@@ -153,3 +153,20 @@ def test_delta_gate_refuses_drifted_candidate():
     with pytest.raises(SemanticError) as exc_info:
         RefmergeService()._validate_delta(owner, drifted, qualified, get_spec("postgres"))
     assert exc_info.value.reason_code is ReasonCode.COMPILE_DRIFT
+
+
+def test_delta_gate_accepts_implicit_donor_alias():
+    candidate = _gate(
+        _model("final as (select a.customer_id, x.amount from a join b x using (id))\nselect * from final")
+    )
+    assert "join a x using (id)" in candidate
+
+
+def test_delta_gate_refuses_unchanged_candidate():
+    # A candidate that still compiles to the baseline did not apply the merge the plan promised.
+    owner, _candidate_node, qualified = _rewrite(
+        _model("final as (select a.customer_id, x.amount from a join b as x using (id))\nselect * from final")
+    )
+    with pytest.raises(SemanticError) as exc_info:
+        RefmergeService()._validate_delta(owner, owner, qualified, get_spec("postgres"))
+    assert exc_info.value.reason_code is ReasonCode.COMPILE_DRIFT

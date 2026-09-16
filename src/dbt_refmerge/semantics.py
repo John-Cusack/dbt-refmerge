@@ -172,8 +172,26 @@ def _alias_name_and_quoted(alias_expr: Any) -> tuple[str, bool]:
     identifier = alias_expr.args.get("this") if hasattr(alias_expr, "args") else None
     if isinstance(identifier, exp.Identifier):
         return identifier.name, bool(identifier.args.get("quoted"))
-    name = alias_expr.name if hasattr(alias_expr, "name") else str(alias_expr)
-    return str(name), False
+    # sqlglot's parser always wraps a CTE alias in an Identifier; this only guards an API change.
+    name = alias_expr.name if hasattr(alias_expr, "name") else str(alias_expr)  # pragma: no cover
+    return str(name), False  # pragma: no cover
+
+
+def _top_level_with(tree: Any) -> Any:
+    # sqlglot>=~27 stores top-level CTEs under "with_"; older versions (26.x) use "with".
+    top_with = tree.args.get("with_")
+    if top_with is None:
+        top_with = tree.args.get("with")
+    return top_with
+
+
+def _cte_identity(cte: Any, fold: str) -> str:
+    """Normalized name of a CTE; empty when it has none (a zero-length quoted name such as ``""``)."""
+    alias_expr = cte.args.get("alias")
+    if alias_expr is None:  # pragma: no cover -- sqlglot's parser gives every CTE a TableAlias
+        return ""
+    alias_name, quoted = _alias_name_and_quoted(alias_expr)
+    return _normalize_ident(alias_name, quoted, fold)
 
 
 def parse_model(sql: str, dialect: str = "postgres") -> ParsedModel:
@@ -195,58 +213,20 @@ def parse_model(sql: str, dialect: str = "postgres") -> ParsedModel:
         raise SemanticError(ReasonCode.INTERNAL_ERROR, "unexpected semicolon node")
     if not isinstance(tree, (exp.Select, exp.Union, exp.Query)):
         raise SemanticError(ReasonCode.INTERNAL_ERROR, f"non-embeddable compiled root: {type(tree).__name__}")
-    if tree.find(exp.Semicolon) is not None:
+    # sqlglot's parser splits statements before building nodes, so none can sit inside the root.
+    if tree.find(exp.Semicolon) is not None:  # pragma: no cover
         raise SemanticError(ReasonCode.INTERNAL_ERROR, "terminal second statement")
     ctes: dict[str, Any] = {}
-    # sqlglot>=~26 stores top-level CTEs under "with_"; older versions use "with".
-    top_with = tree.args.get("with_")
-    if top_with is None:
-        top_with = tree.args.get("with")
+    top_with = _top_level_with(tree)
     scope_ctes: list[Any] = []
     if top_with is not None:
         scope_ctes = top_with.args.get("expressions", []) or []
     for cte in scope_ctes:
-        alias_expr = cte.args.get("alias")
-        if alias_expr is None:
-            continue
-        alias_name, quoted = _alias_name_and_quoted(alias_expr)
-        if not alias_name:
-            continue
-        ident = _normalize_ident(alias_name, quoted, _fold_for_dialect(dialect))
-        ctes[ident] = cte
+        ident = _cte_identity(cte, _fold_for_dialect(dialect))
+        if ident:
+            ctes[ident] = cte
     return ParsedModel(sql=stripped, dialect=dialect, tree=tree, ctes=ctes)
 
-
-_ALLOWED_PROJECTION_NODES = frozenset(
-    {
-        "Select",
-        "Column",
-        "Identifier",
-        "Alias",
-        "From",
-        "Table",
-        "Where",
-        "EQ",
-        "NEQ",
-        "GT",
-        "GTE",
-        "LT",
-        "LTE",
-        "And",
-        "Or",
-        "Not",
-        "Paren",
-        "Boolean",
-        "Literal",
-        "Null",
-        "Is",
-        "In",
-        "Between",
-        "Cast",
-        "Case",
-        "Star",
-    }
-)
 
 # Strict import allowlist: only these classes may appear inside an import CTE body.
 _IMPORT_ALLOWED = frozenset(
@@ -285,10 +265,6 @@ def _iter_nodes(node: Any) -> Any:
     """Yield expression nodes across sqlglot walk API variants (bare or tuple)."""
     for item in node.walk(bfs=False):
         yield item[0] if isinstance(item, tuple) else item
-
-
-def _walk_types(node: Any) -> list[str]:
-    return [type(n).__name__ for n in _iter_nodes(node)]
 
 
 def qualify_import_cte(cte_expr: Any) -> Qualification:
@@ -373,8 +349,9 @@ def qualify_import_cte(cte_expr: Any) -> Qualification:
             reason_codes=(ReasonCode.UNSUPPORTED_IMPORT_SHAPE,),
             unexpected_nodes=("MissingFrom",),
         )
+    # A second relation needs a Join, Subquery, Lateral or similar node, all refused above.
     tables = list(inner.find_all(exp.Table))
-    if len(tables) != 1:
+    if len(tables) != 1:  # pragma: no cover
         return Qualification(
             ok=False,
             reason_codes=(ReasonCode.UNSUPPORTED_IMPORT_SHAPE,),
@@ -384,9 +361,7 @@ def qualify_import_cte(cte_expr: Any) -> Qualification:
 
 
 def _canonical(node: Any, fold: str = "lower") -> Any:
-    """Versioned canonical serializer: tuple form without positions/comments."""
-    if node is None:
-        return None
+    """Versioned canonical serializer: tuple form without positions or comments (sqlglot keeps both off args)."""
     if isinstance(node, list):
         return tuple(_canonical(v, fold) for v in node)
     if isinstance(node, exp.Expression):
@@ -395,16 +370,13 @@ def _canonical(node: Any, fold: str = "lower") -> Any:
         for k, v in node.args.items():
             # An unset arg and an explicit None/[] generate identical SQL; the parser fills some
             # (e.g. TableAlias.columns) that synthesized nodes omit, so neither may affect the hash.
-            if k in ("comments", "meta") or v is None or v == []:
+            if v is None or v == []:
                 continue
             args[k] = _canonical(v, fold)
         if isinstance(node, exp.Identifier):
             quoted = bool(node.args.get("quoted"))
             nm = node.name
             args = {"this": _normalize_ident(nm, quoted, fold), "quoted": quoted}
-        if isinstance(node, exp.Column):
-            # normalize unquoted parts
-            pass
         if isinstance(node, exp.Literal):
             args = {"this": node.this, "is_string": node.is_string}
         return (name, tuple(sorted(args.items())))
@@ -460,12 +432,11 @@ def match_source_ctes(
         # resolve upstream
         rc = scte.ref_call
         upstream = resolve_literal_ref(manifest, owner, rc.kind, rc.package, rc.name, rc.source_name)
-        # confirm single input relation
+        # qualify_import_cte accepted it: a Select reading exactly one relation
         inner = compiled.args.get("this")
         assert isinstance(inner, exp.Select)
         tables = list(inner.find_all(exp.Table))
-        if len(tables) != 1:
-            raise SemanticError(ReasonCode.UNSUPPORTED_IMPORT_SHAPE, "compiled import must read one relation")
+        assert len(tables) == 1
         relation = tuple(
             _normalize_ident(part.name, bool(part.args.get("quoted")), fold)
             for part in (tables[0].args.get(key) for key in ("catalog", "db", "this"))
@@ -619,33 +590,18 @@ def build_expected_transform(
     canonical_ident: str,
     donor_idents: tuple[str, ...],
     added_projections_sql: dict[str, list[str]],
-    redirected_aliases: dict[str, str] | None = None,
 ) -> Any:
     """Deep-copy baseline AST, apply merge, return expected tree. Pure sqlglot transform."""
     import copy
 
     fold = _fold_for_dialect(baseline.dialect)
+    donors = set(donor_idents)
     tree = copy.deepcopy(baseline.tree)
-    top_with = tree.args.get("with_")
-    if top_with is None:
-        top_with = tree.args.get("with")
+    top_with = _top_level_with(tree)
     if top_with is None:
         raise SemanticError(ReasonCode.COMPILE_DRIFT, "baseline has no WITH")
     ctes = list(top_with.args.get("expressions", []) or [])
-
-    def _cte_ident(c: object) -> str | None:
-        alias_expr: Any = c.args.get("alias") if isinstance(c, exp.CTE) else None
-        if alias_expr is None:
-            return None
-        alias_name, quoted = _alias_name_and_quoted(alias_expr)
-        return _normalize_ident(alias_name, quoted, fold)
-
-    by_ident = {}
-    for c in ctes:
-        key = _cte_ident(c)
-        if key:
-            by_ident[key] = c
-    canonical = by_ident.get(canonical_ident)
+    canonical = next((c for c in ctes if _cte_identity(c, fold) == canonical_ident), None)
     if canonical is None:
         raise SemanticError(ReasonCode.COMPILE_DRIFT, "canonical CTE missing in baseline")
     # add missing projections to canonical
@@ -662,7 +618,7 @@ def build_expected_transform(
         existing.append(node)
     inner.set("expressions", existing)
     # remove donors
-    remaining = [c for c in ctes if (_cte_ident(c) not in set(donor_idents))]
+    remaining = [c for c in ctes if _cte_identity(c, fold) not in donors]
     top_with.set("expressions", remaining)
     # redirect table refs bound to donors: rename table to canonical + alias donor
     canon_alias_expr = canonical.args.get("alias")
@@ -676,7 +632,7 @@ def build_expected_transform(
         table_quoted = (
             bool(table_identifier.args.get("quoted")) if isinstance(table_identifier, exp.Identifier) else False
         )
-        if _normalize_ident(tname, table_quoted, fold) in set(donor_idents):
+        if _normalize_ident(tname, table_quoted, fold) in donors:
             # preserve alias behavior: if table already aliased, keep alias; else add alias = donor
             existing_alias = scope_table.args.get("alias")
             donor_raw = tname
@@ -685,5 +641,4 @@ def build_expected_transform(
             scope_table.set("this", exp.to_identifier(canon_name, quoted=canon_quoted))
             if existing_alias is None:
                 scope_table.set("alias", exp.TableAlias(this=exp.to_identifier(donor_raw, quoted=donor_quoted)))
-    _ = redirected_aliases
     return tree
