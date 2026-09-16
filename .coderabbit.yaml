@@ -2,7 +2,8 @@
 # NOTE: config alone does not activate reviews — install the CodeRabbit
 # GitHub App on this repo (github.com/marketplace/coderabbit-ai), then
 reviews:
-  auto_review: true
+  auto_review:
+    enabled: true
   # Fail-closed domain: flag swallowed exceptions, silent fallbacks, and
   # verification logic that could report success without proof.
   review_status: true
@@ -10,7 +11,19 @@ reviews:
   high_level_summary: true
   poem: false
   estimation: true
-  finishing_touches: false
+  finishing_touches:
+    docstrings:
+      enabled: false
+    unit_tests:
+      enabled: false
+    simplify:
+      enabled: false
+    autofix:
+      enabled: false
+    fix_ci:
+      enabled: false
+    resolve_merge_conflict:
+      enabled: false
 path_instructions:
   - path: "src/dbt_refmerge/verification/**"
     instructions: >
