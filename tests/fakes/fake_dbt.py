@@ -14,6 +14,7 @@ Behaviour switches (``FAKE_DBT_MODE``, comma separated, ``key`` or ``key=value``
 - ``adapter_type=<name>``: manifest ``metadata.adapter_type`` (default ``postgres``)
 - ``candidate_drop_node``: candidate manifest omits the selected model
 - ``candidate_bad_manifest``: candidate manifest is not valid JSON
+- ``original_file_path_prefix=<p>``: prefix every node's ``original_file_path`` (a file dbt-refmerge cannot find)
 - ``candidate_drift``: candidate compiled SQL gains ``limit 1``
 - ``sleep=<seconds>``, ``ignore_sigterm``, ``sigint_parent=<delay>``: process-control tests
 - ``big_logs=<chars>`` (with ``big_logs_char=<c>``): write that many characters to stdout and stderr
@@ -168,7 +169,7 @@ def _compile(args: list[str], modes: dict[str, str], *, parse_only: bool = False
             "package_name": package,
             "name": name,
             "path": path.relative_to(project / "models").as_posix(),
-            "original_file_path": path.relative_to(project).as_posix(),
+            "original_file_path": modes.get("original_file_path_prefix", "") + path.relative_to(project).as_posix(),
             "database": "db",
             "schema": schema,
             "alias": alias,

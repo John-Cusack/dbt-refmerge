@@ -60,3 +60,7 @@ def test_dbt_cli_rejects_empty_command():
         DbtCli(())
     assert str(exc_info.value) == "[DBT_COMMAND_FAILED] empty dbt command"
     assert exc_info.value.argv == ()
+
+
+def test_parse_dbt_version_output_core_line_as_last_line():
+    assert parse_dbt_version_output("Plugins:\nCore:\n") == "Plugins:"

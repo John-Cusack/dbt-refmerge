@@ -32,7 +32,7 @@ Measured 2026-09-16 on `acf0184` (the PR #4 branch; production code matches `mai
 | 1 | done (option A) | — | — |
 | 2 | done: B2–B7, S1–S11 | #6 | 71.3% (`fail_under = 71`) |
 | 3 | done: unit lane for reporting, config, errors, domain, analyze, rewrite, semantics, source, artifacts, adapters, workspace, apply | #7 | 85% (`fail_under = 85`) |
-| 4 | not started | | |
+| 4 | done: dbt_cli, CLI and orchestrator in the fake_dbt lane; remaining verifier helpers; CLI/orchestrator bugs from §2.3 | Phase 4 PR | **100%** (`fail_under = 100`) |
 | 5 | verifier built (B1) and warehouse lane added; phase order swapped with 4 so CLI tests target final behavior | #8 | 90% (`fail_under = 90`) |
 
 Discrepancies found while implementing:
@@ -83,6 +83,26 @@ Discrepancies found while implementing:
 - **Phase 5, known limits:**
   - `ORDER BY` with ties passes the static volatility gate (see the Phase 2 S1 note). The single-statement comparison is the backstop.
   - Verification runs sequentially: two compiles, then parse, run and three queries per model, a few seconds each against a local Postgres.
+- **Phase 4 (after the verifier), CLI behaviour changes:**
+  - Unset flags no longer override config.
+  - Output is plain text: no Rich markup, no wrapping.
+  - `fix --dry-run` prints the diff.
+  - `fix` exits 0 when it applies or when a dry run is fixable, 3 when the proof found a difference, and 4 otherwise.
+  - Ctrl-C exits 130, and `--debug` prints the traceback.
+  - Removed `scan --select`/`--compile` and `--allow-compile-introspection`. `scan --fail-on finding` exits 2 when there are leads.
+  - `check --json` reports the dbt version, the manifest schema and the kept workspace.
+- **Phase 4, orchestrator changes:**
+  - `--select` is a dbt selector. Package models are never candidates.
+  - `fix` resolves an exact project file and checks only that model.
+  - Model discovery reads `model-paths`.
+  - A candidate manifest that cannot be read refuses that model only.
+  - A model source missing from the snapshot is refused. It used to fall back to a same-named file.
+  - A manifest outside the workspace is never read.
+- **Phase 4, `dbt_cli`:**
+  - The child process is reaped on Ctrl-C and on timeout (SIGTERM, then SIGKILL after `terminate_grace_seconds`).
+  - Logs are capped in bytes.
+  - Output is decoded as UTF-8 with replacement.
+  - One fewer `dbt --help` subprocess per check.
 
 ## 1. Where coverage stands
 
@@ -588,14 +608,21 @@ F → `tests/fake_dbt/test_check_fix.py`:
 
 ## 7. Pragma budget and conditional code
 
-**Allowed `# pragma: no cover`**, each needing a comment naming the invariant:
-- `semantics.py` 153-154, 177, 189, 192, 356
-- `source.py` 277-279
-- `rewrite.py` 279-283
+**`# pragma: no cover` in use at 100%** (each carries a comment naming the invariant):
+- `semantics.py`:
+  - the non-`Identifier` CTE alias fallback (sqlglot API guard)
+  - a CTE without an alias
+  - a nested `Semicolon` node
+  - an import CTE reading other than one table
+- `source.py`: the sentinel-wider-than-call guard (needs 10**7 calls in one file).
+- `rewrite.py`:
+  - the terminal-donor and donor separator refusals (typed refusals that rely on `parse_source_model`, never asserts)
+  - the post-rewrite reparse guard
 
-**Platform pragmas:**
-- `dbt_cli.py`: `_terminate` / `_kill` win32 arms
-- `orchestrator.py` 609, 636, 652
+**Platform and version pragmas** (covdefaults, still executed by the matching CI job):
+- `dbt_cli.py`: `_terminate` / `_kill` win32 and POSIX arms.
+- `orchestrator.py`: four `sys.platform` checks in `apply_verified_source`.
+- `workspace.py`: the `rmtree` `onexc` (3.12+) and `onerror` (3.11) arms.
 
 **Depends on §5.1:** kept and tested under option A, deleted under option B.
 - `verification/harness.py`, `verification/comparator.py`

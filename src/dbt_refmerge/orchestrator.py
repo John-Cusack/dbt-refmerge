@@ -285,10 +285,7 @@ class RefmergeService:
         try:
             snapshot = ws.snapshot_project(config.project_dir)
             dbt = self._dbt_factory(config)
-            try:
-                version = dbt.version(cwd=snapshot.root)
-            except DbtError as exc:
-                raise exc
+            version = dbt.version(cwd=snapshot.root)
             caps = dbt.discover_capabilities(cwd=snapshot.root)
             context = CompilationContext(
                 dbt_executable=Path(config.dbt_command[0]),
@@ -320,11 +317,8 @@ class RefmergeService:
             res = dbt.compile(baseline_inv, selector)
             if res.returncode != 0:
                 raise DbtError(f"dbt compile failed: {res.stderr[-2000:]}", argv=res.argv_redacted)
-            manifest_path = ws.artifacts_root / "baseline-target" / "manifest.json"
-            if not manifest_path.is_file():
-                # fallback to snapshot target
-                manifest_path = snapshot.root / "target" / "manifest.json"
-            view = load_manifest(manifest_path)
+            # Every supported dbt honors --target-path; a stale <project>/target manifest is never read instead.
+            view = load_manifest(ws.artifacts_root / "baseline-target" / "manifest.json")
             _require_manifest_adapter(view, spec)
             # dbt compiled exactly the selected nodes; package models are not the project's to rewrite.
             models = [n for n in _project_models(view) if n.compiled_code is not None]
@@ -370,9 +364,10 @@ class RefmergeService:
             return ModelResult(node.unique_id, Path(node.original_file_path), receipt, ""), b""
         src_path = ws.source_snapshot / node.original_file_path
         if not src_path.is_file():
-            # try resolved under snapshot root
-            src_path = ws.source_snapshot / Path(node.original_file_path).name
-        raw = src_path.read_bytes() if src_path.is_file() else node.raw_code.encode("utf-8")
+            # The rewrite edits this exact file; never substitute a same-named file or the manifest's raw_code.
+            receipt = _unverifiable_receipt(ws, context, view, node, (ReasonCode.SOURCE_MAPPING_AMBIGUOUS,))
+            return ModelResult(node.unique_id, Path(node.original_file_path), receipt, ""), b""
+        raw = src_path.read_bytes()
         try:
             parsed_src = _parse_src(raw, fold_unquoted=spec.fold_unquoted)
         except RefmergeError as exc:

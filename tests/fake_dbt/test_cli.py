@@ -85,6 +85,16 @@ def test_check_keep_workspace_reports_where_it_is(project):
 
     workspace = Path(json.loads(result.stdout)["workspace"])
     assert (workspace / "run-ledger.json").is_file()
+    human = _invoke("check", *common, "--keep-workspace", "--fail-on", "never")
+    assert human.stdout.rstrip().splitlines()[-1].startswith("workspace kept at ")
+
+
+def test_fix_human_output_without_dry_run_has_no_diff(project):
+    _root, common = project
+
+    result = _invoke("fix", "models/orders.sql", *common)
+
+    assert (result.exit_code, result.stdout) == (0, "applied=True dry_run=False applied\n")
 
 
 def test_fix_dry_run_prints_the_diff_and_leaves_the_file(project):

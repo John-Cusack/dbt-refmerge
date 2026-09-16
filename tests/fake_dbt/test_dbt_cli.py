@@ -227,3 +227,9 @@ def test_terminate_and_kill_tolerate_an_exited_process():
     proc.wait()
     _terminate(proc)
     _kill(proc)
+
+
+def test_parse_argv_minimal(make_project, fake_dbt, tmp_path):
+    root = _project(make_project)
+    DbtCli(fake_dbt.command, DbtCliCapabilities(False, False, False, False)).parse(_inv(tmp_path, project_dir=root))
+    assert fake_dbt.calls()[-1] == ["parse", "--project-dir", str(root)]
