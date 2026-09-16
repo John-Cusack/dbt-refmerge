@@ -1,14 +1,17 @@
 """Warehouse verifier control flow against the fake dbt: every refusal, failure and cleanup path."""
 
+import dataclasses
 import json
 from pathlib import Path
 
 import pytest
 
+from dbt_refmerge.adapters import get_spec
 from dbt_refmerge.config import AppConfig
 from dbt_refmerge.domain import ReasonCode, VerificationStatus, is_fixable
 from dbt_refmerge.errors import RefmergeError
 from dbt_refmerge.orchestrator import CheckRequest, CleanupRequest, FixRequest, RefmergeService
+from dbt_refmerge.verification.runner import verify_postgres
 
 pytestmark = pytest.mark.fake_dbt
 
@@ -224,3 +227,36 @@ def test_cleanup_rejects_malformed_run_id(make_project, fake_dbt, tmp_path):
         RefmergeService().cleanup(CleanupRequest(config=_config(root, fake_dbt, tmp_path), run_id="x'; drop table y"))
     assert exc_info.value.reason_code is ReasonCode.CLEANUP_FAILED
     assert fake_dbt.calls() == []
+
+
+@pytest.mark.parametrize(
+    ("tamper", "code"),
+    [
+        (
+            lambda r: dataclasses.replace(r, baseline=r.baseline.model_copy(update={"database": None})),
+            ReasonCode.SCRATCH_BOUNDARY_VIOLATION,
+        ),
+        (lambda r: dataclasses.replace(r, spec=get_spec("snowflake")), ReasonCode.UNSUPPORTED_ADAPTER),
+    ],
+    ids=["no-database", "adapter-cannot-verify"],
+)
+def test_verifier_refuses_requests_it_cannot_scope(make_project, fake_dbt, tmp_path, tamper, code):
+    root = make_project(FILES)
+    service = RefmergeService(verify_runner=lambda request: verify_postgres(tamper(request)))
+
+    report = service.check(CheckRequest(config=_config(root, fake_dbt, tmp_path)))
+
+    receipt = next(r.receipt for r in report.results if r.model_unique_id == "model.p.m")
+    assert (receipt.status, receipt.reason_codes) == (VerificationStatus.UNVERIFIABLE, (code,))
+    assert "parse" not in [call[0] for call in fake_dbt.calls()]
+
+
+def test_cleanup_with_nothing_left_drops_nothing(make_project, fake_dbt, tmp_path):
+    root = make_project(FILES)
+
+    result = RefmergeService().cleanup(
+        CleanupRequest(config=_config(root, fake_dbt, tmp_path), run_id="20260916T120000_0123456789ab")
+    )
+
+    assert (result["dropped"], result["remaining"], result["complete"]) == ([], [], True)
+    assert _operations(fake_dbt) == ["dbt_refmerge_query"]

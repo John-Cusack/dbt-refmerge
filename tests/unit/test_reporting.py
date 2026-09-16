@@ -175,6 +175,7 @@ def test_check_report_json_counts_each_status():
         "dbt": {"version": "1.9.0", "adapter_type": "postgres", "manifest_schema_version": "v12"},
         "summary": {"models_scanned": 6, "findings": 2, "fixable": 1, "different": 1, "unverifiable": 1, "errors": 1},
         "cleanup": {"complete": False, "objects": []},
+        "workspace": None,
     }
     assert [(m["model_unique_id"], m["status"], m["reason_codes"], m["fixable"]) for m in doc["models"]] == [
         ("model.p.a", "snapshot_equivalent", ["OK"], True),
@@ -186,7 +187,7 @@ def test_check_report_json_counts_each_status():
     ]
     assert doc["models"][0] == {
         "model_unique_id": "model.p.a",
-        "source_path": str(Path("models/a.sql")),
+        "source_path": "models/a.sql",
         "status": "snapshot_equivalent",
         "reason_codes": ["OK"],
         "warning_codes": ["W1"],
@@ -279,12 +280,12 @@ def test_render_human_check_includes_diff_only_when_present():
 
     assert render_human_check(report) == "\n".join(
         [
-            f"model model.p.a ({Path('models/a.sql')})",
+            "model model.p.a (models/a.sql)",
             "  status: unverifiable fixable=False",
             "  reasons: COMPILE_DRIFT, OK",
             "  rows: baseline=0 candidate=0 baseline_only=0 candidate_only=0 schema_equal=False",
             "  verification scope: one-statement snapshot-equivalent multiset comparison (not universal proof)",
-            f"model model.p.b ({Path('models/b.sql')})",
+            "model model.p.b (models/b.sql)",
             "  status: snapshot_equivalent fixable=True",
             "  reasons: OK",
             "  rows: baseline=3 candidate=3 baseline_only=0 candidate_only=0 schema_equal=True",

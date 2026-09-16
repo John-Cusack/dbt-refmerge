@@ -6,7 +6,6 @@ import os
 import shlex
 import tomllib
 from dataclasses import dataclass
-from decimal import Decimal
 from enum import Enum
 from pathlib import Path
 from typing import Any
@@ -29,21 +28,17 @@ class AppConfig(BaseModel):
     target: str | None = None
     dbt_command: tuple[str, ...] = ("dbt",)
     adapter: str | None = None
-    scratch_database: str | None = None
     scratch_schema: str | None = None
     subprocess_timeout_seconds: int = 1800
     warehouse_statement_timeout_ms: int = 900_000
-    warehouse_lock_timeout_ms: int = 10_000
-    max_planner_total_cost: Decimal | None = None
     fail_on: FailOn = FailOn.FIXABLE
     keep_workspace: bool = False
-    allow_compile_introspection: bool = False
     json_output: bool = False
     debug: bool = False
 
     model_config = ConfigDict(frozen=True)
 
-    @field_validator("subprocess_timeout_seconds", "warehouse_statement_timeout_ms", "warehouse_lock_timeout_ms")
+    @field_validator("subprocess_timeout_seconds", "warehouse_statement_timeout_ms")
     @classmethod
     def _positive(cls, v: int) -> int:
         if v <= 0 or v > 86_400_000:
@@ -68,7 +63,7 @@ class CompilationContext:
 
 _SECRET_HINTS = ("secret", "password", "token", "key")
 _ENV_PREFIX = "DBT_REFMERGE_"
-_ENV_BOOL_FIELDS = ("keep_workspace", "allow_compile_introspection", "json_output", "debug")
+_ENV_BOOL_FIELDS = ("keep_workspace", "json_output", "debug")
 
 
 def is_secret_name(name: str) -> bool:
@@ -125,6 +120,7 @@ def load_config(
         merged[field] = value.lower() in ("1", "true", "yes") if field in _ENV_BOOL_FIELDS else value
     if cli_overrides:
         merged.update({k: v for k, v in cli_overrides.items() if v is not None})
+    merged["project_dir"] = str(root)  # the argument always names the project, never a file or env value
 
     command = merged.get("dbt_command")
     if isinstance(command, str):

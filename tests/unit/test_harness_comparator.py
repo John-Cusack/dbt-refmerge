@@ -144,3 +144,168 @@ def test_verdict_sql_names_cannot_collide_with_user_names(generate):
     for cte in tree.find_all(exp.CTE):
         aliases = [projection.alias_or_name for projection in cte.this.expressions]
         assert len(aliases) == len(set(aliases)), cte.alias
+
+
+def test_schemas_equal_detects_a_different_column_count():
+    baseline = comp.normalize_schema(
+        comp.RawSchemaPayload(baseline=[{"ordinal": 1, "name": "a", "data_type": "int"}], candidate=[])
+    )
+    candidate = comp.RawSchemaPayload(baseline=[], candidate=[])
+    assert comp.schemas_equal(baseline, candidate) is False
+
+
+@pytest.mark.parametrize(
+    "output",
+    [
+        "DBT_REFMERGE_RESULT_n_BEGIN\n{}\n{}\nDBT_REFMERGE_RESULT_n_END",
+        "DBT_REFMERGE_RESULT_n_BEGIN\n" + '"' + "x" * 1_000_001 + '"' + "\nDBT_REFMERGE_RESULT_n_END",
+    ],
+    ids=["two-lines", "oversized"],
+)
+def test_parse_marked_json_refuses_bad_payload_lines(output):
+    with pytest.raises(VerificationError):
+        comp.parse_marked_json(output, "n")
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"baseline_rows": True},
+        {"baseline_rows": -1},
+        {"baseline_rows": 2**63},
+        {"baseline_rows": 1.0},
+        {"baseline_rows": "1"},
+        {"surprise": 1},
+    ],
+    ids=["bool", "negative", "too-large", "float", "string", "extra-field"],
+)
+def test_parse_equality_result_refuses_invalid_fields(overrides):
+    with pytest.raises(VerificationError):
+        comp.parse_equality_result(_payload(**overrides))
+
+
+def test_parse_equality_result_requires_every_field():
+    payload = _payload()
+    del payload["candidate_rows"]
+    with pytest.raises(VerificationError, match="missing result field"):
+        comp.parse_equality_result(payload)
+
+
+def test_derive_status_schema_difference_is_different():
+    from dbt_refmerge.domain import EqualityResult, VerificationStatus
+
+    assert comp.derive_status(EqualityResult(False, 1, 1, 0, 0)) == VerificationStatus.DIFFERENT
+
+
+def test_semicolon_rules_refuse_two_terminated_statements():
+    with pytest.raises(VerificationError):
+        strip_single_terminal_semicolon("select 1; select 2;")
+
+
+def test_harness_refuses_unsafe_profile_names(tmp_path):
+    from dbt_refmerge.verification.harness import write_harness_macros
+
+    with pytest.raises(VerificationError) as exc_info:
+        write_harness_macros(tmp_path, 'prof"\nmodels: {}')
+    assert exc_info.value.reason_code is ReasonCode.HARNESS_EMBEDDING_UNSAFE
+
+
+def _harness_manifest(tmp_path, *, baseline=None, candidate=None, extra=None):
+    def node(name, alias, **config):
+        return {
+            "unique_id": f"model.dbt_refmerge_harness.{name}",
+            "resource_type": "model",
+            "package_name": "dbt_refmerge_harness",
+            "name": name,
+            "original_file_path": f"models/{name}.sql",
+            "database": "db",
+            "schema": "scratch",
+            "alias": alias,
+            "config": {"materialized": "view", **config},
+        }
+
+    nodes = {}
+    for name, overrides in (("baseline", baseline), ("candidate", candidate)):
+        if overrides is not False:
+            entry = node(name, f"dbt_refmerge_{name}_tok")
+            entry.update(overrides or {})
+            nodes[entry["unique_id"]] = entry
+    nodes.update(extra or {})
+    path = tmp_path / "manifest.json"
+    path.write_text(
+        json.dumps(
+            {
+                "metadata": {
+                    "dbt_schema_version": "https://schemas.getdbt.com/dbt/manifest/v12.json",
+                    "dbt_version": "1",
+                },
+                "nodes": nodes,
+            }
+        )
+    )
+    return path
+
+
+def _boundary():
+    from dbt_refmerge.domain import IdentifierIdentity, RelationIdentity, ScratchBoundary
+
+    def rel(alias):
+        return RelationIdentity(IdentifierIdentity("db"), IdentifierIdentity("scratch"), IdentifierIdentity(alias))
+
+    return ScratchBoundary(
+        database=IdentifierIdentity("db"),
+        schema=IdentifierIdentity("scratch"),
+        allowed_relations=(rel("dbt_refmerge_baseline_tok"), rel("dbt_refmerge_candidate_tok")),
+    )
+
+
+def test_preflight_accepts_the_two_harness_views_and_disabled_or_test_nodes(tmp_path):
+    from dbt_refmerge.verification.harness import preflight_harness_manifest
+
+    extra = {
+        "model.dbt_refmerge_harness.off": {
+            "unique_id": "model.dbt_refmerge_harness.off",
+            "resource_type": "model",
+            "package_name": "dbt_refmerge_harness",
+            "name": "off",
+            "original_file_path": "models/off.sql",
+            "config": {"enabled": False},
+        },
+        "test.dbt_refmerge_harness.t": {
+            "unique_id": "test.dbt_refmerge_harness.t",
+            "resource_type": "test",
+            "package_name": "dbt_refmerge_harness",
+            "name": "t",
+            "original_file_path": "tests/t.sql",
+        },
+    }
+    baseline, candidate = preflight_harness_manifest(_harness_manifest(tmp_path, extra=extra), _boundary())
+    assert (baseline.identifier.value, candidate.identifier.value) == (
+        "dbt_refmerge_baseline_tok",
+        "dbt_refmerge_candidate_tok",
+    )
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"candidate": False},
+        {"baseline": {"config": {"materialized": "view", "post-hook": ["drop table x"]}}},
+        {"baseline": {"alias": "customers"}},
+        {"baseline": {"database": "other"}},
+    ],
+    ids=["missing-candidate", "hook", "alias-not-allowed", "other-database"],
+)
+def test_preflight_refuses(tmp_path, kwargs):
+    from dbt_refmerge.verification.harness import preflight_harness_manifest
+
+    with pytest.raises(ScratchBoundaryError):
+        preflight_harness_manifest(_harness_manifest(tmp_path, **kwargs), _boundary())
+
+
+def test_build_verdict_sql_dispatches_by_strategy():
+    from dbt_refmerge.verification.harness import build_verdict_sql
+
+    relations = ('"db"."s"."b"', '"db"."s"."c"', ["x"])
+    assert build_verdict_sql(*relations, "grouped_counts") == comp.generate_grouped_counts_sql(*relations)
+    assert build_verdict_sql(*relations, "except_all") == comp.generate_except_all_sql(*relations)

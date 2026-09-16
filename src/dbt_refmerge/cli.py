@@ -1,16 +1,24 @@
-"""Typer CLI: scan / check / fix / cleanup. No business logic beyond parsing/rendering."""
+"""Typer CLI: scan / check / fix / cleanup. No business logic beyond parsing/rendering.
+
+Every option defaults to None (or is omitted from the overrides) so that an unset flag never replaces a
+value from ``.dbt-refmerge.toml`` or ``DBT_REFMERGE_*``.
+"""
 
 from __future__ import annotations
 
 import json
 import sys
+import traceback
+from collections.abc import Callable
 from pathlib import Path
+from typing import NoReturn, TypeVar
 
 import typer
 from rich.console import Console
 
 from dbt_refmerge import __version__
 from dbt_refmerge.config import AppConfig, FailOn, load_config
+from dbt_refmerge.domain import VerificationStatus, is_fixable
 from dbt_refmerge.orchestrator import (
     CheckRequest,
     CleanupRequest,
@@ -27,8 +35,11 @@ from dbt_refmerge.reporting import (
 )
 
 app = typer.Typer(add_completion=False, help="Safe merge of duplicate direct-import CTEs.")
-console = Console()
-err_console = Console(stderr=True)
+# Plain text: paths such as models/[legacy]/m.sql are not markup, and lines must not wrap.
+console = Console(markup=False, highlight=False, soft_wrap=True)
+err_console = Console(stderr=True, markup=False, highlight=False, soft_wrap=True)
+
+T = TypeVar("T")
 
 
 def _version_callback(value: bool) -> None:
@@ -46,39 +57,36 @@ def main(
     pass
 
 
-def _common_config(
-    project_dir: Path,
-    profiles_dir: Path | None,
-    profile: str | None,
-    target: str | None,
-    dbt_command_part: list[str] | None,
-    scratch_schema: str | None,
-    adapter: str | None,
-    fail_on: FailOn,
-    json_output: bool,
-    debug: bool,
-    keep_workspace: bool,
-    allow_compile_introspection: bool,
-) -> AppConfig:
-    overrides: dict[str, object] = {}
-    if profiles_dir is not None:
-        overrides["profiles_dir"] = profiles_dir
-    if profile is not None:
-        overrides["profile"] = profile
-    if target is not None:
-        overrides["target"] = target
-    if dbt_command_part:
-        overrides["dbt_command"] = tuple(dbt_command_part)
-    if scratch_schema is not None:
-        overrides["scratch_schema"] = scratch_schema
-    if adapter is not None:
-        overrides["adapter"] = adapter
-    overrides["fail_on"] = fail_on
-    overrides["json_output"] = json_output
-    overrides["debug"] = debug
-    overrides["keep_workspace"] = keep_workspace
-    overrides["allow_compile_introspection"] = allow_compile_introspection
-    return load_config(project_dir, cli_overrides=overrides)
+def _load(project_dir: Path, **overrides: object) -> AppConfig:
+    try:
+        return load_config(project_dir, cli_overrides=overrides)
+    except Exception as exc:
+        _fail("configuration error", exc, debug=bool(overrides.get("debug")))
+
+
+def _run(action: str, config: AppConfig, call: Callable[[], T]) -> T:
+    try:
+        return call()
+    except KeyboardInterrupt:
+        err_console.print("interrupted")
+        raise typer.Exit(code=int(ExitCode.INTERRUPTED)) from None
+    except Exception as exc:
+        _fail(f"{action} failed", exc, debug=config.debug)
+
+
+def _fail(prefix: str, exc: BaseException, *, debug: bool) -> NoReturn:
+    if debug:
+        err_console.print("".join(traceback.format_exception(exc)).rstrip())
+    err_console.print(f"{prefix}: {exc}")
+    raise typer.Exit(code=int(ExitCode.OPERATIONAL_ERROR))
+
+
+def _command(parts: list[str] | None) -> tuple[str, ...] | None:
+    return tuple(parts) if parts else None
+
+
+def _write_json(payload: object) -> None:
+    sys.stdout.write(json.dumps(payload, indent=2, sort_keys=True) + "\n")
 
 
 @app.command()
@@ -87,46 +95,31 @@ def scan(
     profiles_dir: Path | None = typer.Option(None, "--profiles-dir"),
     profile: str | None = typer.Option(None, "--profile"),
     target: str | None = typer.Option(None, "--target"),
-    dbt_command_part: list[str] | None = typer.Option(None, "--dbt-command-part"),
     adapter: str | None = typer.Option(None, "--adapter"),
-    select: str | None = typer.Option(None, "--select"),
-    compile_: bool = typer.Option(False, "--compile"),
-    json_: bool = typer.Option(False, "--json"),
-    fail_on: FailOn = typer.Option(FailOn.FIXABLE, "--fail-on"),
-    debug: bool = typer.Option(False, "--debug"),
+    json_: bool | None = typer.Option(None, "--json", show_default=False),
+    fail_on: FailOn | None = typer.Option(None, "--fail-on", help="finding: exit 2 when there are leads."),
+    debug: bool | None = typer.Option(None, "--debug", show_default=False),
 ) -> None:
-    try:
-        config = _common_config(
-            project_dir,
-            profiles_dir,
-            profile,
-            target,
-            dbt_command_part,
-            None,
-            adapter,
-            fail_on,
-            json_,
-            debug,
-            False,
-            False,
-        )
-    except Exception as exc:
-        err_console.print(f"configuration error: {exc}")
-        raise typer.Exit(code=int(ExitCode.OPERATIONAL_ERROR)) from None
-    svc = RefmergeService()
-    try:
-        report = svc.scan(ScanRequest(config=config, select=select, compile=compile_))
-    except Exception as exc:
-        err_console.print(f"scan failed: {exc}")
-        raise typer.Exit(code=int(ExitCode.OPERATIONAL_ERROR)) from None
-    if json_:
-        sys.stdout.write(
-            json.dumps(scan_report_json(report, project_dir=config.project_dir), indent=2, sort_keys=True) + "\n"
-        )
+    """List duplicate import CTEs from source files (no dbt run, no warehouse)."""
+    config = _load(
+        project_dir,
+        profiles_dir=profiles_dir,
+        profile=profile,
+        target=target,
+        adapter=adapter,
+        json_output=json_,
+        fail_on=fail_on,
+        debug=debug,
+    )
+    report = _run("scan", config, lambda: RefmergeService().scan(ScanRequest(config=config)))
+    if config.json_output:
+        _write_json(scan_report_json(report, project_dir=config.project_dir))
     else:
         for f in report.findings:
-            console.print(f"{f.source_path}: {', '.join(f.cte_names)} -> {f.upstream_unique_id or '?'}")
-    raise typer.Exit(code=0)
+            path = f.source_path.relative_to(config.project_dir).as_posix()
+            console.print(f"{path}: {', '.join(f.cte_names)} -> {f.upstream_unique_id or '?'}")
+    failed = config.fail_on is FailOn.FINDING and report.findings
+    raise typer.Exit(code=int(ExitCode.POLICY_FINDING) if failed else 0)
 
 
 @app.command()
@@ -136,51 +129,45 @@ def check(
     profile: str | None = typer.Option(None, "--profile"),
     target: str | None = typer.Option(None, "--target"),
     dbt_command_part: list[str] | None = typer.Option(None, "--dbt-command-part"),
-    select: str | None = typer.Option(None, "--select"),
+    select: str | None = typer.Option(None, "--select", help="dbt selector (default: every model)."),
     scratch_schema: str | None = typer.Option(None, "--scratch-schema"),
     adapter: str | None = typer.Option(None, "--adapter"),
-    json_: bool = typer.Option(False, "--json"),
-    fail_on: FailOn = typer.Option(FailOn.FIXABLE, "--fail-on"),
-    keep_workspace: bool = typer.Option(False, "--keep-workspace"),
-    allow_compile_introspection: bool = typer.Option(False, "--allow-compile-introspection"),
-    debug: bool = typer.Option(False, "--debug"),
+    json_: bool | None = typer.Option(None, "--json", show_default=False),
+    fail_on: FailOn | None = typer.Option(None, "--fail-on"),
+    keep_workspace: bool | None = typer.Option(None, "--keep-workspace", show_default=False),
+    debug: bool | None = typer.Option(None, "--debug", show_default=False),
 ) -> None:
-    try:
-        config = _common_config(
-            project_dir,
-            profiles_dir,
-            profile,
-            target,
-            dbt_command_part,
-            scratch_schema,
-            adapter,
-            fail_on,
-            json_,
-            debug,
-            keep_workspace,
-            allow_compile_introspection,
-        )
-    except Exception as exc:
-        err_console.print(f"configuration error: {exc}")
-        raise typer.Exit(code=int(ExitCode.OPERATIONAL_ERROR)) from None
-    svc = RefmergeService()
-    try:
-        report = svc.check(CheckRequest(config=config, select=select))
-    except Exception as exc:
-        err_console.print(f"check failed: {exc}")
-        raise typer.Exit(code=int(ExitCode.OPERATIONAL_ERROR)) from None
-    if json_:
-        sys.stdout.write(
-            json.dumps(
-                check_report_json(report, command="check", project_dir=config.project_dir),
-                indent=2,
-                sort_keys=True,
+    """Prove each duplicate-import merge on the warehouse. Never edits files."""
+    config = _load(
+        project_dir,
+        profiles_dir=profiles_dir,
+        profile=profile,
+        target=target,
+        dbt_command=_command(dbt_command_part),
+        scratch_schema=scratch_schema,
+        adapter=adapter,
+        json_output=json_,
+        fail_on=fail_on,
+        keep_workspace=keep_workspace,
+        debug=debug,
+    )
+    report = _run("check", config, lambda: RefmergeService().check(CheckRequest(config=config, select=select)))
+    if config.json_output:
+        _write_json(
+            check_report_json(
+                report,
+                command="check",
+                project_dir=config.project_dir,
+                dbt_version=report.dbt_version,
+                manifest_schema_version=report.manifest_schema_version,
+                workspace=report.workspace_root,
             )
-            + "\n"
         )
     else:
         console.print(render_human_check(report))
-    raise typer.Exit(code=int(evaluate_exit_code_for_check(report, fail_on)))
+        if report.workspace_root is not None:
+            console.print(f"workspace kept at {report.workspace_root}")
+    raise typer.Exit(code=int(evaluate_exit_code_for_check(report, config.fail_on)))
 
 
 @app.command()
@@ -193,58 +180,51 @@ def fix(
     dbt_command_part: list[str] | None = typer.Option(None, "--dbt-command-part"),
     scratch_schema: str | None = typer.Option(None, "--scratch-schema"),
     adapter: str | None = typer.Option(None, "--adapter"),
-    dry_run: bool = typer.Option(False, "--dry-run"),
-    json_: bool = typer.Option(False, "--json"),
-    fail_on: FailOn = typer.Option(FailOn.FIXABLE, "--fail-on"),
-    keep_workspace: bool = typer.Option(False, "--keep-workspace"),
-    allow_compile_introspection: bool = typer.Option(False, "--allow-compile-introspection"),
-    debug: bool = typer.Option(False, "--debug"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Prove and show the diff without writing."),
+    json_: bool | None = typer.Option(None, "--json", show_default=False),
+    keep_workspace: bool | None = typer.Option(None, "--keep-workspace", show_default=False),
+    debug: bool | None = typer.Option(None, "--debug", show_default=False),
 ) -> None:
-    try:
-        config = _common_config(
-            project_dir,
-            profiles_dir,
-            profile,
-            target,
-            dbt_command_part,
-            scratch_schema,
-            adapter,
-            fail_on,
-            json_,
-            debug,
-            keep_workspace,
-            allow_compile_introspection,
-        )
-    except Exception as exc:
-        err_console.print(f"configuration error: {exc}")
-        raise typer.Exit(code=int(ExitCode.OPERATIONAL_ERROR)) from None
-    svc = RefmergeService()
-    try:
-        fix_report = svc.fix(FixRequest(config=config, model_path=model_path, dry_run=dry_run))
-    except Exception as exc:
-        err_console.print(f"fix failed: {exc}")
-        raise typer.Exit(code=int(ExitCode.OPERATIONAL_ERROR)) from None
-    if fix_report.result is None:
-        err_console.print(f"fix: {fix_report.reason}")
-        raise typer.Exit(code=int(ExitCode.OPERATIONAL_ERROR)) from None
-    if json_:
-        sys.stdout.write(
-            json.dumps(
-                {
-                    "applied": fix_report.applied,
-                    "dry_run": fix_report.dry_run,
-                    "reason": fix_report.reason,
-                },
-                indent=2,
-            )
-            + "\n"
+    """Re-prove one model's merge and write it only if the proof passes."""
+    config = _load(
+        project_dir,
+        profiles_dir=profiles_dir,
+        profile=profile,
+        target=target,
+        dbt_command=_command(dbt_command_part),
+        scratch_schema=scratch_schema,
+        adapter=adapter,
+        json_output=json_,
+        keep_workspace=keep_workspace,
+        debug=debug,
+    )
+    request = FixRequest(config=config, model_path=model_path, dry_run=dry_run)
+    report = _run("fix", config, lambda: RefmergeService().fix(request))
+    result = report.result
+    if result is None:
+        err_console.print(f"fix: {report.reason}")
+        raise typer.Exit(code=int(ExitCode.OPERATIONAL_ERROR))
+    receipt = result.receipt
+    if config.json_output:
+        _write_json(
+            {
+                "applied": report.applied,
+                "dry_run": report.dry_run,
+                "reason": report.reason,
+                "model_unique_id": receipt.model_unique_id,
+                "status": receipt.status.value,
+                "reason_codes": [code.value for code in receipt.reason_codes],
+                "diff": result.diff,
+            }
         )
     else:
-        console.print(f"applied={fix_report.applied} dry_run={fix_report.dry_run} {fix_report.reason}")
-    if fix_report.applied:
+        if report.dry_run and result.diff:
+            console.print(result.diff.rstrip("\n"))
+        console.print(f"applied={report.applied} dry_run={report.dry_run} {report.reason}")
+    if report.applied or (report.dry_run and is_fixable(receipt)):
         raise typer.Exit(code=0)
-    # not applied: surface policy code
-    raise typer.Exit(code=int(ExitCode.UNVERIFIABLE)) from None
+    code = ExitCode.DIFFERENT if receipt.status is VerificationStatus.DIFFERENT else ExitCode.UNVERIFIABLE
+    raise typer.Exit(code=int(code))
 
 
 @app.command()
@@ -256,26 +236,21 @@ def cleanup(
     target: str | None = typer.Option(None, "--target"),
     dbt_command_part: list[str] | None = typer.Option(None, "--dbt-command-part"),
     scratch_schema: str | None = typer.Option(None, "--scratch-schema"),
+    debug: bool | None = typer.Option(None, "--debug", show_default=False),
 ) -> None:
-    """Drop the scratch views a check run left behind (found by run id in the scratch schema)."""
-    overrides: dict[str, object] = {
-        "profiles_dir": profiles_dir,
-        "profile": profile,
-        "target": target,
-        "dbt_command": tuple(dbt_command_part) if dbt_command_part else None,
-        "scratch_schema": scratch_schema,
-    }
-    try:
-        config = load_config(project_dir, cli_overrides=overrides)
-    except Exception as exc:
-        err_console.print(f"configuration error: {exc}")
-        raise typer.Exit(code=int(ExitCode.OPERATIONAL_ERROR)) from None
-    try:
-        result = RefmergeService().cleanup(CleanupRequest(config=config, run_id=run_id))
-    except Exception as exc:
-        err_console.print(f"cleanup failed: {exc}")
-        raise typer.Exit(code=int(ExitCode.OPERATIONAL_ERROR)) from None
-    sys.stdout.write(json.dumps(result, indent=2, sort_keys=True) + "\n")
+    """Drop the scratch views an interrupted check left behind (found by run id in the scratch schema)."""
+    config = _load(
+        project_dir,
+        profiles_dir=profiles_dir,
+        profile=profile,
+        target=target,
+        dbt_command=_command(dbt_command_part),
+        scratch_schema=scratch_schema,
+        debug=debug,
+    )
+    request = CleanupRequest(config=config, run_id=run_id)
+    result = _run("cleanup", config, lambda: RefmergeService().cleanup(request))
+    _write_json(result)
     raise typer.Exit(code=0 if result["complete"] else int(ExitCode.OPERATIONAL_ERROR))
 
 

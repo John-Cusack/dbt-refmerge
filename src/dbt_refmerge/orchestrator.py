@@ -21,7 +21,7 @@ from dbt_refmerge.analyze import (
     qualify_group,
 )
 from dbt_refmerge.artifacts import ManifestNodeModel, ManifestView, load_manifest
-from dbt_refmerge.config import AppConfig, CompilationContext
+from dbt_refmerge.config import AppConfig, CompilationContext, is_secret_name
 from dbt_refmerge.dbt_cli import DbtCli, DbtInvocation
 from dbt_refmerge.domain import (
     EqualityResult,
@@ -54,12 +54,12 @@ from dbt_refmerge.workspace import RunWorkspace
 @dataclass(frozen=True)
 class ScanRequest:
     config: AppConfig
-    select: str | None = None
-    compile: bool = False
 
 
 @dataclass(frozen=True)
 class CheckRequest:
+    """``select`` is a dbt selector; ``model_path`` (project-relative) checks exactly that model file."""
+
     config: AppConfig
     select: str | None = None
     model_path: Path | None = None
@@ -96,6 +96,9 @@ class CheckReport:
     run_id: str
     results: tuple[ModelResult, ...]
     candidate_bytes_map: dict[str, bytes]
+    dbt_version: str = ""
+    manifest_schema_version: str = ""
+    workspace_root: Path | None = None  # set when the workspace is kept
 
 
 @dataclass(frozen=True)
@@ -106,16 +109,47 @@ class FixReport:
     reason: str = ""
 
 
+def _model_paths(project_dir: Path) -> list[str]:
+    """``model-paths`` from dbt_project.yml (dbt's default ``models``); unusable values fall back to the default."""
+    import yaml
+
+    for filename in ("dbt_project.yml", "dbt_project.yaml"):
+        path = project_dir / filename
+        if not path.is_file():
+            continue
+        try:
+            raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, yaml.YAMLError):
+            break
+        paths = raw.get("model-paths") if isinstance(raw, dict) else None
+        if isinstance(paths, list) and paths and all(isinstance(p, str) for p in paths):
+            return paths
+        break
+    return ["models"]
+
+
 def discover_model_files(project_dir: Path) -> list[Path]:
-    out: list[Path] = []
-    for cand in ("models",):
-        root = project_dir / cand
-        if root.is_dir():
-            out.extend(sorted(root.rglob("*.sql")))
-    if not out:
-        out.extend(sorted(project_dir.rglob("*.sql")))
-    # exclude harness/target dirs
-    return [p for p in out if "target" not in p.parts and "dbt_packages" not in p.parts]
+    """SQL files under the project's model paths. Paths escaping the project are ignored."""
+    root = project_dir.resolve()
+    found: set[Path] = set()
+    for rel in _model_paths(project_dir):
+        base = project_dir / rel
+        if not base.is_dir() or not base.resolve().is_relative_to(root):
+            continue
+        found.update(p for p in base.rglob("*.sql") if p.is_file())
+    return sorted(found)
+
+
+def project_relative_path(model_path: Path, project_dir: Path) -> Path | None:
+    """``model_path`` (absolute, relative to the working directory, or relative to the project) as a
+    project-relative path, or None when it is not inside the project."""
+    root = project_dir.resolve()
+    candidates = [model_path] if model_path.is_absolute() else [Path.cwd() / model_path, root / model_path]
+    for candidate in candidates:
+        resolved = candidate.resolve()
+        if resolved.is_relative_to(root) and (resolved.is_file() or candidate is candidates[-1]):
+            return resolved.relative_to(root)
+    return None
 
 
 def detect_source_duplicates(
@@ -213,16 +247,15 @@ class RefmergeService:
             profile=request.config.profile,
             target=request.config.target,
         )
+        nodes_by_path = {
+            node.original_file_path.replace("\\", "/"): node.unique_id
+            for node in (_project_models(manifest) if manifest is not None else [])
+        }
         findings: list[Finding] = []
         for path in sorted(files):
             data = path.read_bytes()
-            # model uid proxy: file path relative
-            uid = f"model.{path.stem}"
-            if manifest is not None:
-                for node in manifest.models():
-                    if path.resolve().as_posix().endswith(node.original_file_path.replace("\\", "/")):
-                        uid = node.unique_id
-                        break
+            rel = path.relative_to(project_dir).as_posix()
+            uid = nodes_by_path.get(rel, f"model.{path.stem}")
             finding = detect_source_duplicates(data, manifest, uid, path, spec.fold_unquoted)
             if finding is not None:
                 findings.append(finding)
@@ -252,10 +285,7 @@ class RefmergeService:
         try:
             snapshot = ws.snapshot_project(config.project_dir)
             dbt = self._dbt_factory(config)
-            try:
-                version = dbt.version(cwd=snapshot.root)
-            except DbtError as exc:
-                raise exc
+            version = dbt.version(cwd=snapshot.root)
             caps = dbt.discover_capabilities(cwd=snapshot.root)
             context = CompilationContext(
                 dbt_executable=Path(config.dbt_command[0]),
@@ -266,12 +296,15 @@ class RefmergeService:
                 target=config.target,
                 vars_json=None,
                 passthrough_args=(),
-                environment_names=tuple(sorted([k for k in os.environ if not _is_secret(k)])),
+                environment_names=tuple(sorted([k for k in os.environ if not is_secret_name(k)])),
                 package_state_sha256=ws.package_state_digest(snapshot.root),
                 adapter=spec.name,
             )
             _ = caps
-            selector = request.select or "fqn:*"
+            if request.model_path is not None:
+                selector = f"path:{request.model_path.as_posix()}"
+            else:
+                selector = request.select or "fqn:*"
             baseline_inv = DbtInvocation(
                 project_dir=snapshot.root,
                 profiles_dir=config.profiles_dir,
@@ -284,23 +317,29 @@ class RefmergeService:
             res = dbt.compile(baseline_inv, selector)
             if res.returncode != 0:
                 raise DbtError(f"dbt compile failed: {res.stderr[-2000:]}", argv=res.argv_redacted)
-            manifest_path = ws.artifacts_root / "baseline-target" / "manifest.json"
-            if not manifest_path.is_file():
-                # fallback to snapshot target
-                manifest_path = snapshot.root / "target" / "manifest.json"
-            view = load_manifest(manifest_path)
+            # Every supported dbt honors --target-path; a stale <project>/target manifest is never read instead.
+            view = load_manifest(ws.artifacts_root / "baseline-target" / "manifest.json")
             _require_manifest_adapter(view, spec)
-            # select models: filter resource_type model + name match
-            models = [n for n in view.models() if _selected(n, request)]
-            if not models:
-                raise RefmergeError(ReasonCode.INTERNAL_ERROR, "no exact selected SQL model")
+            # dbt compiled exactly the selected nodes; package models are not the project's to rewrite.
+            models = [n for n in _project_models(view) if n.compiled_code is not None]
+            if request.model_path is not None:
+                models = [n for n in models if n.original_file_path.replace("\\", "/") == request.model_path.as_posix()]
+            elif not models:
+                raise RefmergeError(ReasonCode.INTERNAL_ERROR, f"no models selected by {selector!r}")
             results: list[ModelResult] = []
             cand_map: dict[str, bytes] = {}
             for node in sorted(models, key=lambda n: n.unique_id):
                 result, cand_bytes = self._check_one_model(config, ws, dbt, context, view, node, baseline_inv, spec)
                 results.append(result)
                 cand_map[result.model_unique_id] = cand_bytes
-            return CheckReport(run_id=ws.run_id, results=tuple(results), candidate_bytes_map=cand_map)
+            return CheckReport(
+                run_id=ws.run_id,
+                results=tuple(results),
+                candidate_bytes_map=cand_map,
+                dbt_version=view.metadata.dbt_version,
+                manifest_schema_version=view.metadata.dbt_schema_version,
+                workspace_root=ws.root if config.keep_workspace else None,
+            )
         finally:
             if not config.keep_workspace:
                 # A leftover local temp directory must not replace the report or the real error.
@@ -325,9 +364,10 @@ class RefmergeService:
             return ModelResult(node.unique_id, Path(node.original_file_path), receipt, ""), b""
         src_path = ws.source_snapshot / node.original_file_path
         if not src_path.is_file():
-            # try resolved under snapshot root
-            src_path = ws.source_snapshot / Path(node.original_file_path).name
-        raw = src_path.read_bytes() if src_path.is_file() else node.raw_code.encode("utf-8")
+            # The rewrite edits this exact file; never substitute a same-named file or the manifest's raw_code.
+            receipt = _unverifiable_receipt(ws, context, view, node, (ReasonCode.SOURCE_MAPPING_AMBIGUOUS,))
+            return ModelResult(node.unique_id, Path(node.original_file_path), receipt, ""), b""
+        raw = src_path.read_bytes()
         try:
             parsed_src = _parse_src(raw, fold_unquoted=spec.fold_unquoted)
         except RefmergeError as exc:
@@ -394,7 +434,11 @@ class RefmergeService:
         if cres.returncode != 0:
             receipt = _unverifiable_receipt(ws, context, view, node, (ReasonCode.DBT_COMMAND_FAILED,))
             return ModelResult(node.unique_id, src_path, receipt, ""), b""
-        cand_view = load_manifest(ws.artifacts_root / "candidate-target" / "manifest.json")
+        try:
+            cand_view = load_manifest(ws.artifacts_root / "candidate-target" / "manifest.json")
+        except ArtifactError as exc:
+            receipt = _unverifiable_receipt(ws, context, view, node, (exc.reason_code,))
+            return ModelResult(node.unique_id, src_path, receipt, ""), b""
         cand_node = cand_view.get(node.unique_id)
         if cand_node is None or not cand_node.compiled_code:
             receipt = _unverifiable_receipt(ws, context, view, node, (ReasonCode.COMPILE_DRIFT,))
@@ -418,7 +462,7 @@ class RefmergeService:
                 spec=spec,
             )
         )
-        diff = _unified_diff(raw, candidate_bytes, str(rel))
+        diff = _unified_diff(raw, candidate_bytes, rel.as_posix())  # a/ b/ headers use forward slashes everywhere
         return ModelResult(node.unique_id, src_path, receipt, diff), candidate_bytes
 
     def _validate_delta(
@@ -454,24 +498,19 @@ class RefmergeService:
 
     # -- fix --
     def fix(self, request: FixRequest) -> FixReport:
-        check_report = self.check(CheckRequest(config=request.config))
-        # find single model matching path
-        target = None
-        for r in check_report.results:
-            if r.source_path.as_posix().endswith(request.model_path.as_posix()) or r.source_path == request.model_path:
-                target = r
-                break
+        rel = project_relative_path(request.model_path, request.config.project_dir)
+        if rel is None:
+            return FixReport(applied=False, dry_run=request.dry_run, result=None, reason="model not found")
+        check_report = self.check(CheckRequest(config=request.config, model_path=rel))
+        target = next((r for r in check_report.results if r.receipt.source_path.as_posix() == rel.as_posix()), None)
         if target is None:
-            if len(check_report.results) == 1:
-                target = check_report.results[0]
-            else:
-                return FixReport(applied=False, dry_run=request.dry_run, result=None, reason="model not found")
+            return FixReport(applied=False, dry_run=request.dry_run, result=None, reason="model not found")
         if not is_fixable(target.receipt):
             return FixReport(applied=False, dry_run=request.dry_run, result=target, reason="not fixable")
         candidate_bytes = check_report.candidate_bytes_map.get(target.model_unique_id, b"")
         if request.dry_run:
             return FixReport(applied=False, dry_run=True, result=target, reason="dry-run")
-        live_path = request.config.project_dir / request.model_path
+        live_path = request.config.project_dir / rel
         apply_verified_source(
             live_path,
             expected_original_sha256=target.receipt.original_source_sha256,
@@ -502,20 +541,10 @@ def _require_manifest_adapter(view: ManifestView, spec: AdapterSpec) -> None:
         )
 
 
-def _is_secret(name: str) -> bool:
-    low = name.lower()
-    return any(h in low for h in ("secret", "password", "token", "key"))
-
-
-def _selected(node: ManifestNodeModel, request: CheckRequest) -> bool:
-    if request.model_path is not None:
-        return node.original_file_path.replace("\\", "/").endswith(request.model_path.as_posix())
-    if request.select:
-        sel = request.select
-        if sel in ("fqn:*", "*"):
-            return True
-        return sel in node.name or sel in node.unique_id
-    return True
+def _project_models(view: ManifestView) -> list[ManifestNodeModel]:
+    """Models of the root project (not installed packages) when the manifest names the project."""
+    project = view.metadata.project_name
+    return [n for n in view.models() if project is None or n.package_name == project]
 
 
 def _unified_diff(a: bytes, b: bytes, filename: str) -> str:

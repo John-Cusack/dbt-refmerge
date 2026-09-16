@@ -53,3 +53,14 @@ def test_launch_failure_error_carries_redacted_argv(tmp_path):
     with pytest.raises(DbtError) as exc_info:
         DbtCli((missing, "--password", "hunter2")).version(cwd=tmp_path)
     assert exc_info.value.argv == (missing, "--password", "***", "--version")
+
+
+def test_dbt_cli_rejects_empty_command():
+    with pytest.raises(DbtError) as exc_info:
+        DbtCli(())
+    assert str(exc_info.value) == "[DBT_COMMAND_FAILED] empty dbt command"
+    assert exc_info.value.argv == ()
+
+
+def test_parse_dbt_version_output_core_line_as_last_line():
+    assert parse_dbt_version_output("Plugins:\nCore:\n") == "Plugins:"

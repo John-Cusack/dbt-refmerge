@@ -13,9 +13,12 @@ Behaviour switches (``FAKE_DBT_MODE``, comma separated, ``key`` or ``key=value``
 - ``ignore_target_path``: write the manifest to ``<project>/target`` instead
 - ``adapter_type=<name>``: manifest ``metadata.adapter_type`` (default ``postgres``)
 - ``candidate_drop_node``: candidate manifest omits the selected model
+- ``candidate_bad_manifest``: candidate manifest is not valid JSON
+- ``original_file_path_prefix=<p>``: prefix every node's ``original_file_path`` (a file dbt-refmerge cannot find)
 - ``candidate_drift``: candidate compiled SQL gains ``limit 1``
-- ``sleep=<seconds>``, ``ignore_sigterm``, ``sigint_parent``: process-control tests
-- ``big_logs=<chars>``: write that many characters to stdout and stderr
+- ``sleep=<seconds>``, ``ignore_sigterm``, ``sigint_parent=<delay>``: process-control tests
+- ``big_logs=<chars>`` (with ``big_logs_char=<c>``): write that many characters to stdout and stderr
+- ``invalid_utf8``: write bytes that are not UTF-8 to stdout
 - ``echo_env=<NAME>``: print ``NAME=<value>`` to stdout
 - ``exit=<code>``: exit with ``code`` after everything else
 - ``parse_fail`` / ``run_fail`` / ``drop_fail``: that harness step exits 1
@@ -23,7 +26,7 @@ Behaviour switches (``FAKE_DBT_MODE``, comma separated, ``key`` or ``key=value``
 - ``harness_materialized=<m>``, ``harness_schema=<s>``, ``harness_extra_node``: preflight violations
 
 ``FAKE_DBT_VERSION_OUTPUT`` / ``FAKE_DBT_COMPILE_HELP`` replace those outputs, and
-``FAKE_DBT_ARGV_LOG`` appends each argv as a JSON line.
+``FAKE_DBT_ARGV_LOG`` appends each argv as a JSON line, and ``FAKE_DBT_PID_FILE`` receives the process id.
 
 Harness query results (``run-operation dbt_refmerge_query``), keyed by the call's ``label``:
 
@@ -90,10 +93,10 @@ ALIAS_RE = re.compile(r"""alias\s*=\s*['"]([A-Za-z0-9_]+)['"]""")
 HARNESS_NAME_RE = re.compile(r"'(dbt_refmerge_(?:baseline|candidate)_[a-z0-9_]+)'")
 
 
-def _selected(selector: str | None, name: str) -> bool:
+def _selected(selector: str | None, name: str, path: str = "") -> bool:
     if selector in (None, "fqn:*", "*"):
         return True
-    return selector in (name, f"fqn:{name}")
+    return selector in (name, f"fqn:{name}", f"path:{path}")
 
 
 def _compile(args: list[str], modes: dict[str, str], *, parse_only: bool = False) -> int:
@@ -117,7 +120,11 @@ def _compile(args: list[str], modes: dict[str, str], *, parse_only: bool = False
     for path in sorted((project / "models").rglob("*.sql")):
         name = path.stem
         uid = f"model.{package}.{name}"
-        if is_candidate and "candidate_drop_node" in modes and _selected(selector, name):
+        if (
+            is_candidate
+            and "candidate_drop_node" in modes
+            and _selected(selector, name, path.relative_to(project).as_posix())
+        ):
             continue
         raw = path.read_text(encoding="utf-8")
         config_match = CONFIG_RE.search(raw)
@@ -150,7 +157,11 @@ def _compile(args: list[str], modes: dict[str, str], *, parse_only: bool = False
         compiled = CONFIG_RE.sub("", raw)
         compiled = REF_RE.sub(lambda m: f'"db"."sch"."{m.group(1)}"', compiled)
         compiled = SOURCE_RE.sub(lambda m: f'"db"."{m.group(1)}"."{m.group(2)}"', compiled)
-        if is_candidate and "candidate_drift" in modes and _selected(selector, name):
+        if (
+            is_candidate
+            and "candidate_drift" in modes
+            and _selected(selector, name, path.relative_to(project).as_posix())
+        ):
             compiled = compiled.rstrip() + " limit 1\n"
         nodes[uid] = {
             "unique_id": uid,
@@ -158,13 +169,15 @@ def _compile(args: list[str], modes: dict[str, str], *, parse_only: bool = False
             "package_name": package,
             "name": name,
             "path": path.relative_to(project / "models").as_posix(),
-            "original_file_path": path.relative_to(project).as_posix(),
+            "original_file_path": modes.get("original_file_path_prefix", "") + path.relative_to(project).as_posix(),
             "database": "db",
             "schema": schema,
             "alias": alias,
             "relation_name": f'"db"."{schema}"."{alias}"',
             "raw_code": raw,
-            "compiled_code": compiled if _selected(selector, name) and not parse_only else None,
+            "compiled_code": compiled
+            if _selected(selector, name, path.relative_to(project).as_posix()) and not parse_only
+            else None,
             "depends_on": {
                 "macros": [],
                 "nodes": sorted(
@@ -195,6 +208,9 @@ def _compile(args: list[str], modes: dict[str, str], *, parse_only: bool = False
         "nodes": nodes,
         "sources": sources,
     }
+    if is_candidate and "candidate_bad_manifest" in modes:
+        (target / "manifest.json").write_text("{not json", encoding="utf-8")
+        return 0
     (target / "manifest.json").write_text(json.dumps(manifest, indent=1), encoding="utf-8")
     return 0
 
@@ -256,16 +272,27 @@ def main(args: list[str]) -> int:
     if log:
         with open(log, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(args) + "\n")
+    pid_file = os.environ.get("FAKE_DBT_PID_FILE")
+    if pid_file:
+        with open(pid_file, "w", encoding="utf-8") as fh:
+            fh.write(str(os.getpid()))
     if "ignore_sigterm" in modes:
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
     if "sigint_parent" in modes:
+        time.sleep(float(modes["sigint_parent"] or 0))
         os.kill(os.getppid(), signal.SIGINT)
     if "sleep" in modes:
         time.sleep(float(modes["sleep"]))
     if "big_logs" in modes:
         count = int(modes["big_logs"])
-        sys.stdout.write("o" * count)
-        sys.stderr.write("e" * count)
+        char = modes.get("big_logs_char", "o")
+        sys.stdout.buffer.write((char * count).encode("utf-8"))
+        sys.stderr.buffer.write((char * count).encode("utf-8"))
+        sys.stdout.flush()
+        sys.stderr.flush()
+    if "invalid_utf8" in modes:
+        sys.stdout.buffer.write(b"before \xff\xfe after\n")
+        sys.stdout.flush()
     if "echo_env" in modes:
         name = modes["echo_env"]
         print(f"{name}={os.environ.get(name, '')}")

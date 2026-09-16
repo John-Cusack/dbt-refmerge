@@ -7,6 +7,7 @@ import pytest
 from dbt_refmerge.config import AppConfig
 from dbt_refmerge.dbt_cli import DbtCli
 from dbt_refmerge.domain import ReasonCode, VerificationStatus, is_fixable
+from dbt_refmerge.errors import RefmergeError
 from dbt_refmerge.orchestrator import CheckRequest, FixRequest, RefmergeService
 
 pytestmark = pytest.mark.fake_dbt
@@ -109,3 +110,140 @@ def test_check_report_survives_local_workspace_cleanup_failure(make_project, fak
     report = RefmergeService().check(CheckRequest(config=_config(root, fake_dbt, tmp_path)))
 
     assert {r.model_unique_id for r in report.results} == {"model.p.orders", "model.p.stg_orders"}
+
+
+def test_unreadable_candidate_manifest_refuses_that_model_only(make_project, fake_dbt, tmp_path):
+    fake_dbt.set_mode("candidate_bad_manifest")
+    root = make_project({"models/stg_orders.sql": STG, "models/orders.sql": README_MODEL})
+
+    report = RefmergeService().check(CheckRequest(config=_config(root, fake_dbt, tmp_path)))
+
+    receipt = _results(report)["model.p.orders"].receipt
+    assert (receipt.status, receipt.reason_codes) == (VerificationStatus.UNVERIFIABLE, (ReasonCode.INTERNAL_ERROR,))
+
+
+def _model(
+    final: str = "select a.customer_id, b.amount from a join b using (id)", *, b_where: str = "", a_sep="\n"
+) -> str:
+    return (
+        f"with a as (\n    select\n        id,{a_sep}        customer_id\n    from {{{{ ref('stg_orders') }}}}\n),\n"
+        f"b as (\n    select\n        id,\n        amount\n    from {{{{ ref('stg_orders') }}}}{b_where}\n)\n"
+        f"{final}\n"
+    )
+
+
+@pytest.mark.parametrize(
+    ("model", "mode", "status", "codes"),
+    [
+        (
+            "{{ config(materialized='incremental') }}\n" + _model(),
+            None,
+            VerificationStatus.UNVERIFIABLE,
+            (ReasonCode.UNSUPPORTED_MODEL_TYPE,),
+        ),
+        (
+            _model()
+            .replace("        customer_id\n", "        customer_id\n", 1)
+            .replace("    select\n        id,\n        amount", "    select distinct\n        id,\n        amount"),
+            None,
+            VerificationStatus.UNVERIFIABLE,
+            (ReasonCode.UNSUPPORTED_IMPORT_SHAPE,),
+        ),
+        (
+            _model("select a.customer_id, b.amount, '{{ var(\"x\") }}' from a join b using (id)"),
+            None,
+            VerificationStatus.UNVERIFIABLE,
+            (ReasonCode.HARNESS_EMBEDDING_UNSAFE,),
+        ),
+        (
+            _model(b_where=" where amount > 0"),
+            None,
+            VerificationStatus.UNVERIFIABLE,
+            (ReasonCode.DIFFERENT_PREDICATE,),
+        ),
+        (
+            _model(a_sep=" "),
+            None,
+            VerificationStatus.UNVERIFIABLE,
+            (ReasonCode.UNSUPPORTED_IMPORT_SHAPE,),
+        ),
+        (_model(), "candidate_compile_fail", VerificationStatus.UNVERIFIABLE, (ReasonCode.DBT_COMMAND_FAILED,)),
+        (_model(), "candidate_drop_node", VerificationStatus.UNVERIFIABLE, (ReasonCode.COMPILE_DRIFT,)),
+        (_model(), "candidate_drift", VerificationStatus.UNVERIFIABLE, (ReasonCode.COMPILE_DRIFT,)),
+        (
+            _model(),
+            "original_file_path_prefix=moved/",
+            VerificationStatus.UNVERIFIABLE,
+            (ReasonCode.SOURCE_MAPPING_AMBIGUOUS,),
+        ),
+    ],
+    ids=[
+        "incremental",
+        "unsupported-duplicate-import",
+        "unrendered-jinja",
+        "different-predicates",
+        "single-line-select-list",
+        "candidate-compile-fails",
+        "candidate-node-missing",
+        "candidate-drift",
+        "source-file-not-in-snapshot",
+    ],
+)
+def test_check_refuses_models_it_cannot_prove(make_project, fake_dbt, tmp_path, model, mode, status, codes):
+    if mode:
+        fake_dbt.set_mode(mode)
+    root = make_project({"models/stg_orders.sql": STG, "models/m.sql": model})
+
+    report = RefmergeService().check(CheckRequest(config=_config(root, fake_dbt, tmp_path)))
+
+    receipt = _results(report)["model.p.m"].receipt
+    assert (receipt.status, receipt.reason_codes) == (status, codes)
+    assert not is_fixable(receipt)
+    assert "run" not in [call[0] for call in fake_dbt.calls()]
+
+
+def test_check_never_falls_back_to_a_manifest_outside_its_workspace(make_project, fake_dbt, tmp_path):
+    fake_dbt.set_mode("ignore_target_path")
+    root = make_project({"models/stg_orders.sql": STG, "models/orders.sql": README_MODEL})
+
+    with pytest.raises(RefmergeError, match="cannot read manifest"):
+        RefmergeService().check(CheckRequest(config=_config(root, fake_dbt, tmp_path)))
+
+
+@pytest.mark.parametrize(
+    ("mode", "message"),
+    [("version_fail", "dbt --version failed"), ("compile_fail", "dbt compile failed")],
+)
+def test_check_aborts_when_dbt_itself_fails(make_project, fake_dbt, tmp_path, mode, message):
+    fake_dbt.set_mode(mode)
+    root = make_project({"models/stg_orders.sql": STG, "models/orders.sql": README_MODEL})
+
+    with pytest.raises(RefmergeError, match=message):
+        RefmergeService().check(CheckRequest(config=_config(root, fake_dbt, tmp_path)))
+
+
+def test_check_with_a_selector_that_matches_nothing_is_an_error(make_project, fake_dbt, tmp_path):
+    root = make_project({"models/stg_orders.sql": STG, "models/orders.sql": README_MODEL})
+
+    with pytest.raises(RefmergeError, match="no models selected by 'nomatch'"):
+        RefmergeService().check(CheckRequest(config=_config(root, fake_dbt, tmp_path), select="nomatch"))
+
+
+def test_manifest_adapter_mismatch_aborts(make_project, fake_dbt, tmp_path):
+    fake_dbt.set_mode("adapter_type=snowflake")
+    root = make_project({"models/stg_orders.sql": STG, "models/orders.sql": README_MODEL})
+
+    with pytest.raises(RefmergeError) as exc_info:
+        RefmergeService().check(CheckRequest(config=_config(root, fake_dbt, tmp_path)))
+    assert exc_info.value.reason_code is ReasonCode.ADAPTER_MISMATCH
+
+
+def test_fix_path_outside_the_project_is_model_not_found(make_project, fake_dbt, tmp_path):
+    root = make_project({"models/stg_orders.sql": STG, "models/orders.sql": README_MODEL})
+    outside = tmp_path / "elsewhere.sql"
+    outside.write_text(README_MODEL)
+
+    report = RefmergeService().fix(FixRequest(config=_config(root, fake_dbt, tmp_path), model_path=outside))
+
+    assert (report.applied, report.result, report.reason) == (False, None, "model not found")
+    assert fake_dbt.calls() == []
