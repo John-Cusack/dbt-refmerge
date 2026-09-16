@@ -74,7 +74,7 @@ def build_plan(
 
     def _has_non_ref_jinja(start: int, end: int, allowed_ref_span: SourceSpan | None = None) -> bool:
         for jinja in model.masked.jinja_spans:
-            if not (start <= jinja.span.start_byte and jinja.span.end_byte <= end):
+            if jinja.span.end_byte <= start or jinja.span.start_byte >= end:
                 continue
             if allowed_ref_span is not None and jinja.span == allowed_ref_span:
                 continue

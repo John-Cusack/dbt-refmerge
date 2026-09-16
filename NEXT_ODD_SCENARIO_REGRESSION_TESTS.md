@@ -1,8 +1,8 @@
 # Next Odd-Scenario Regression Tests
 
-This document is the canonical, deduplicated regression-test strategy for `dbt-refmerge`. It reconciles the original proposal with `test-strategy.opus.md`; overlapping cases are listed once, and unsafe Opus expectations were corrected to follow the project's fail-closed policy. The first group contains cases that previously produced an unsafe plan, an incorrect no-op, or `INTERNAL_ERROR`. The second group pins behavior that is correct or conservatively fail-closed.
+This document is the canonical, deduplicated regression-test strategy for `dbt-refmerge`. It reconciles the original proposal with `test-strategy.opus.md`; overlapping cases are listed once, and unsafe Opus expectations were corrected to follow the project's fail-closed policy. All 43 numbered scenarios are implemented, and every heading uses the exact pytest function name. The first group records cases that previously produced an unsafe plan, an incorrect no-op, or `INTERNAL_ERROR`. The second group pins behavior that is correct or conservatively fail-closed.
 
-The implemented fast regression lane is `tests/unit/test_odd_scenarios.py`. It exercises these cases entirely in memory so the complete odd-scenario file remains sub-second.
+The implemented fast regression lane is `tests/unit/test_odd_scenarios.py`. It exercises these cases entirely in memory so the complete odd-scenario file remains sub-second. `qualify_group` consumes `downstream_refs`, `build_plan` reparses candidates with `model.fold_unquoted`, and the canonical comment/Jinja guard scans from `select_list_span.end_byte` through the canonical tail.
 
 ## Common fixture
 
@@ -28,7 +28,7 @@ The compiled SQL must mirror the source exactly, replacing each `{{ ref('stg') }
 
 Tests should remain plain pytest functions with no classes or mocks. Assert observable candidate SQL, status and exact reason codes, or the documented public error. Byte-sensitive tests must compare complete `bytes`, not normalized text.
 
-## Likely exposes a bug
+## Implemented regressions that exposed bugs
 
 These are ordered from highest silent-corruption risk downward.
 
@@ -53,7 +53,7 @@ Assertion: `NOT_ELIGIBLE` with exactly:
 (ReasonCode.REFERENCE_BINDING_AMBIGUOUS,)
 ```
 
-Why it matters: after projection union, rewritten `a AS b` unexpectedly gains `customer_id`, making the previously valid unqualified reference ambiguous. This pins downstream column-binding safety. `qualify_group` accepts `downstream_refs` but currently does not use them (`src/dbt_refmerge/analyze.py:56`).
+Why it matters: after projection union, rewritten `a AS b` unexpectedly gains `customer_id`, making the previously valid unqualified reference ambiguous. This pins the downstream column-binding check performed from `qualify_group`'s `downstream_refs`.
 
 ### 2. `test_downstream_qualified_star_refuses_projection_union`
 
@@ -72,7 +72,7 @@ Assertion: `NOT_ELIGIBLE` with exactly:
 (ReasonCode.UNSUPPORTED_IMPORT_SHAPE,)
 ```
 
-Why it matters: `b.*` originally exposes `(id, amount)` but exposes `(id, customer_id, amount)` after rewriting to `a AS b`. The `star_blocked` gate exists, but the orchestrator never supplies it (`src/dbt_refmerge/analyze.py:62`, `src/dbt_refmerge/orchestrator.py:338`).
+Why it matters: `b.*` originally exposes `(id, amount)` but exposes `(id, customer_id, amount)` after rewriting to `a AS b`. This pins propagation of downstream star expansion into the fail-closed qualification gate.
 
 ### 3. `test_comma_join_donor_binding_refuses`
 
@@ -95,7 +95,7 @@ Assertion: `NOT_ELIGIBLE` with exactly:
 (ReasonCode.REFERENCE_BINDING_AMBIGUOUS,)
 ```
 
-Why it matters: the current reference scanner only recognizes names immediately following `FROM` or `JOIN`. It misses comma-bound `b`, deletes its CTE, and leaves a dangling reference (`src/dbt_refmerge/source.py:862`).
+Why it matters: the former reference scanner missed comma-bound `b`, deleted its CTE, and left a dangling reference. This pins comma-bound relations as ambiguous downstream references.
 
 ### 4. `test_cross_join_keyword_is_not_an_implicit_alias`
 
@@ -119,7 +119,7 @@ from a as b cross join dim
 
 It must contain no `b as (` import CTE.
 
-Why it matters: `CROSS` is absent from the non-alias keyword list, so the current plan emits `from a cross join dim` while leaving `b.id` unchanged (`src/dbt_refmerge/source.py:888`, `src/dbt_refmerge/rewrite.py:191`).
+Why it matters: treating `CROSS` as an implicit alias emits `from a cross join dim` while leaving `b.id` unchanged. This pins `CROSS` as an alias-stopper keyword.
 
 ### 5. `test_natural_join_refuses_projection_union`
 
@@ -160,13 +160,13 @@ select * from final
 
 The compiled SQL mirrors the rendered `include_b=true` form, with the Jinja tags absent.
 
-Assertion: `NOT_ELIGIBLE` with exactly:
+Assertion: `build_plan` raises `RewriteError` with exactly:
 
 ```python
-(ReasonCode.COMMENT_RELOCATION_UNSUPPORTED,)
+assert exc_info.value.reason_code is ReasonCode.COMMENT_RELOCATION_UNSUPPORTED
 ```
 
-Why it matters: donor deletion starts at `b` but extends through the separator after `{% endif %}`, leaving an unmatched opening block. Separator extension does not inspect intervening Jinja (`src/dbt_refmerge/rewrite.py:141`).
+Why it matters: donor deletion starts at `b` but extends through the separator after `{% endif %}`, which would leave an unmatched opening block. The deletion guard now rejects any overlapping non-`ref` Jinja span.
 
 ### 7. `test_donor_comments_outside_select_span_refuse`
 
@@ -187,13 +187,13 @@ b as (...) /* donor ownership note */,
 
 The compiled SQL omits the comments but otherwise mirrors the source.
 
-Assertion for each case: `NOT_ELIGIBLE` with exactly:
+Assertion for each case: `build_plan` raises `RewriteError` with exactly:
 
 ```python
-(ReasonCode.COMMENT_RELOCATION_UNSUPPORTED,)
+assert exc_info.value.reason_code is ReasonCode.COMMENT_RELOCATION_UNSUPPORTED
 ```
 
-Why it matters: both comments are currently deleted. Comment collection stops at the final significant projection token, while the rewrite guard searches only `select_list_span` (`src/dbt_refmerge/source.py:773`, `src/dbt_refmerge/rewrite.py:129`).
+Why it matters: deleting either comment loses user-authored bytes. The rewrite guard scans the complete donor deletion span, including tail and separator ownership.
 
 ### 8. `test_canonical_terminal_comment_refuses_projection_append`
 
@@ -206,13 +206,13 @@ from {{ ref('stg') }}
 
 The donor contributes `amount`; compiled SQL mirrors the source.
 
-Assertion: `NOT_ELIGIBLE` with exactly:
+Assertion: `build_plan` raises `RewriteError` with exactly:
 
 ```python
-(ReasonCode.COMMENT_RELOCATION_UNSUPPORTED,)
+assert exc_info.value.reason_code is ReasonCode.COMMENT_RELOCATION_UNSUPPORTED
 ```
 
-Why it matters: current insertion occurs immediately after `customer_id`, turning the comment into an annotation on appended `amount`.
+Why it matters: insertion immediately after `customer_id` would turn the comment into an annotation on appended `amount`. The guard scans from `select_list_span.end_byte` through the canonical tail before inserting.
 
 ### 9. `test_none_fold_predicate_case_remains_semantic`
 
@@ -240,7 +240,7 @@ Assertion: `NOT_ELIGIBLE` with exactly:
 (ReasonCode.DIFFERENT_PREDICATE,)
 ```
 
-Why it matters: the fingerprint serializer currently lowercases every unquoted identifier regardless of dialect, so these predicates hash identically (`src/dbt_refmerge/semantics.py:344`).
+Why it matters: lowercasing every unquoted identifier regardless of dialect makes these predicates hash identically. This pins dialect-aware predicate fingerprints.
 
 ### 10. `test_quoted_cte_case_maps_without_folding`
 
@@ -275,7 +275,7 @@ Assertion: successful merge retaining `"A"` and rewriting the relation as:
 
 The flow must not report `SOURCE_MAPPING_AMBIGUOUS` or later `COMPILE_DRIFT`.
 
-Why it matters: compiled CTE quote state is read from `TableAlias` instead of its child `Identifier`, so `"A"` is currently indexed as folded `a`. The same mistake recurs in the expected-transform path (`src/dbt_refmerge/semantics.py:177`, `src/dbt_refmerge/semantics.py:594`).
+Why it matters: reading compiled CTE quote state from `TableAlias` instead of its child `Identifier` indexes `"A"` as folded `a`. This pins quote preservation in both source matching and expected transforms.
 
 ### 11. `test_none_fold_reparse_preserves_case_distinct_ctes`
 
@@ -297,7 +297,7 @@ The compiled SQL mirrors the same spellings.
 
 Assertion: successful exact merge preserving both `Foo` and `foo`.
 
-Why it matters: `build_plan` reparses the candidate with the default lower-folding frontend, causing a false duplicate-name error wrapped as `INTERNAL_ERROR` (`src/dbt_refmerge/rewrite.py:207`).
+Why it matters: reparsing with default lower-folding causes a false duplicate-name error wrapped as `INTERNAL_ERROR`. This pins candidate reparsing with `model.fold_unquoted`.
 
 ### 12. `test_bigquery_trailing_comma_style_merges`
 
@@ -334,7 +334,7 @@ amount,
 
 The donor is removed and formatting is otherwise byte-identical.
 
-Why it matters: the planner explicitly supports trailing commas, but the frontend creates an empty final projection and marks both imports unsupported, yielding a false `NO_DUPLICATE_IMPORT` (`src/dbt_refmerge/source.py:702`, `src/dbt_refmerge/rewrite.py:101`).
+Why it matters: the planner supports trailing commas, so the frontend must skip the empty final projection rather than yielding a false `NO_DUPLICATE_IMPORT`.
 
 ### 13. `test_unquoted_unicode_projection_merges`
 
@@ -342,7 +342,7 @@ PostgreSQL source uses `café_id` and `montant` as unquoted projection identifie
 
 Assertion: successful merge with exact UTF-8 output bytes.
 
-Why it matters: tokenization accepts Unicode identifiers, but projection validation subsequently applies an ASCII-only regex and silently removes the imports from grouping (`src/dbt_refmerge/source.py:749`).
+Why it matters: tokenization accepts Unicode identifiers, so later projection validation must not silently remove those imports from grouping with an ASCII-only check.
 
 ### 14. `test_decode_source_pure_crlf_is_not_mixed`
 
@@ -355,9 +355,9 @@ assert decoded.newline_style == "crlf"
 assert candidate == exact_expected_crlf_bytes
 ```
 
-Why it matters: replacing CRLF with LF before testing `has_lf` currently classifies every pure CRLF file as `"mixed"` (`src/dbt_refmerge/source.py:62`). The existing CRLF rewrite golden does not pin this metadata.
+Why it matters: newline classification must remove CRLF pairs before looking for lone CR or LF bytes. The existing CRLF rewrite golden did not pin this metadata.
 
-## Pin current correct or conservatively fail-closed behavior
+## Implemented pins for correct or conservatively fail-closed behavior
 
 These are ordered by semantic risk, then byte-exactness risk.
 
@@ -385,7 +385,7 @@ join a as rhs using (id)
 
 Why it matters: pins bare-name alias synthesis and explicit-alias preservation across multiple bindings of the donor.
 
-### 16. `test_four_member_group_with_one_divergent_filter_refuses_atomically`
+### 16. `test_four_members_one_divergent_filter_refuses_whole_group`
 
 Use four imports from `stg`. Imports `a`, `b`, and `c` use:
 
@@ -412,7 +412,7 @@ No partial three-member plan should be built.
 
 Why it matters: prevents unsafe subset merging and order-dependent qualification.
 
-### 17. `test_nested_cte_shadow_refuses_group`
+### 17. `test_nested_cte_shadow_refuses_end_to_end`
 
 Add this downstream CTE:
 
@@ -473,7 +473,7 @@ Assertions:
 
 Why it matters: pins the intentional dead-import policy and prevents later regressions that incorrectly require every donor to have a downstream reference.
 
-### 20. `test_donor_separated_by_nonimport_cte_preserves_intervening_bytes`
+### 20. `test_donors_separated_by_unrelated_cte_preserve_middle_block`
 
 CTE order:
 
@@ -499,7 +499,7 @@ Assertions:
 
 Why it matters: exercises comma ownership and nonadjacent group membership.
 
-### 21. `test_single_column_canonical_append_refuses_cleanly`
+### 21. `test_single_line_canonical_needs_insertion_refuses`
 
 Canonical:
 
@@ -552,9 +552,9 @@ Assertion: `RewriteError` with exactly:
 ReasonCode.COMMENT_RELOCATION_UNSUPPORTED
 ```
 
-Why it matters: pins the existing in-span comment guard independently of the currently missed boundary-comment cases.
+Why it matters: pins the in-span comment guard independently of the boundary-comment cases.
 
-### 23. `test_bom_rewrite_is_byte_exact`
+### 23. `test_bom_preserved_through_actual_rewrite`
 
 Source bytes:
 
@@ -572,7 +572,7 @@ assert candidate == b"\xef\xbb\xbf" + EXPECTED_BASE_BYTES
 
 Why it matters: pins the three-byte offset in every edit span, not merely successful parsing.
 
-### 24. `test_mixed_newlines_use_canonical_local_style_only`
+### 24. `test_mixed_crlf_lf_file_preserves_local_bytes`
 
 Construct raw bytes so that:
 
@@ -586,7 +586,7 @@ Assertion: compare complete expected bytes. The appended projection uses the can
 
 Why it matters: prevents global newline normalization and wrong local insertion style.
 
-### 25. `test_tab_indentation_is_preserved_exactly`
+### 25. `test_tab_indented_select_list_insertion`
 
 Both import lists use:
 
@@ -636,7 +636,7 @@ Assertion: exact UTF-8 output bytes, including the prefix comment and redirected
 
 Why it matters: pins `char_to_byte` offsets when multibyte characters precede every edited span.
 
-### 28. `test_cr_only_source_refuses_projection_insertion_cleanly`
+### 28. `test_cr_only_file_insertion_refuses_cleanly`
 
 The entire source uses `\r` as its line separator. The donor adds a missing projection. Compiled SQL is the normalized semantic mirror.
 
@@ -650,7 +650,7 @@ It must never become `INTERNAL_ERROR`.
 
 Why it matters: `_detect_newline_indent` recognizes only LF and CRLF today. This locks in a clean refusal for CR-only input.
 
-### 29. `test_projection_collision_respects_quoted_same_spelling_matrix`
+### 29. `test_quoted_and_unquoted_same_identity_collide`
 
 Use parametrized dialect cases:
 
@@ -668,7 +668,7 @@ Assertion for every case: exactly `NOT_ELIGIBLE` with:
 
 Why it matters: quoted identifiers never fold, but may still equal the dialect-resolved unquoted spelling.
 
-### 30. `test_unquoted_case_variant_matrix`
+### 30. `test_case_different_outputs_follow_dialect_fold`
 
 Use:
 
@@ -692,7 +692,7 @@ The compiled SQL uses the corresponding dialect spelling.
 
 Why it matters: pins all three `FoldRule` behaviors at the semantic and rewrite boundary.
 
-### 31. `test_backtick_and_bracket_delimiters_refuse_cleanly`
+### 31. `test_unsupported_cte_delimiters_refuse_cleanly`
 
 Use parametrized source cases.
 
@@ -749,9 +749,9 @@ Additional test rules:
 - A current `INTERNAL_ERROR` is never the expected result for these cases.
 - Do not assert private span coordinates or internal dictionaries; assert candidate SQL, status, reason code, or raised domain error.
 
-## Additional unique cases accepted from the Opus review
+## Additional implemented cases
 
-The following Opus scenarios were not duplicates of the ranked list above and are also implemented:
+The following scenarios extend the ranked list above and are also implemented:
 
 ### 32. `test_single_line_canonical_redundant_donor_merges`
 
@@ -775,7 +775,7 @@ Alias two different upstream columns to the same output inside one import CTE. A
 
 ### 37. `test_mixed_alias_styles_redirect_independently`
 
-Use bare, explicit-`AS`, and implicit aliases for three donors in one group. Assert each replacement independently preserves its binding spelling.
+Use three different donors in one group: `b` bare, `c AS cc`, and `d dd`. Assert each replacement independently preserves its binding spelling. The same-donor self-join case is covered separately by test 15.
 
 ### 38. `test_two_independent_groups_rewrite_in_one_fast_plan`
 
@@ -784,6 +784,22 @@ Put two duplicate groups for two upstream models in one source file. Assert both
 ### 39. `test_backtick_projection_duplicates_report_unsupported_shape`
 
 Two source CTEs with backtick-delimited projections over the same literal `ref()` must produce an observable `UNSUPPORTED_IMPORT_SHAPE` finding. They must not silently disappear into `NO_DUPLICATE_IMPORT`.
+
+### 40. `test_jinja_comma_overlapping_last_donor_deletion_refuses`
+
+Put a non-`ref` Jinja expression containing a comma between the preceding CTE separator and a last-position donor. Assert `build_plan` raises `COMMENT_RELOCATION_UNSUPPORTED`. This pins overlap rather than full containment: the raw comma search can otherwise choose a byte inside the Jinja span and produce malformed Jinja before the candidate reparse reports a misleading `INTERNAL_ERROR`.
+
+### 41. `test_quoted_and_unquoted_cte_names_redirect_with_exact_spelling`
+
+Use a lowercase unquoted canonical CTE and a case-distinct quoted donor. Assert the donor relation is redirected with its quoted binding spelling preserved exactly.
+
+### 42. `test_quoted_case_variants_never_fold`
+
+Use two differently cased quoted output identifiers under an upper-folding dialect. Assert both remain in the projection union because quoted identifiers never fold.
+
+### 43. `test_unquoted_case_variants_collide_under_folding_dialects`
+
+Parametrize lower- and upper-folding dialects with differently cased unquoted aliases backed by different upstream columns. Assert exactly `PROJECTION_COLLISION`.
 
 ## Opus proposals deliberately rejected or corrected
 
