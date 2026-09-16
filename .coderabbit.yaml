@@ -1,0 +1,28 @@
+# CodeRabbit review policy for dbt-refmerge.
+# NOTE: config alone does not activate reviews — install the CodeRabbit
+# GitHub App on this repo (github.com/marketplace/coderabbit-ai), then
+reviews:
+  auto_review: true
+  # Fail-closed domain: flag swallowed exceptions, silent fallbacks, and
+  # verification logic that could report success without proof.
+  review_status: true
+  collapse_walkthrough: false
+  high_level_summary: true
+  poem: false
+  estimation: true
+  finishing_touches: false
+path_instructions:
+  - path: "src/dbt_refmerge/verification/**"
+    instructions: >
+      This is proof code. Any path that can report success without executing
+      the warehouse comparison, or that catches an exception and continues as
+      if verified, is a blocking defect.
+  - path: "src/dbt_refmerge/adapters.py"
+    instructions: >
+      Fold rules must match the engine's real identifier semantics; a wrong
+      fold silently merges distinct columns. Demand a source for each rule.
+  - path: "tests/**"
+    instructions: >
+      Tests must assert observable behavior. Reject tests that pin wording,
+      implementation details, or incidental defaults.
+abort_on_close: true
