@@ -7,6 +7,7 @@ available. v0.1 verifies ``postgres`` only; every other adapter fails closed.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -162,22 +163,37 @@ def read_project_profile(project_dir: Path) -> str | None:
     return None
 
 
-def read_profiles_target_type(profiles_dir: Path | None, profile: str, target: str | None) -> str | None:
-    """Return the `type:` of a profiles.yml target, or None when unavailable.
+def _default_profiles_dir(project_dir: Path) -> Path:
+    """Where dbt looks for profiles.yml when no --profiles-dir is given.
+
+    dbt's order is ``DBT_PROFILES_DIR`` (ignored when empty), then the working directory if it holds a
+    ``profiles.yml``, then ``~/.dbt``. dbt-refmerge runs dbt from (a snapshot of) the project directory,
+    so the project directory stands in for the working directory, including for a relative
+    ``DBT_PROFILES_DIR``. dbt does not fall back once a directory is chosen, and neither does the reader.
+    """
+    env_dir = os.environ.get("DBT_PROFILES_DIR")
+    if env_dir:
+        return project_dir / env_dir
+    if (project_dir / "profiles.yml").exists():
+        return project_dir
+    return Path.home() / ".dbt"
+
+
+def read_profiles_target_type(profiles_dir: Path, profile: str, target: str | None) -> str | None:
+    """Return the `type:` of a target in ``<profiles_dir>/profiles.yml``, or None when unavailable.
+
+    Mirrors dbt: only ``profiles.yml`` is read, and the target is the override, else the profile's
+    ``target:`` key whenever present (dbt renders it; unrendered Jinja finds no output here), else
+    ``default``. An empty override counts as none because the tool never passes an empty --target.
 
     Fail-soft by design: absence of evidence is not evidence of an adapter.
     The resolution chain decides whether None is fatal.
     """
     import yaml
 
-    base = profiles_dir if profiles_dir is not None else Path.home() / ".dbt"
-    candidate = base / "profiles.yml"
-    if not candidate.is_file():
-        candidate = base / "profiles.yaml"
-        if not candidate.is_file():
-            return None
+    candidate = profiles_dir / "profiles.yml"
     try:
-        if candidate.stat().st_size > MAX_PROFILES_BYTES:
+        if not candidate.is_file() or candidate.stat().st_size > MAX_PROFILES_BYTES:
             return None
         raw = yaml.safe_load(candidate.read_text(encoding="utf-8"))
     except Exception:
@@ -188,9 +204,9 @@ def read_profiles_target_type(profiles_dir: Path | None, profile: str, target: s
     if not isinstance(entry, dict):
         return None
     outputs = entry.get("outputs")
-    if not isinstance(outputs, dict) or not outputs:
+    if not isinstance(outputs, dict):
         return None
-    target_name = target or entry.get("target") or "dev"
+    target_name = target or entry.get("target", "default")
     if not isinstance(target_name, str) or target_name not in outputs:
         return None
     output = outputs[target_name]
@@ -224,7 +240,8 @@ def resolve_adapter(
     profiles_name: str | None = None
     profile_name = profile or read_project_profile(project_dir)
     if profile_name:
-        profiles_type = read_profiles_target_type(profiles_dir, profile_name, target)
+        base = profiles_dir if profiles_dir is not None else _default_profiles_dir(project_dir)
+        profiles_type = read_profiles_target_type(base, profile_name, target)
         if profiles_type:
             profiles_name = canonical_adapter_name(profiles_type)
 
