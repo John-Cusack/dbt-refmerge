@@ -1139,3 +1139,22 @@ def test_projection_collision_reported_once(a_projection, b_projection):
     *_unused, qualified = _qualified(raw, compiled)
     assert qualified.status is FindingStatus.NOT_ELIGIBLE
     assert qualified.reason_codes == (ReasonCode.PROJECTION_COLLISION,)
+
+
+@pytest.mark.parametrize("newline", ["\n", "\r\n"], ids=["lf", "crlf"])
+def test_whitespace_only_line_after_donor_is_collapsed(newline):
+    final = "final as (select b.id from b)\nselect b.id from final"
+    raw = _source(final).replace("),\nfinal", "),\n  \t\nfinal").replace("\n", newline)
+    candidate = _candidate(raw, _compiled(final.replace("\n", " ")))
+    expected = (
+        "with a as (\n"
+        "    select\n"
+        "        id,\n"
+        "        customer_id,\n"
+        "        amount\n"
+        "    from {{ ref('stg') }}\n"
+        "),\n"
+        "final as (select b.id from a as b)\n"
+        "select b.id from final\n"
+    ).replace("\n", newline)
+    assert candidate == expected.encode()

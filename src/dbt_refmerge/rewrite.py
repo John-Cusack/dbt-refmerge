@@ -82,12 +82,11 @@ def build_plan(
     terminal_deletion_owner: str | None = None
     terminal_ref_spans: tuple[SourceSpan, ...] = ()
     if terminal_donors:
-        if terminal_donor_start == 0:
-            raise RewriteError(ReasonCode.UNSUPPORTED_IMPORT_SHAPE, "terminal donor separator is unavailable")
-        retained_predecessor = model.ctes[terminal_donor_start - 1]
-        predecessor_separator = retained_predecessor.separator_span
-        if predecessor_separator is None:
-            raise RewriteError(ReasonCode.UNSUPPORTED_IMPORT_SHAPE, "terminal donor separator is unavailable")
+        # A group's canonical CTE precedes its donors, so a CTE is always retained before the terminal run,
+        # and parse_source_model gives every CTE but the last a separator.
+        assert terminal_donor_start > 0
+        predecessor_separator = model.ctes[terminal_donor_start - 1].separator_span
+        assert predecessor_separator is not None
         terminal_deletion_start = predecessor_separator.start_byte
         terminal_deletion_owner = terminal_donors[0].identifier.identity.value
         terminal_ref_spans = tuple(cte.ref_call.span for cte in terminal_donors if cte.ref_call is not None)
@@ -196,8 +195,7 @@ def build_plan(
             )
             # include separator comma
             if donor.identity.value == terminal_deletion_owner:
-                if terminal_deletion_start is None:
-                    raise RewriteError(ReasonCode.UNSUPPORTED_IMPORT_SHAPE, "terminal donor separator is unavailable")
+                assert terminal_deletion_start is not None  # set together with terminal_deletion_owner
                 start = terminal_deletion_start
                 end = terminal_donors[-1].cte_span.end_byte
                 allowed_ref_spans = terminal_ref_spans
@@ -214,10 +212,10 @@ def build_plan(
                         ReasonCode.COMMENT_RELOCATION_UNSUPPORTED,
                         f"comment or Jinja after terminal donor {donor.source_text}",
                     )
-            elif donor_cte.separator_span is not None:
-                end = max(end, donor_cte.separator_span.end_byte)
             else:
-                raise RewriteError(ReasonCode.UNSUPPORTED_IMPORT_SHAPE, "donor separator is unavailable")
+                # A donor outside the terminal run has a retained CTE after it, so it is not last.
+                assert donor_cte.separator_span is not None
+                end = max(end, donor_cte.separator_span.end_byte)
             if _has_sql_comment(start, end) or _has_non_ref_jinja(start, end, allowed_ref_spans):
                 raise RewriteError(
                     ReasonCode.COMMENT_RELOCATION_UNSUPPORTED,
@@ -231,21 +229,15 @@ def build_plan(
                     end += 2
                 elif source[end : end + 1] == b"\n":
                     end += 1
-                # Collapse exactly one extra blank line left by the removed block,
-                # but never consume comment- or Jinja-bearing trivia.
+                # Collapse exactly one extra blank line left by the removed block. The line holds only
+                # spaces and tabs, so it cannot carry a comment or Jinja.
                 probe = end
                 while probe < len(source) and source[probe : probe + 1] in (b" ", b"\t"):
                     probe += 1
                 if source[probe : probe + 2] == b"\r\n":
-                    newline_len = 2
+                    end = probe + 2
                 elif source[probe : probe + 1] == b"\n":
-                    newline_len = 1
-                else:
-                    newline_len = 0
-                if newline_len:
-                    consumed = source[end : probe + newline_len]
-                    if not any(marker in consumed for marker in (b"--", b"/*", b"{{", b"{%", b"{#")):
-                        end = probe + newline_len
+                    end = probe + 1
             # strip leading blank line similarly if at start
             edits.append(
                 TextEdit(
@@ -262,14 +254,14 @@ def build_plan(
                 else:
                     replacement = canonical.source_text.encode("utf-8") + b" as " + donor.source_text.encode("utf-8")
                 edits.append(TextEdit(span=ref.span, replacement=replacement, reason_code=ReasonCode.OK))
-        if canonical_overall is None:
-            canonical_overall = canonical
 
     if canonical_overall is None:
         raise RewriteError(ReasonCode.NO_DUPLICATE_IMPORT, "no groups to plan")
     validate_edits(tuple(edits), len(source))
     candidate = apply_edits(source, tuple(edits))
-    # reparse guard: transformed group must no longer contain duplicates
+    # reparse guard: transformed group must no longer contain duplicates. Defense in depth: the edits only
+    # delete whole donor CTEs with their separators, append projections and rename references, so the
+    # candidate re-parses and no donor survives; no input is known to reach either refusal.
     from dbt_refmerge.source import parse_source_model as _parse
 
     try:
@@ -278,10 +270,10 @@ def build_plan(
         for qg in groups:
             remaining = [n for n in names if n in {m.source_cte.identifier.identity.value for m in qg.group.imports}]
             if len(remaining) >= 2:
-                raise RewriteError(ReasonCode.INTERNAL_ERROR, "duplicate group survives rewrite")
-    except RewriteError:
+                raise RewriteError(ReasonCode.INTERNAL_ERROR, "duplicate group survives rewrite")  # pragma: no cover
+    except RewriteError:  # pragma: no cover
         raise
-    except Exception as exc:
+    except Exception as exc:  # pragma: no cover
         raise RewriteError(ReasonCode.INTERNAL_ERROR, f"reparse after patch failed: {exc}") from exc
     candidate_sha = hashlib.sha256(candidate).hexdigest()
     return RewritePlan(

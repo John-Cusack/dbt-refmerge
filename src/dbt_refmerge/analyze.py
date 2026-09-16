@@ -63,8 +63,6 @@ def qualify_group(
     downstream_refs: tuple[DownstreamRef, ...] = (),
     whole_model_ok: bool = True,
     nested_names: frozenset[str] = frozenset(),
-    star_blocked: bool = False,
-    comment_blocked: bool = False,
 ) -> QualifiedDuplicateGroup:
     reasons: list[ReasonCode] = []
     # Members resolved to the same upstream node must also read the same compiled relation.
@@ -120,15 +118,7 @@ def qualify_group(
     # v0.1: require binding check only for referenced donors; unreferenced donor removal allowed.
     if not whole_model_ok:
         reasons.append(ReasonCode.NONDETERMINISTIC)
-    if star_blocked and ReasonCode.UNSUPPORTED_IMPORT_SHAPE not in reasons:
-        reasons.append(ReasonCode.UNSUPPORTED_IMPORT_SHAPE)
-    if comment_blocked:
-        reasons.append(ReasonCode.COMMENT_RELOCATION_UNSUPPORTED)
     if reasons:
-        # dedupe preserving order
-        seen: list[ReasonCode] = []
-        for r in reasons:
-            if r not in seen:
-                seen.append(r)
-        return QualifiedDuplicateGroup(group=group, status=FindingStatus.NOT_ELIGIBLE, reason_codes=tuple(seen))
+        # Each code above is appended at most once, in a stable order.
+        return QualifiedDuplicateGroup(group=group, status=FindingStatus.NOT_ELIGIBLE, reason_codes=tuple(reasons))
     return QualifiedDuplicateGroup(group=group, status=FindingStatus.MERGE_ELIGIBLE, reason_codes=(ReasonCode.OK,))

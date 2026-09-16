@@ -2,7 +2,11 @@
 
 from pathlib import Path
 
-from dbt_refmerge.analyze import group_imports, qualify_group
+import pytest
+
+from dbt_refmerge.analyze import FindingStatus, QualifiedDuplicateGroup, group_imports, qualify_group
+from dbt_refmerge.domain import ReasonCode, SourceSpan, TextEdit
+from dbt_refmerge.errors import InternalInvariantError, RewriteError
 from dbt_refmerge.rewrite import apply_edits, build_plan, validate_edits
 from dbt_refmerge.semantics import match_source_ctes, parse_model
 from dbt_refmerge.source import parse_source_model
@@ -268,3 +272,61 @@ def test_source_kind_matches_and_merges():
     plan = build_plan(raw, owner2.unique_id, Path("m.sql"), (q,), src)
     text = apply_edits(raw, plan.edits).decode()
     assert "b as (" not in text and "amount" in text
+
+
+def _edits(*spans: tuple[int, int]) -> tuple[TextEdit, ...]:
+    return tuple(
+        TextEdit(span=SourceSpan(start, end), replacement=b"x", reason_code=ReasonCode.OK) for start, end in spans
+    )
+
+
+@pytest.mark.parametrize(
+    ("spans", "message"),
+    [
+        (((3, 6), (0, 4)), "overlapping source edits"),
+        (((2, 2), (1, 3)), "overlapping source edits"),
+        (((5, 3),), "invalid source span"),
+        (((8, 11),), "invalid source span"),
+        (((-1, 2),), "invalid source span"),
+    ],
+    ids=["overlap", "insertion-inside-replacement", "reversed", "past-end", "negative-start"],
+)
+def test_validate_edits_rejects_overlap_and_out_of_bounds(spans, message):
+    with pytest.raises(InternalInvariantError) as exc_info:
+        validate_edits(_edits(*spans), 10)
+    assert exc_info.value.reason_code is ReasonCode.INTERNAL_ERROR
+    assert exc_info.value.message.startswith(message)
+
+
+def test_validate_edits_accepts_adjacent_and_boundary_spans():
+    edits = _edits((3, 5), (0, 3), (5, 5), (10, 10))
+    validate_edits(edits, 10)
+    assert apply_edits(b"0123456789", edits) == b"xxx56789x"
+
+
+def test_build_plan_without_groups_refuses():
+    raw, src, owner, _groups = _qualified()
+    with pytest.raises(RewriteError) as exc_info:
+        build_plan(raw, owner.unique_id, Path("m.sql"), (), src)
+    assert exc_info.value.reason_code is ReasonCode.NO_DUPLICATE_IMPORT
+
+
+def test_build_plan_refuses_collision_without_qualification():
+    # Defense in depth: a group wrongly marked eligible still cannot union colliding projections.
+    raw_str = (
+        "with a as (\n    select\n        amount as x\n    from {{ ref('stg') }}\n),\n"
+        "b as (\n    select\n        region as x\n    from {{ ref('stg') }}\n),\n"
+        "final as (\n    select a.x from a join b on a.x = b.x\n)\n"
+        "select * from final\n"
+    )
+    compiled = (
+        "with a as (select amount as x from db.sch.stg), "
+        "b as (select region as x from db.sch.stg), "
+        "final as (select a.x from a join b on a.x = b.x) "
+        "select * from final"
+    )
+    raw, src, owner, group = _run_case(raw_str, compiled)
+    forged = QualifiedDuplicateGroup(group=group, status=FindingStatus.MERGE_ELIGIBLE, reason_codes=(ReasonCode.OK,))
+    with pytest.raises(RewriteError) as exc_info:
+        build_plan(raw, owner.unique_id, Path("m.sql"), (forged,), src)
+    assert exc_info.value.reason_code is ReasonCode.PROJECTION_COLLISION
