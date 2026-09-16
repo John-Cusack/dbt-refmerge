@@ -66,6 +66,21 @@ def build_plan(
     canonical_overall: Identifier | None = None
     removed_all: list[Identifier] = []
 
+    def _has_sql_comment(start: int, end: int) -> bool:
+        decoded = model.decoded
+        return any(
+            token.kind == "comment" and start <= decoded.char_to_byte[token.start] < end for token in model.tokens
+        )
+
+    def _has_non_ref_jinja(start: int, end: int, allowed_ref_span: SourceSpan | None = None) -> bool:
+        for jinja in model.masked.jinja_spans:
+            if not (start <= jinja.span.start_byte and jinja.span.end_byte <= end):
+                continue
+            if allowed_ref_span is not None and jinja.span == allowed_ref_span:
+                continue
+            return True
+        return False
+
     for qg in groups:
         members = sorted(qg.group.imports, key=lambda m: m.source_cte.ordinal)
         canonical = members[0].source_cte.identifier
@@ -91,6 +106,17 @@ def build_plan(
         # --- projection insertion edit ---
         if missing:
             canon_cte = cte_by_ident[canonical.identity.value]
+            canonical_tail_end = (
+                canon_cte.ref_call.span.start_byte if canon_cte.ref_call is not None else canon_cte.body_span.end_byte
+            )
+            if _has_sql_comment(canon_cte.select_list_span.end_byte, canonical_tail_end) or _has_non_ref_jinja(
+                canon_cte.select_list_span.end_byte,
+                canonical_tail_end,
+            ):
+                raise RewriteError(
+                    ReasonCode.COMMENT_RELOCATION_UNSUPPORTED,
+                    f"comment or Jinja after canonical projection {canonical.source_text}",
+                )
             select_bytes = source[canon_cte.select_list_span.start_byte : canon_cte.select_list_span.end_byte]
             nl, indent, multiline = _detect_newline_indent(select_bytes)
             if not multiline:
@@ -121,19 +147,6 @@ def build_plan(
         # --- donor deletion edits ---
         for donor in donors:
             donor_cte = cte_by_ident[donor.identity.value]
-            # comment guard: any comment inside deletion span not attached to a moved projection -> reject
-            # simplified: if donor has attached comments outside moved projections, reject.
-            # attached comments move with their projection fragment only if that projection was already
-            # in canonical (deduplicated) — missing ones move via fragment copy, comments stay? v0.1: reject
-            # donor deletion when donor select list contains SQL comments.
-            select_region = source[donor_cte.select_list_span.start_byte : donor_cte.select_list_span.end_byte]
-            if b"--" in select_region or b"/*" in select_region:
-                # check whether comment bytes are inside a projection span that is being deduplicated
-                # conservative: reject
-                raise RewriteError(
-                    ReasonCode.COMMENT_RELOCATION_UNSUPPORTED,
-                    f"comment in donor {donor.source_text}",
-                )
             # deletion span: cte_span extended to consume separator comma ownership
             # Representation: leading trivia | CTE | trailing trivia | optional comma.
             # We delete cte_span; plus separator comma span if present; plus one adjacent newline run
@@ -157,6 +170,12 @@ def build_plan(
                 comma_idx = between.rfind(b",")
                 if comma_idx != -1:
                     start = prev_end + comma_idx
+            allowed_ref_span = donor_cte.ref_call.span if donor_cte.ref_call is not None else None
+            if _has_sql_comment(start, end) or _has_non_ref_jinja(start, end, allowed_ref_span):
+                raise RewriteError(
+                    ReasonCode.COMMENT_RELOCATION_UNSUPPORTED,
+                    f"comment or Jinja in donor deletion span {donor.source_text}",
+                )
             # also strip one trailing newline to avoid blank pile-up (only whitespace)
             while end < len(source) and source[end : end + 1] in (b" ", b"\t"):
                 end += 1
@@ -207,7 +226,7 @@ def build_plan(
     from dbt_refmerge.source import parse_source_model as _parse
 
     try:
-        reparsed = _parse(candidate)
+        reparsed = _parse(candidate, fold_unquoted=model.fold_unquoted)
         names = [c.identifier.identity.value for c in reparsed.ctes if c.ref_call is not None]
         for qg in groups:
             remaining = [n for n in names if n in {m.source_cte.identifier.identity.value for m in qg.group.imports}]

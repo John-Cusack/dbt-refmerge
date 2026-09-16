@@ -145,6 +145,15 @@ def _fold_for_dialect(dialect: str) -> str:
     return spec_for_dialect(dialect).fold_unquoted
 
 
+def _alias_name_and_quoted(alias_expr: Any) -> tuple[str, bool]:
+    """Extract the identifier carried by sqlglot's TableAlias wrapper."""
+    identifier = alias_expr.args.get("this") if hasattr(alias_expr, "args") else None
+    if isinstance(identifier, exp.Identifier):
+        return identifier.name, bool(identifier.args.get("quoted"))
+    name = alias_expr.name if hasattr(alias_expr, "name") else str(alias_expr)
+    return str(name), False
+
+
 def parse_model(sql: str, dialect: str = "postgres") -> ParsedModel:
     stripped = sql.strip()
     if not stripped:
@@ -178,10 +187,9 @@ def parse_model(sql: str, dialect: str = "postgres") -> ParsedModel:
         alias_expr = cte.args.get("alias")
         if alias_expr is None:
             continue
-        alias_name = alias_expr.name if hasattr(alias_expr, "name") else str(alias_expr)
+        alias_name, quoted = _alias_name_and_quoted(alias_expr)
         if not alias_name:
             continue
-        quoted = bool(alias_expr.args.get("quoted")) if hasattr(alias_expr, "args") else False
         ident = _normalize_ident(alias_name, quoted, _fold_for_dialect(dialect))
         ctes[ident] = cte
     return ParsedModel(sql=stripped, dialect=dialect, tree=tree, ctes=ctes)
@@ -308,11 +316,23 @@ def qualify_import_cte(cte_expr: Any) -> Qualification:
             reason_codes=(ReasonCode.UNSUPPORTED_IMPORT_SHAPE,),
             unexpected_nodes=("Star",),
         )
-    if inner.find(exp.Anonymous) is not None or inner.find(exp.Func) is not None:
-        # any function inside import is rejected (no scalar functions in direct import)
-        found = inner.find(exp.Func)
-        name = type(found).__name__ if found is not None else "Func"
-        return Qualification(ok=False, reason_codes=(ReasonCode.UNSUPPORTED_IMPORT_SHAPE,), unexpected_nodes=(name,))
+    unsupported_func = next(
+        (
+            node
+            for node in _iter_nodes(inner)
+            if isinstance(node, exp.Func) and type(node).__name__ not in _IMPORT_ALLOWED
+        ),
+        None,
+    )
+    if unsupported_func is not None:
+        # Any actual function call inside an import is rejected. sqlglot also
+        # models allowed boolean operators such as And/Or as Func subclasses,
+        # so the class allowlist must be consulted before refusing.
+        return Qualification(
+            ok=False,
+            reason_codes=(ReasonCode.UNSUPPORTED_IMPORT_SHAPE,),
+            unexpected_nodes=(type(unsupported_func).__name__,),
+        )
     for n in _iter_nodes(inner):
         cname = type(n).__name__
         if cname not in _IMPORT_ALLOWED:
@@ -341,23 +361,23 @@ def qualify_import_cte(cte_expr: Any) -> Qualification:
     return Qualification(ok=True, reason_codes=(ReasonCode.OK,))
 
 
-def _canonical(node: Any) -> Any:
+def _canonical(node: Any, fold: str = "lower") -> Any:
     """Versioned canonical serializer: tuple form without positions/comments."""
     if node is None:
         return None
     if isinstance(node, list):
-        return tuple(_canonical(v) for v in node)
+        return tuple(_canonical(v, fold) for v in node)
     if isinstance(node, exp.Expression):
         name = type(node).__name__
         args: dict[str, Any] = {}
         for k, v in node.args.items():
             if k in ("comments", "meta"):
                 continue
-            args[k] = _canonical(v)
+            args[k] = _canonical(v, fold)
         if isinstance(node, exp.Identifier):
             quoted = bool(node.args.get("quoted"))
             nm = node.name
-            args = {"this": nm if quoted else nm.lower(), "quoted": quoted}
+            args = {"this": _normalize_ident(nm, quoted, fold), "quoted": quoted}
         if isinstance(node, exp.Column):
             # normalize unquoted parts
             pass
@@ -367,24 +387,29 @@ def _canonical(node: Any) -> Any:
     return node
 
 
-def canonical_fingerprint(node: Any, version: str = SEMANTIC_FINGERPRINT_VERSION) -> str:
-    canon = _canonical(node)
+def canonical_fingerprint(
+    node: Any,
+    version: str = SEMANTIC_FINGERPRINT_VERSION,
+    *,
+    fold: str = "lower",
+) -> str:
+    canon = _canonical(node, fold)
     payload = json.dumps({"v": version, "ast": repr(canon)}, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
-def predicate_fingerprint(cte_expr: Any) -> str | None:
+def predicate_fingerprint(cte_expr: Any, *, fold: str = "lower") -> str | None:
     inner = cte_expr.args.get("this")
     if not isinstance(inner, exp.Select):
         return None
     where = inner.args.get("where")
     if where is None:
         return None
-    return canonical_fingerprint(where)
+    return canonical_fingerprint(where, fold=fold)
 
 
-def semantic_fingerprint(tree: Any) -> str:
-    return canonical_fingerprint(tree)
+def semantic_fingerprint(tree: Any, *, fold: str = "lower") -> str:
+    return canonical_fingerprint(tree, fold=fold)
 
 
 def match_source_ctes(
@@ -470,7 +495,7 @@ def match_source_ctes(
         src_where = scte.predicate_source_span is not None
         if inner_where != src_where:
             raise SemanticError(ReasonCode.SOURCE_MAPPING_AMBIGUOUS, f"predicate presence drift for {ident}")
-        fp = predicate_fingerprint(compiled)
+        fp = predicate_fingerprint(compiled, fold=fold)
         matched.append(
             MatchedCTE(
                 source_cte=scte,
@@ -567,7 +592,7 @@ def analyze_volatility(parsed: ParsedModel, deterministic_allowlist: frozenset[s
 
 
 def validate_compiled_delta(baseline: ParsedModel, candidate: ParsedModel, expected_fingerprint: str) -> None:
-    actual = semantic_fingerprint(candidate.tree)
+    actual = semantic_fingerprint(candidate.tree, fold=_fold_for_dialect(candidate.dialect))
     if actual != expected_fingerprint:
         raise SemanticError(ReasonCode.COMPILE_DRIFT, "candidate compiled AST differs from expected transform")
 
@@ -595,8 +620,8 @@ def build_expected_transform(
         alias_expr: Any = c.args.get("alias") if isinstance(c, exp.CTE) else None
         if alias_expr is None:
             return None
-        q = bool(alias_expr.args.get("quoted")) if hasattr(alias_expr, "args") else False
-        return _normalize_ident(alias_expr.name if hasattr(alias_expr, "name") else str(alias_expr), q, fold)
+        alias_name, quoted = _alias_name_and_quoted(alias_expr)
+        return _normalize_ident(alias_name, quoted, fold)
 
     by_ident = {}
     for c in ctes:
@@ -624,17 +649,22 @@ def build_expected_transform(
     top_with.set("expressions", remaining)
     # redirect table refs bound to donors: rename table to canonical + alias donor
     canon_alias_expr = canonical.args.get("alias")
-    canon_name = canon_alias_expr.name if hasattr(canon_alias_expr, "name") else str(canon_alias_expr)
+    canon_name, canon_quoted = _alias_name_and_quoted(canon_alias_expr)
     for scope_table in tree.find_all(exp.Table):
         # determine name
         tname = scope_table.name
-        if _normalize_ident(tname, False, fold) in set(donor_idents):
+        table_identifier = scope_table.args.get("this")
+        table_quoted = (
+            bool(table_identifier.args.get("quoted")) if isinstance(table_identifier, exp.Identifier) else False
+        )
+        if _normalize_ident(tname, table_quoted, fold) in set(donor_idents):
             # preserve alias behavior: if table already aliased, keep alias; else add alias = donor
             existing_alias = scope_table.args.get("alias")
             donor_raw = tname
+            donor_quoted = table_quoted
             # rename to canonical spelling (use canonical alias text from baseline)
-            scope_table.set("this", exp.to_identifier(canon_name))
+            scope_table.set("this", exp.to_identifier(canon_name, quoted=canon_quoted))
             if existing_alias is None:
-                scope_table.set("alias", exp.to_identifier(donor_raw))
+                scope_table.set("alias", exp.TableAlias(this=exp.to_identifier(donor_raw, quoted=donor_quoted)))
     _ = redirected_aliases
     return tree

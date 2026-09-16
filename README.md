@@ -39,6 +39,21 @@ working, not broken). Verification supports PostgreSQL in v0.1; `scan` parses
 16 dialects (snowflake, bigquery, duckdb, databricks, redshift, trino, spark,
 sqlite, tsql, oracle, exasol, clickhouse, and more).
 
+## Develop it
+
+Keep the inner test loop focused and in memory:
+
+```sh
+python3 -m pytest -q tests/unit/test_odd_scenarios.py  # odd-scenario safety lane
+python3 -m pytest -q                                  # complete suite
+python3 -m ruff check .
+python3 -m mypy --strict src
+```
+
+The odd-scenario lane avoids dbt subprocesses and warehouse setup; the full
+suite should also remain a sub-second pytest run on a typical development
+machine.
+
 ## Support
 
 If this saves you an afternoon, [buy me a coffee](https://buymeacoffee.com/johncusack).
