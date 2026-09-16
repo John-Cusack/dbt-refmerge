@@ -67,6 +67,9 @@ def qualify_group(
     comment_blocked: bool = False,
 ) -> QualifiedDuplicateGroup:
     reasons: list[ReasonCode] = []
+    # Members resolved to the same upstream node must also read the same compiled relation.
+    if len({m.semantic.relation for m in group.imports}) != 1:
+        reasons.append(ReasonCode.SOURCE_MAPPING_AMBIGUOUS)
     fps = {m.semantic.predicate_fingerprint for m in group.imports}
     if len(fps) != 1:
         reasons.append(ReasonCode.DIFFERENT_PREDICATE)

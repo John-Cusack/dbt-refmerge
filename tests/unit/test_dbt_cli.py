@@ -2,7 +2,8 @@
 
 import pytest
 
-from dbt_refmerge.dbt_cli import parse_dbt_version_output
+from dbt_refmerge.dbt_cli import DbtCli, _redact_argv, parse_dbt_version_output
+from dbt_refmerge.errors import DbtError
 
 DBT_1_12 = (
     "Core:\n"
@@ -28,3 +29,27 @@ DBT_1_12 = (
 )
 def test_parse_dbt_version_output(output, expected):
     assert parse_dbt_version_output(output) == expected
+
+
+@pytest.mark.parametrize(
+    ("argv", "expected"),
+    [
+        (["dbt", "compile", "--password", "hunter2"], ("dbt", "compile", "--password", "***")),
+        (["dbt", "--token=abc"], ("dbt", "--token=***")),
+        (["dbt", "--client-secret", "s", "--select", "m"], ("dbt", "--client-secret", "***", "--select", "m")),
+        (["dbt", "--vars", '{"api_key": "k"}'], ("dbt", "--vars", "***")),
+        (["dbt", "--vars", '{"day": "2026-01-01"}'], ("dbt", "--vars", '{"day": "2026-01-01"}')),
+        (["dbt", "compile", "--select", "secret_model"], ("dbt", "compile", "--select", "secret_model")),
+    ],
+    ids=["flag-value", "flag-equals", "hyphenated", "vars-with-secret", "vars-plain", "positional"],
+)
+def test_redact_argv_masks_secret_values(argv, expected):
+    # S11
+    assert _redact_argv(argv) == expected
+
+
+def test_launch_failure_error_carries_redacted_argv(tmp_path):
+    missing = str(tmp_path / "missing-dbt")
+    with pytest.raises(DbtError) as exc_info:
+        DbtCli((missing, "--password", "hunter2")).version(cwd=tmp_path)
+    assert exc_info.value.argv == (missing, "--password", "***", "--version")

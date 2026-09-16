@@ -444,6 +444,11 @@ def match_source_ctes(
         tables = list(inner.find_all(exp.Table))
         if len(tables) != 1:
             raise SemanticError(ReasonCode.UNSUPPORTED_IMPORT_SHAPE, "compiled import must read one relation")
+        relation = tuple(
+            _normalize_ident(part.name, bool(part.args.get("quoted")), fold)
+            for part in (tables[0].args.get(key) for key in ("catalog", "db", "this"))
+            if isinstance(part, exp.Identifier)
+        )
         # compare projections
         compiled_projs = inner.args.get("expressions", []) or []
         if len(compiled_projs) != len(scte.projections):
@@ -508,6 +513,7 @@ def match_source_ctes(
                     projections=tuple(sem_projs),
                     predicate_fingerprint=fp,
                     ast_path=("ctes", ident),
+                    relation=relation,
                 ),
             )
         )
@@ -572,17 +578,23 @@ def analyze_volatility(parsed: ParsedModel, deterministic_allowlist: frozenset[s
         ):
             continue
         unknown.append(fn)
-    # sampling / limit checks
-    sample_cls = getattr(exp, "Sample", None)
-    if sample_cls is not None and parsed.tree.find(sample_cls) is not None:
+    # Row sampling, and any query level that picks a subset of rows without its own ORDER BY.
+    if parsed.tree.find(exp.TableSample) is not None:
         return VolatilityResult(ok=False, reason_codes=(ReasonCode.NONDETERMINISTIC,), unknown_functions=("sample",))
-    limit = parsed.tree.find(exp.Limit)
-    order = parsed.tree.find(exp.Order)
-    if limit is not None and order is None:
+    for query in _iter_nodes(parsed.tree):
+        if not isinstance(query, exp.Query) or query.args.get("order") is not None:
+            continue
+        distinct = query.args.get("distinct")
+        if query.args.get("limit") is not None or query.args.get("offset") is not None:
+            unordered = "unordered_limit"
+        elif isinstance(distinct, exp.Distinct) and distinct.args.get("on") is not None:
+            unordered = "unordered_distinct_on"
+        else:
+            continue
         return VolatilityResult(
             ok=False,
             reason_codes=(ReasonCode.NONDETERMINISTIC,),
-            unknown_functions=("unordered_limit",),
+            unknown_functions=(unordered,),
         )
     if unknown:
         return VolatilityResult(

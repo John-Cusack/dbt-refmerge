@@ -977,3 +977,28 @@ def test_comment_inside_donor_select_refuses_cleanly():
     with pytest.raises(RewriteError) as exc_info:
         build_plan(raw_bytes, owner.unique_id, Path("m.sql"), (qualified,), source)
     assert exc_info.value.reason_code is ReasonCode.COMMENT_RELOCATION_UNSUPPORTED
+
+
+def test_group_members_reading_different_relations_refuse():
+    # S7: both CTEs ref('stg') in source, but the compiled SQL reads two different relations.
+    final = "final as (select a.customer_id, b.amount from a join b using (id))\nselect * from final"
+    compiled = (
+        "with a as (select id, customer_id from db.sch.stg), "
+        "b as (select id, amount from db.other.unrelated), "
+        "final as (select a.customer_id, b.amount from a join b using (id)) select * from final"
+    )
+    *_unused, qualified = _qualified(_source(final), compiled)
+    assert qualified.status is FindingStatus.NOT_ELIGIBLE
+    assert qualified.reason_codes == (ReasonCode.SOURCE_MAPPING_AMBIGUOUS,)
+
+
+def test_build_plan_refuses_ineligible_group():
+    # S8: the planner must not merge a group qualification rejected, even if a caller passes it.
+    final = "final as (select a.customer_id, b.amount from a join b using (id))\nselect * from final"
+    raw = _source(final, b_where=" where amount > 500")
+    compiled = _compiled(final, b_where=" where amount > 500")
+    raw_bytes, source, owner, _group, qualified = _qualified(raw, compiled)
+    assert qualified.reason_codes == (ReasonCode.DIFFERENT_PREDICATE,)
+    with pytest.raises(RewriteError) as exc_info:
+        build_plan(raw_bytes, owner.unique_id, Path("m.sql"), (qualified,), source)
+    assert exc_info.value.reason_code is ReasonCode.DIFFERENT_PREDICATE

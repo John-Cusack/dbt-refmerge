@@ -27,20 +27,26 @@ def normalize_pg_ident(text: str, quoted: bool) -> IdentifierIdentity:
     return IdentifierIdentity(value=text if quoted else text.lower())
 
 
+# PostgreSQL silently truncates identifiers longer than NAMEDATALEN - 1 bytes.
+PG_MAX_IDENTIFIER_BYTES = 63
+
+
 def validate_scratch_schema(schema: str, model_schema: str | None = None) -> IdentifierIdentity:
-    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_$]*", schema) and not (schema.startswith('"') and schema.endswith('"')):
-        # allow quoted form "..." with escapes
-        if not (len(schema) >= 2 and schema.startswith('"')):
-            raise ScratchBoundaryError(f"invalid scratch schema: {schema!r}")
-    quoted = schema.startswith('"')
-    value = schema[1:-1].replace('""', '"') if quoted else schema
+    if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_$]*", schema):
+        quoted = False
+        value = schema
+    elif re.fullmatch(r'"(?:[^"\x00]|"")+"', schema):
+        quoted = True
+        value = schema[1:-1].replace('""', '"')
+    else:
+        raise ScratchBoundaryError(f"invalid scratch schema: {schema!r}")
     ident = normalize_pg_ident(value, quoted)
+    if len(ident.value.encode("utf-8")) > PG_MAX_IDENTIFIER_BYTES:
+        raise ScratchBoundaryError(f"scratch schema exceeds {PG_MAX_IDENTIFIER_BYTES} bytes: {schema!r}")
     if ident.value.lower() in FORBIDDEN_SCHEMAS:
         raise ScratchBoundaryError(f"scratch schema forbidden: {schema}")
     if model_schema is not None and ident.value.lower() == model_schema.lower():
         raise ScratchBoundaryError("scratch schema must differ from model output schema")
-    if "\x00" in schema or len(schema) > 128:
-        raise ScratchBoundaryError("invalid scratch schema")
     return ident
 
 
@@ -112,8 +118,9 @@ def build_harness_project(
     baseline_alias = f"{BASELINE_ALIAS_PREFIX}{token}"
     candidate_alias = f"{CANDIDATE_ALIAS_PREFIX}{token}"
     for sql in (baseline_sql, candidate_sql):
-        if "{% endraw %}" in sql:
-            raise VerificationError(ReasonCode.HARNESS_EMBEDDING_UNSAFE, "raw-block terminator in compiled SQL")
+        # Any "{%" could close the raw block ({%endraw%}, {%- endraw %}, ...); compiled SQL never needs one.
+        if "{%" in sql:
+            raise VerificationError(ReasonCode.HARNESS_EMBEDDING_UNSAFE, "Jinja block delimiter in compiled SQL")
     baseline_body = strip_single_terminal_semicolon(baseline_sql)
     candidate_body = strip_single_terminal_semicolon(candidate_sql)
     root = ws.harness_project

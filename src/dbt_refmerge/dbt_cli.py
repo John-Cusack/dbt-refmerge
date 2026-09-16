@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from dbt_refmerge.config import redact_mapping
+from dbt_refmerge.config import is_secret_name
 from dbt_refmerge.errors import DbtError
 
 JSONValue = Any
@@ -82,17 +82,25 @@ def parse_dbt_version_output(text: str) -> str:
 
 
 def _redact_argv(argv: list[str]) -> tuple[str, ...]:
+    """Mask values of secret-looking flags, and ``--vars`` payloads that mention a secret."""
     out: list[str] = []
-    skip_next = False
+    pending: str | None = None  # "secret" or "vars": how to treat the next token
     for tok in argv:
-        if skip_next:
-            out.append("***")
-            skip_next = False
+        if pending is not None:
+            out.append("***" if pending == "secret" or is_secret_name(tok) else tok)
+            pending = None
             continue
-        low = tok.lower()
-        if any(h in low for h in ("password", "token", "secret")) and "=" not in tok:
-            out.append(tok)
-            continue
+        if tok.startswith("-"):
+            name, has_value, value = tok.partition("=")
+            flag = name.lstrip("-")
+            kind = "secret" if is_secret_name(flag) else "vars" if flag == "vars" else None
+            if kind is not None:
+                if not has_value:
+                    pending = kind
+                    out.append(tok)
+                else:
+                    out.append(f"{name}=***" if kind == "secret" or is_secret_name(value) else tok)
+                continue
         out.append(tok)
     return tuple(out)
 
@@ -159,7 +167,7 @@ class DbtCli:
                 start_new_session=True,
             )
         except OSError as exc:
-            raise DbtError(f"failed to launch dbt: {exc}", argv=tuple(argv)) from exc
+            raise DbtError(f"failed to launch dbt: {exc}", argv=_redact_argv(argv)) from exc
         timed_out = False
         try:
             stdout, stderr = proc.communicate(timeout=timeout_seconds)
@@ -180,7 +188,6 @@ class DbtCli:
             stdout = stdout[-MAX_RETAINED_LOG_BYTES:]
         if len(stderr.encode("utf-8", "ignore")) > MAX_RETAINED_LOG_BYTES:
             stderr = stderr[-MAX_RETAINED_LOG_BYTES:]
-        _ = redact_mapping(dict(full_env))
         return CommandResult(
             argv_redacted=_redact_argv(argv),
             returncode=proc.returncode,

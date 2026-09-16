@@ -603,7 +603,12 @@ def apply_verified_source(
     candidate_bytes: bytes,
     expected_candidate_sha256: str,
 ) -> None:
-    """Atomic same-directory replacement with lock + hash/stat preconditions."""
+    """Atomic same-directory replacement under an exclusive lock, with content preconditions.
+
+    The lock file is opened without following symlinks and removed afterwards. The source is
+    re-hashed immediately before ``os.replace``; a stat comparison cannot see a same-size edit
+    inside the filesystem's mtime granularity.
+    """
     import tempfile
 
     if path.is_symlink() or not path.is_file():
@@ -611,54 +616,59 @@ def apply_verified_source(
     if hashlib.sha256(candidate_bytes).hexdigest() != expected_candidate_sha256:
         raise SourceChangedError(ReasonCode.SOURCE_CHANGED_BEFORE_APPLY, "candidate digest mismatch")
     lock_path = path.with_name(path.name + ".dbt-refmerge.lock")
-    with lock_path.open("w") as lock:
+    if lock_path.is_symlink():
+        raise RefmergeError(ReasonCode.INTERNAL_ERROR, f"refusing symlinked lock file: {lock_path}")
+    try:
+        lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    except OSError as exc:
+        raise RefmergeError(ReasonCode.INTERNAL_ERROR, f"cannot open lock file {lock_path}: {exc}") from exc
+    try:
         if sys.platform != "win32":
             import fcntl
 
             try:
-                fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-            except OSError:
-                pass
+                fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            except OSError as exc:
+                raise RefmergeError(ReasonCode.INTERNAL_ERROR, f"cannot lock {path}: {exc}") from exc
+        if hashlib.sha256(path.read_bytes()).hexdigest() != expected_original_sha256:
+            raise SourceChangedError(ReasonCode.SOURCE_CHANGED_BEFORE_APPLY, "source changed before apply")
+        mode = path.stat().st_mode
+        tmp_fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=".dbt-refmerge-")
         try:
-            current = path.read_bytes()
-            st_before = path.stat()
-            if hashlib.sha256(current).hexdigest() != expected_original_sha256:
+            with os.fdopen(tmp_fd, "wb") as fh:
+                fh.write(candidate_bytes)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.chmod(tmp_name, mode)
+            if hashlib.sha256(path.read_bytes()).hexdigest() != expected_original_sha256:
                 raise SourceChangedError(ReasonCode.SOURCE_CHANGED_BEFORE_APPLY, "source changed before apply")
-            mode = st_before.st_mode
-            tmp_fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=".dbt-refmerge-")
-            try:
-                with os.fdopen(tmp_fd, "wb") as fh:
-                    fh.write(candidate_bytes)
-                    fh.flush()
-                    os.fsync(fh.fileno())
-                os.chmod(tmp_name, mode)
-                st_after = path.stat()
-                if st_after.st_mtime_ns != st_before.st_mtime_ns or st_after.st_size != st_before.st_size:
-                    # re-read to confirm content unchanged (mtime may lack granularity)
-                    current2 = path.read_bytes()
-                    if hashlib.sha256(current2).hexdigest() != expected_original_sha256:
-                        raise SourceChangedError(ReasonCode.SOURCE_CHANGED_BEFORE_APPLY, "source changed before apply")
-                os.replace(tmp_name, path)
-                if sys.platform != "win32":
-                    try:
-                        dir_fd = os.open(str(path.parent), os.O_DIRECTORY)
-                        try:
-                            os.fsync(dir_fd)
-                        finally:
-                            os.close(dir_fd)
-                    except OSError:
-                        pass
-            finally:
+            os.replace(tmp_name, path)
+            if sys.platform != "win32":
                 try:
-                    if os.path.exists(tmp_name):
-                        os.unlink(tmp_name)
+                    dir_fd = os.open(str(path.parent), os.O_DIRECTORY)
+                    try:
+                        os.fsync(dir_fd)
+                    finally:
+                        os.close(dir_fd)
                 except OSError:
                     pass
         finally:
-            if sys.platform != "win32":
-                import fcntl
+            try:
+                if os.path.exists(tmp_name):
+                    os.unlink(tmp_name)
+            except OSError:
+                pass
+    finally:
+        if sys.platform != "win32":
+            # Unlink while still holding the lock; a waiter on the old inode re-hashes and refuses.
+            _unlink_quietly(lock_path)
+        os.close(lock_fd)
+        if sys.platform == "win32":
+            _unlink_quietly(lock_path)  # Windows cannot delete a file that is still open
 
-                try:
-                    fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
-                except OSError:
-                    pass
+
+def _unlink_quietly(path: Path) -> None:
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
