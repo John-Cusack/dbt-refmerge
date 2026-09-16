@@ -6,7 +6,7 @@ import hashlib
 from pathlib import Path
 
 from dbt_refmerge.analyze import QualifiedDuplicateGroup
-from dbt_refmerge.domain import Identifier, ReasonCode, RewritePlan, SourceSpan, TextEdit
+from dbt_refmerge.domain import Identifier, ReasonCode, RewritePlan, SourceCTE, SourceSpan, TextEdit
 from dbt_refmerge.errors import InternalInvariantError, RewriteError
 from dbt_refmerge.source import DownstreamRef, ParsedSourceModel
 
@@ -65,6 +65,11 @@ def build_plan(
     edits: list[TextEdit] = []
     canonical_overall: Identifier | None = None
     removed_all: list[Identifier] = []
+    all_donor_identities = {
+        member.source_cte.identifier.identity.value
+        for qualified in groups
+        for member in sorted(qualified.group.imports, key=lambda item: item.source_cte.ordinal)[1:]
+    }
 
     def _has_sql_comment(start: int, end: int) -> bool:
         decoded = model.decoded
@@ -160,19 +165,20 @@ def build_plan(
             if donor_cte.separator_span is not None:
                 end = max(end, donor_cte.separator_span.end_byte)
             else:
-                # last CTE: need to consume the comma of the previous sibling? Instead previous CTE
-                # owns its trailing comma; deleting last CTE leaves dangling comma -> must remove it.
-                # Find previous CTE's separator and extend deletion backwards to cover it? That would
-                # consume retained CTE trivia. v0.1 approach: delete donor span + preceding comma run.
-                # Search backwards for the nearest comma in source between previous CTE end and donor start.
-                prev_end = 0
+                # A last donor consumes a retained previous sibling's separator. If that sibling is
+                # also a donor, its own forward deletion already owns the separator, so starting this
+                # edit at the final donor avoids overlapping deletion spans.
+                previous_cte: SourceCTE | None = None
                 for c in model.ctes:
-                    if c.cte_span.end_byte <= start and c.cte_span.end_byte > prev_end:
-                        prev_end = c.cte_span.end_byte
-                between = source[prev_end:start]
-                comma_idx = between.rfind(b",")
-                if comma_idx != -1:
-                    start = prev_end + comma_idx
+                    if c.cte_span.end_byte <= start and (
+                        previous_cte is None or c.cte_span.end_byte > previous_cte.cte_span.end_byte
+                    ):
+                        previous_cte = c
+                if previous_cte is not None and previous_cte.identifier.identity.value not in all_donor_identities:
+                    between = source[previous_cte.cte_span.end_byte : start]
+                    comma_idx = between.rfind(b",")
+                    if comma_idx != -1:
+                        start = previous_cte.cte_span.end_byte + comma_idx
             allowed_ref_span = donor_cte.ref_call.span if donor_cte.ref_call is not None else None
             if _has_sql_comment(start, end) or _has_non_ref_jinja(start, end, allowed_ref_span):
                 raise RewriteError(

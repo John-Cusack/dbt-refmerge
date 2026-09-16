@@ -496,6 +496,37 @@ def test_last_cte_donor_removes_preceding_separator():
     assert len(parse_source_model(candidate.encode()).ctes) == 1
 
 
+def test_consecutive_donors_with_last_donor_do_not_overlap_edits():
+    raw = (
+        "with a as (\n"
+        "    select\n"
+        "        id,\n"
+        "        base_value\n"
+        "    from {{ ref('stg') }}\n"
+        "),\n"
+        "b as (\n"
+        "    select\n"
+        "        id,\n"
+        "        amount\n"
+        "    from {{ ref('stg') }}\n"
+        "),\n"
+        "c as (\n"
+        "    select\n"
+        "        id,\n"
+        "        customer_id\n"
+        "    from {{ ref('stg') }}\n"
+        ")\n"
+        "select b.amount, c.customer_id from b join c using (id)\n"
+    )
+    compiled = raw.replace("{{ ref('stg') }}", "db.sch.stg")
+    candidate = _candidate(raw, compiled).decode()
+    assert "b as (" not in candidate
+    assert "c as (" not in candidate
+    assert "base_value,\n        amount,\n        customer_id" in candidate
+    assert "from a as b join a as c using (id)" in candidate
+    assert len(parse_source_model(candidate.encode()).ctes) == 1
+
+
 def test_nested_cte_shadow_refuses_end_to_end():
     final = (
         "wrapper as (with b as (select id from dim) select id from b),\n"
