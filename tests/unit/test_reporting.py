@@ -280,12 +280,12 @@ def test_render_human_check_includes_diff_only_when_present():
 
     assert render_human_check(report) == "\n".join(
         [
-            f"model model.p.a ({Path('models/a.sql')})",
+            "model model.p.a (models/a.sql)",
             "  status: unverifiable fixable=False",
             "  reasons: COMPILE_DRIFT, OK",
             "  rows: baseline=0 candidate=0 baseline_only=0 candidate_only=0 schema_equal=False",
             "  verification scope: one-statement snapshot-equivalent multiset comparison (not universal proof)",
-            f"model model.p.b ({Path('models/b.sql')})",
+            "model model.p.b (models/b.sql)",
             "  status: snapshot_equivalent fixable=True",
             "  reasons: OK",
             "  rows: baseline=3 candidate=3 baseline_only=0 candidate_only=0 schema_equal=True",
