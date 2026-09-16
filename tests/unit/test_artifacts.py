@@ -105,7 +105,8 @@ _VALID_JSON = json.dumps(_payload()).encode("utf-8")
         (_VALID_JSON[:-1], "invalid manifest JSON"),
         (b'{"metadata": {}, "metadata": {}}', "duplicate JSON key: metadata"),
         (_VALID_JSON[:-1] + b', "n": ' + b"1" * 5000 + b"}", "invalid manifest JSON"),
-        (b"[" * 100_000 + b"]" * 100_000, "invalid manifest JSON"),
+        # Python <= 3.13 raises RecursionError while decoding; 3.14 decodes it and the structure is refused.
+        (b"[" * 100_000 + b"]" * 100_000, None),
     ],
     ids=["non-utf8", "utf8-bom", "truncated", "duplicate-key", "huge-integer", "deep-nesting"],
 )
