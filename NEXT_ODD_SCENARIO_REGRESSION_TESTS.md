@@ -1,6 +1,6 @@
 # Next Odd-Scenario Regression Tests
 
-This document is the canonical, deduplicated regression-test strategy for `dbt-refmerge`. It reconciles the original proposal with `test-strategy.opus.md`; overlapping cases are listed once, and unsafe Opus expectations were corrected to follow the project's fail-closed policy. All 43 numbered scenarios are implemented, and every heading uses the exact pytest function name. The first group records cases that previously produced an unsafe plan, an incorrect no-op, or `INTERNAL_ERROR`. The second group pins behavior that is correct or conservatively fail-closed.
+This document is the canonical, deduplicated regression-test strategy for `dbt-refmerge`. It reconciles the original proposal with `test-strategy.opus.md`; overlapping cases are listed once, and unsafe Opus expectations were corrected to follow the project's fail-closed policy. All 44 numbered scenarios are implemented, and every heading uses the exact pytest function name. The first group records cases that previously produced an unsafe plan, an incorrect no-op, or `INTERNAL_ERROR`. The second group pins behavior that is correct or conservatively fail-closed.
 
 The implemented fast regression lane is `tests/unit/test_odd_scenarios.py`. It exercises these cases entirely in memory so the complete odd-scenario file remains sub-second. `qualify_group` consumes `downstream_refs`, `build_plan` reparses candidates with `model.fold_unquoted`, and the canonical comment/Jinja guard scans from `select_list_span.end_byte` through the canonical tail.
 
@@ -800,6 +800,10 @@ Use two differently cased quoted output identifiers under an upper-folding diale
 ### 43. `test_unquoted_case_variants_collide_under_folding_dialects`
 
 Parametrize lower- and upper-folding dialects with differently cased unquoted aliases backed by different upstream columns. Assert exactly `PROJECTION_COLLISION`.
+
+### 44. `test_sql_comment_comma_overlapping_last_donor_deletion_refuses`
+
+Put a SQL block comment containing a comma between the preceding CTE separator and a last-position donor. Assert `build_plan` raises `COMMENT_RELOCATION_UNSUPPORTED`. This pins overlap using both comment-token boundaries: otherwise the raw comma search can start deletion inside the comment while a start-only guard misses it.
 
 ## Opus proposals deliberately rejected or corrected
 

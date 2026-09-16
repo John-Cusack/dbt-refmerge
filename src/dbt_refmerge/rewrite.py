@@ -69,7 +69,10 @@ def build_plan(
     def _has_sql_comment(start: int, end: int) -> bool:
         decoded = model.decoded
         return any(
-            token.kind == "comment" and start <= decoded.char_to_byte[token.start] < end for token in model.tokens
+            token.kind == "comment"
+            and decoded.char_to_byte[token.start] < end
+            and decoded.char_to_byte[token.end] > start
+            for token in model.tokens
         )
 
     def _has_non_ref_jinja(start: int, end: int, allowed_ref_span: SourceSpan | None = None) -> bool:
