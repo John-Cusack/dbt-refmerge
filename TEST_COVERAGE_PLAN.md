@@ -30,7 +30,7 @@ Measured 2026-09-16 on `acf0184` (the PR #4 branch; production code matches `mai
 |---|---|---|---:|
 | 0 | done | #5 | 61.2% (`fail_under = 61`) |
 | 1 | done (option A) | — | — |
-| 2 | done: B2–B7, S1–S11 | Phase 2 PR | 71.3% (`fail_under = 71`) |
+| 2 | done: B2–B7, S1–S11 | #6 | 71.3% (`fail_under = 71`) |
 | 3 | not started | | |
 | 4 | not started | | |
 | 5 | not started | | |
