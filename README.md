@@ -49,15 +49,27 @@ sqlite, tsql, oracle, exasol, clickhouse, and more).
 Keep the inner test loop focused and in memory:
 
 ```sh
+pip install -e ".[dev,integration]"
 python3 -m pytest -q tests/unit/test_odd_scenarios.py  # odd-scenario safety lane
-python3 -m pytest -q                                  # complete suite
+python3 -m pytest -q                                  # unit lane (default)
 python3 -m ruff check .
 python3 -m mypy --strict src
 ```
 
-The odd-scenario lane avoids dbt subprocesses and warehouse setup; the full
-suite should also remain a sub-second pytest run on a typical development
-machine.
+The default run is the in-memory unit lane and should stay sub-second on a
+typical development machine. Two slower lanes are opt-in:
+
+```sh
+python3 -m pytest -q -m fake_dbt      # subprocess tests against tests/fakes/fake_dbt.py
+
+docker run --rm -d --name refmerge-pg -p 5432:5432 \
+  -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=refmerge postgres:16
+export REFMERGE_TEST_PG_DSN=postgresql://postgres:postgres@localhost:5432/refmerge
+python3 -m pytest -q -m warehouse     # needs Postgres and dbt-postgres
+python3 -m pytest -q -m "" --cov      # every lane; enforces the coverage floor
+```
+
+`TEST_COVERAGE_PLAN.md` tracks the path to 100% coverage.
 
 ## Support
 
