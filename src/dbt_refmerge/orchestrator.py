@@ -32,6 +32,7 @@ from dbt_refmerge.domain import (
 )
 from dbt_refmerge.errors import (
     ArtifactError,
+    CleanupError,
     DbtError,
     RefmergeError,
     SemanticError,
