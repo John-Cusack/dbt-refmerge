@@ -6,6 +6,7 @@ import os
 import shlex
 import signal
 import subprocess
+import sys
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -73,6 +74,28 @@ def _redact_argv(argv: list[str]) -> tuple[str, ...]:
     return tuple(out)
 
 
+def _terminate(proc: subprocess.Popen[str]) -> None:
+    """SIGTERM the process group; terminate() on Windows (no process groups)."""
+    try:
+        if sys.platform == "win32":
+            proc.terminate()
+        else:
+            os.killpg(proc.pid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
+def _kill(proc: subprocess.Popen[str]) -> None:
+    """SIGKILL the process group; kill() on Windows."""
+    try:
+        if sys.platform == "win32":
+            proc.kill()
+        else:
+            os.killpg(proc.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
 class DbtCli:
     def __init__(self, command: tuple[str, ...], capabilities: DbtCliCapabilities | None = None) -> None:
         if not command:
@@ -119,23 +142,14 @@ class DbtCli:
             stdout, stderr = proc.communicate(timeout=timeout_seconds)
         except subprocess.TimeoutExpired:
             timed_out = True
-            try:
-                os.killpg(proc.pid, signal.SIGTERM)
-            except (ProcessLookupError, PermissionError):
-                pass
+            _terminate(proc)
             try:
                 stdout, stderr = proc.communicate(timeout=10)
             except subprocess.TimeoutExpired:
-                try:
-                    os.killpg(proc.pid, signal.SIGKILL)
-                except (ProcessLookupError, PermissionError):
-                    pass
+                _kill(proc)
                 stdout, stderr = proc.communicate()
         except KeyboardInterrupt:
-            try:
-                os.killpg(proc.pid, signal.SIGINT)
-            except (ProcessLookupError, PermissionError):
-                pass
+            _terminate(proc)
             raise
         duration = time.monotonic() - start
         # cap retained bytes

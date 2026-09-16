@@ -6,6 +6,7 @@ import difflib
 import hashlib
 import json
 import os
+import sys
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -577,10 +578,6 @@ def apply_verified_source(
     expected_candidate_sha256: str,
 ) -> None:
     """Atomic same-directory replacement with lock + hash/stat preconditions."""
-    try:
-        import fcntl
-    except ImportError:  # Windows: no fcntl
-        fcntl = None  # type: ignore[assignment]
     import tempfile
 
     if path.is_symlink() or not path.is_file():
@@ -589,7 +586,9 @@ def apply_verified_source(
         raise SourceChangedError(ReasonCode.SOURCE_CHANGED_BEFORE_APPLY, "candidate digest mismatch")
     lock_path = path.with_name(path.name + ".dbt-refmerge.lock")
     with lock_path.open("w") as lock:
-        if fcntl is not None:
+        if sys.platform != "win32":
+            import fcntl
+
             try:
                 fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
             except OSError:
@@ -614,14 +613,15 @@ def apply_verified_source(
                     if hashlib.sha256(current2).hexdigest() != expected_original_sha256:
                         raise SourceChangedError(ReasonCode.SOURCE_CHANGED_BEFORE_APPLY, "source changed before apply")
                 os.replace(tmp_name, path)
-                try:
-                    dir_fd = os.open(str(path.parent), os.O_DIRECTORY)
+                if sys.platform != "win32":
                     try:
-                        os.fsync(dir_fd)
-                    finally:
-                        os.close(dir_fd)
-                except OSError:
-                    pass
+                        dir_fd = os.open(str(path.parent), os.O_DIRECTORY)
+                        try:
+                            os.fsync(dir_fd)
+                        finally:
+                            os.close(dir_fd)
+                    except OSError:
+                        pass
             finally:
                 try:
                     if os.path.exists(tmp_name):
@@ -629,7 +629,9 @@ def apply_verified_source(
                 except OSError:
                     pass
         finally:
-            if fcntl is not None:
+            if sys.platform != "win32":
+                import fcntl
+
                 try:
                     fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
                 except OSError:
