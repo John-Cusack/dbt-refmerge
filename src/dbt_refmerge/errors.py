@@ -17,10 +17,6 @@ class RefmergeError(Exception):
         return f"[{self.reason_code.value}] {self.message}"
 
 
-class ConfigError(RefmergeError):
-    pass
-
-
 class DbtError(RefmergeError):
     def __init__(
         self,
@@ -29,7 +25,7 @@ class DbtError(RefmergeError):
         argv: tuple[str, ...] = (),
     ) -> None:
         super().__init__(reason_code=reason_code, message=message)
-        object.__setattr__(self, "argv", argv)
+        self.argv = argv
 
 
 class ArtifactError(RefmergeError):
