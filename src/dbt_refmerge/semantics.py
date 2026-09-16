@@ -23,12 +23,15 @@ from dbt_refmerge.errors import SemanticError
 COMPARATOR_VERSION = "1"
 SEMANTIC_FINGERPRINT_VERSION = "2"
 
+# Function names are lowercase; they match a call's own name and sqlglot's normalized name for it,
+# compared without underscores (sqlglot parses gen_random_uuid() as Uuid and string_agg as GroupConcat).
 VOLATILE_FUNCTIONS = frozenset(
     {
         "random",
         "rand",
         "setseed",
         "gen_random_uuid",
+        "uuid",
         "uuid_generate_v1",
         "uuid_generate_v4",
         "uuid_generate_v1mc",
@@ -36,59 +39,12 @@ VOLATILE_FUNCTIONS = frozenset(
         "nextval",
         "currval",
         "lastval",
-        "now",
         "clock_timestamp",
         "statement_timestamp",
         "transaction_timestamp",
         "timeofday",
         "pg_sleep",
         "txid_current",
-    }
-)
-_VOLATILE_FLAT = frozenset(v.replace("_", "") for v in VOLATILE_FUNCTIONS)
-
-# Conservative deterministic allowlist (unqualified names, lowercase).
-DETERMINISTIC_FUNCTIONS = frozenset(
-    {
-        "abs",
-        "ceil",
-        "ceiling",
-        "floor",
-        "round",
-        "trunc",
-        "power",
-        "sqrt",
-        "exp",
-        "ln",
-        "log",
-        "coalesce",
-        "nullif",
-        "greatest",
-        "least",
-        "lower",
-        "upper",
-        "trim",
-        "btrim",
-        "ltrim",
-        "rtrim",
-        "substring",
-        "substr",
-        "replace",
-        "concat",
-        "concat_ws",
-        "length",
-        "char_length",
-        "strpos",
-        "split_part",
-        "to_char",
-        "to_number",
-        "to_timestamp",
-        "to_date",
-        "date_part",
-        "date_trunc",
-        "extract",
-        "cast",
-        "case",
     }
 )
 
@@ -104,11 +60,77 @@ ORDER_SENSITIVE_FUNCTIONS = frozenset(
         "nth_value",
         "array_agg",
         "string_agg",
+        "group_concat",
         "json_agg",
+        "json_array_agg",
         "jsonb_agg",
     }
 )
-_ORDER_SENSITIVE_FLAT = frozenset(v.replace("_", "") for v in ORDER_SENSITIVE_FUNCTIONS)
+_REFUSED_FLAT = frozenset(v.replace("_", "") for v in VOLATILE_FUNCTIONS | ORDER_SENSITIVE_FUNCTIONS)
+
+# Allowlist of sqlglot function classes (exact class names, not SQL spellings) whose result depends only
+# on their arguments, or is STABLE: fixed for one statement, which is all the single-statement
+# baseline/candidate comparison needs. Judged for PostgreSQL, the only adapter that verifies.
+# Calls sqlglot does not recognize (exp.Anonymous: UDFs, schema-qualified calls) are never allowlisted.
+DETERMINISTIC_FUNCTIONS = frozenset(
+    {
+        # math: abs, ceil/ceiling, floor, round, trunc, power/^, sqrt, exp, ln, log
+        "Abs",
+        "Ceil",
+        "Floor",
+        "Round",
+        "Trunc",
+        "Pow",
+        "Sqrt",
+        "Exp",
+        "Ln",
+        "Log",
+        # null handling, conditionals (CASE WHEN parses as Case holding If nodes), boolean connectives
+        "Coalesce",
+        "Nullif",
+        "Greatest",
+        "Least",
+        "Case",
+        "If",
+        "And",
+        "Or",
+        # strings: lower, upper, trim/btrim/ltrim/rtrim, substring/substr, replace, concat, concat_ws,
+        # length/char_length, strpos/position, split_part
+        "Lower",
+        "Upper",
+        "Trim",
+        "Substring",
+        "Replace",
+        "Concat",
+        "ConcatWs",
+        "Length",
+        "StrPosition",
+        "SplitPart",
+        # conversion and dates: cast/::, to_char, to_number, to_timestamp(text, fmt), to_timestamp(epoch),
+        # to_date, date_part/extract, date_trunc (TimestampTrunc; DateTrunc in some dialects)
+        "Cast",
+        "TimeToStr",
+        "ToNumber",
+        "StrToTime",
+        "UnixToTime",
+        "StrToDate",
+        "Extract",
+        "TimestampTrunc",
+        "DateTrunc",
+        # order-insensitive aggregates (window frames are checked separately)
+        "Count",
+        "Sum",
+        "Min",
+        "Max",
+        "Avg",
+        # STABLE within a statement: now()/current_timestamp, current_date, current_time, localtimestamp, localtime
+        "CurrentTimestamp",
+        "CurrentDate",
+        "CurrentTime",
+        "Localtimestamp",
+        "Localtime",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -534,53 +556,34 @@ class VolatilityResult:
     unknown_functions: tuple[str, ...]
 
 
-def analyze_volatility(parsed: ParsedModel, deterministic_allowlist: frozenset[str] = frozenset()) -> VolatilityResult:
-    func_names: list[str] = []
-    for n in _iter_nodes(parsed.tree):
-        if isinstance(n, exp.Anonymous):
-            fname = str(n.this).lower() if n.this else "anonymous"
-            func_names.append(fname)
-        elif isinstance(n, exp.Func):
-            func_names.append(type(n).__name__.lower())
-            # also capture sql name
-            try:
-                sql_name = n.sql_name().lower()
-                if sql_name not in func_names:
-                    func_names.append(sql_name)
-            except Exception:  # noqa: S112 -- best-effort display name only
-                continue
-    allow = {a.lower() for a in deterministic_allowlist}
-    unknown: list[str] = []
-    for fn in func_names:
-        base = fn.split(".")[-1].lower()
-        flat = base.replace("_", "")
-        if base in VOLATILE_FUNCTIONS or flat in _VOLATILE_FLAT:
-            return VolatilityResult(ok=False, reason_codes=(ReasonCode.NONDETERMINISTIC,), unknown_functions=(fn,))
-        if base in ORDER_SENSITIVE_FUNCTIONS or flat in _ORDER_SENSITIVE_FLAT:
-            return VolatilityResult(ok=False, reason_codes=(ReasonCode.NONDETERMINISTIC,), unknown_functions=(fn,))
-        if base in allow or flat in allow:
+def analyze_volatility(parsed: ParsedModel) -> VolatilityResult:
+    """Refuse a model whose rows one statement comparing baseline and candidate cannot pin down."""
+    unknown: set[str] = set()
+    for node in _iter_nodes(parsed.tree):
+        if not isinstance(node, exp.Func):
             continue
-        # known sqlglot function classes that are deterministic but not in list: treat common ones
-        if base in (
-            "eq",
-            "neq",
-            "gt",
-            "gte",
-            "lt",
-            "lte",
-            "and",
-            "or",
-            "not",
-            "cast",
-            "alias",
-            "column",
-            "select",
-        ):
-            continue
-        unknown.append(fn)
+        if isinstance(node, exp.Anonymous):
+            name = node.name.lower()
+            spellings = {name}
+            allowlisted = False
+        else:
+            name = node.sql_name().lower()
+            spellings = {name, type(node).__name__.lower()}
+            allowlisted = type(node).__name__ in DETERMINISTIC_FUNCTIONS
+        if {spelling.replace("_", "") for spelling in spellings} & _REFUSED_FLAT:
+            return VolatilityResult(ok=False, reason_codes=(ReasonCode.NONDETERMINISTIC,), unknown_functions=(name,))
+        if not allowlisted:
+            unknown.add(name)
     # Row sampling, and any query level that picks a subset of rows without its own ORDER BY.
     if parsed.tree.find(exp.TableSample) is not None:
         return VolatilityResult(ok=False, reason_codes=(ReasonCode.NONDETERMINISTIC,), unknown_functions=("sample",))
+    # A ROWS frame counts physical rows, so ties make even an allowlisted aggregate order-dependent.
+    # RANGE and GROUPS frames always include every peer row.
+    for spec in parsed.tree.find_all(exp.WindowSpec):
+        if str(spec.args.get("kind") or "").lower() not in ("range", "groups"):
+            return VolatilityResult(
+                ok=False, reason_codes=(ReasonCode.NONDETERMINISTIC,), unknown_functions=("window_frame",)
+            )
     for query in _iter_nodes(parsed.tree):
         if not isinstance(query, exp.Query) or query.args.get("order") is not None:
             continue
