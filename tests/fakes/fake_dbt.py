@@ -14,8 +14,9 @@ Behaviour switches (``FAKE_DBT_MODE``, comma separated, ``key`` or ``key=value``
 - ``adapter_type=<name>``: manifest ``metadata.adapter_type`` (default ``postgres``)
 - ``candidate_drop_node``: candidate manifest omits the selected model
 - ``candidate_drift``: candidate compiled SQL gains ``limit 1``
-- ``sleep=<seconds>``, ``ignore_sigterm``, ``sigint_parent``: process-control tests
-- ``big_logs=<chars>``: write that many characters to stdout and stderr
+- ``sleep=<seconds>``, ``ignore_sigterm``, ``sigint_parent=<delay>``: process-control tests
+- ``big_logs=<chars>`` (with ``big_logs_char=<c>``): write that many characters to stdout and stderr
+- ``invalid_utf8``: write bytes that are not UTF-8 to stdout
 - ``echo_env=<NAME>``: print ``NAME=<value>`` to stdout
 - ``exit=<code>``: exit with ``code`` after everything else
 - ``parse_fail`` / ``run_fail`` / ``drop_fail``: that harness step exits 1
@@ -23,7 +24,7 @@ Behaviour switches (``FAKE_DBT_MODE``, comma separated, ``key`` or ``key=value``
 - ``harness_materialized=<m>``, ``harness_schema=<s>``, ``harness_extra_node``: preflight violations
 
 ``FAKE_DBT_VERSION_OUTPUT`` / ``FAKE_DBT_COMPILE_HELP`` replace those outputs, and
-``FAKE_DBT_ARGV_LOG`` appends each argv as a JSON line.
+``FAKE_DBT_ARGV_LOG`` appends each argv as a JSON line, and ``FAKE_DBT_PID_FILE`` receives the process id.
 
 Harness query results (``run-operation dbt_refmerge_query``), keyed by the call's ``label``:
 
@@ -256,16 +257,27 @@ def main(args: list[str]) -> int:
     if log:
         with open(log, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(args) + "\n")
+    pid_file = os.environ.get("FAKE_DBT_PID_FILE")
+    if pid_file:
+        with open(pid_file, "w", encoding="utf-8") as fh:
+            fh.write(str(os.getpid()))
     if "ignore_sigterm" in modes:
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
     if "sigint_parent" in modes:
+        time.sleep(float(modes["sigint_parent"] or 0))
         os.kill(os.getppid(), signal.SIGINT)
     if "sleep" in modes:
         time.sleep(float(modes["sleep"]))
     if "big_logs" in modes:
         count = int(modes["big_logs"])
-        sys.stdout.write("o" * count)
-        sys.stderr.write("e" * count)
+        char = modes.get("big_logs_char", "o")
+        sys.stdout.buffer.write((char * count).encode("utf-8"))
+        sys.stderr.buffer.write((char * count).encode("utf-8"))
+        sys.stdout.flush()
+        sys.stderr.flush()
+    if "invalid_utf8" in modes:
+        sys.stdout.buffer.write(b"before \xff\xfe after\n")
+        sys.stdout.flush()
     if "echo_env" in modes:
         name = modes["echo_env"]
         print(f"{name}={os.environ.get(name, '')}")

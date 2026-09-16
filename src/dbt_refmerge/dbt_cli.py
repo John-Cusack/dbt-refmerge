@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import os
-import shlex
 import signal
 import subprocess
 import sys
@@ -108,9 +107,9 @@ def _redact_argv(argv: list[str]) -> tuple[str, ...]:
 def _terminate(proc: subprocess.Popen[str]) -> None:
     """SIGTERM the process group; terminate() on Windows (no process groups)."""
     try:
-        if sys.platform == "win32":
+        if sys.platform == "win32":  # pragma: win32 cover
             proc.terminate()
-        else:
+        else:  # pragma: win32 no cover
             os.killpg(proc.pid, signal.SIGTERM)
     except (ProcessLookupError, PermissionError):
         pass
@@ -119,28 +118,44 @@ def _terminate(proc: subprocess.Popen[str]) -> None:
 def _kill(proc: subprocess.Popen[str]) -> None:
     """SIGKILL the process group; kill() on Windows."""
     try:
-        if sys.platform == "win32":
+        if sys.platform == "win32":  # pragma: win32 cover
             proc.kill()
-        else:
+        else:  # pragma: win32 no cover
             os.killpg(proc.pid, signal.SIGKILL)
     except (ProcessLookupError, PermissionError):
         pass
 
 
+def _retained(text: str) -> str:
+    """The last MAX_RETAINED_LOG_BYTES bytes of ``text`` (a split character at the cut is dropped)."""
+    data = text.encode("utf-8")
+    if len(data) <= MAX_RETAINED_LOG_BYTES:
+        return text
+    return data[-MAX_RETAINED_LOG_BYTES:].decode("utf-8", "ignore")
+
+
 class DbtCli:
-    def __init__(self, command: tuple[str, ...], capabilities: DbtCliCapabilities | None = None) -> None:
+    def __init__(
+        self,
+        command: tuple[str, ...],
+        capabilities: DbtCliCapabilities | None = None,
+        *,
+        terminate_grace_seconds: float = 10.0,
+    ) -> None:
         if not command:
             raise DbtError("empty dbt command", argv=())
         self._command = tuple(command)
         self._capabilities = capabilities or DbtCliCapabilities()
+        self._terminate_grace_seconds = terminate_grace_seconds
 
-    @classmethod
-    def from_config(cls, dbt_command: tuple[str, ...]) -> DbtCli:
-        return cls(tuple(dbt_command))
-
-    @property
-    def capabilities(self) -> DbtCliCapabilities:
-        return self._capabilities
+    def _stop(self, proc: subprocess.Popen[str]) -> tuple[str, str]:
+        """SIGTERM, then SIGKILL after the grace period; always reap the child and drain its pipes."""
+        _terminate(proc)
+        try:
+            return proc.communicate(timeout=self._terminate_grace_seconds)
+        except subprocess.TimeoutExpired:
+            _kill(proc)
+            return proc.communicate()
 
     def _run_argv(
         self,
@@ -162,7 +177,9 @@ class DbtCli:
                 env=full_env,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                text=True,
+                # dbt output is not guaranteed to be valid in the locale encoding (cp1252 on Windows).
+                encoding="utf-8",
+                errors="replace",
                 shell=False,
                 start_new_session=True,
             )
@@ -173,26 +190,16 @@ class DbtCli:
             stdout, stderr = proc.communicate(timeout=timeout_seconds)
         except subprocess.TimeoutExpired:
             timed_out = True
-            _terminate(proc)
-            try:
-                stdout, stderr = proc.communicate(timeout=10)
-            except subprocess.TimeoutExpired:
-                _kill(proc)
-                stdout, stderr = proc.communicate()
+            stdout, stderr = self._stop(proc)
         except KeyboardInterrupt:
-            _terminate(proc)
+            self._stop(proc)
             raise
         duration = time.monotonic() - start
-        # cap retained bytes
-        if len(stdout.encode("utf-8", "ignore")) > MAX_RETAINED_LOG_BYTES:
-            stdout = stdout[-MAX_RETAINED_LOG_BYTES:]
-        if len(stderr.encode("utf-8", "ignore")) > MAX_RETAINED_LOG_BYTES:
-            stderr = stderr[-MAX_RETAINED_LOG_BYTES:]
         return CommandResult(
             argv_redacted=_redact_argv(argv),
             returncode=proc.returncode,
-            stdout=stdout,
-            stderr=stderr,
+            stdout=_retained(stdout),
+            stderr=_retained(stderr),
             duration_seconds=duration,
             timed_out=timed_out,
         )
@@ -209,15 +216,13 @@ class DbtCli:
         return DbtVersion(raw=text, version=parse_dbt_version_output(text))
 
     def discover_capabilities(self, cwd: Path | None = None) -> DbtCliCapabilities:
-        res = self._run_argv([*self._command, "--help"], cwd=cwd or Path.cwd(), env=None, timeout_seconds=120)
-        help_text = (res.stdout + res.stderr).lower()
-        res2 = self._run_argv(
+        res = self._run_argv(
             [*self._command, "compile", "--help"],
             cwd=cwd or Path.cwd(),
             env=None,
             timeout_seconds=120,
         )
-        compile_help = (res2.stdout + res2.stderr).lower()
+        compile_help = (res.stdout + res.stderr).lower()
         caps = DbtCliCapabilities(
             supports_no_partial_parse="no-partial-parse" in compile_help,
             supports_no_populate_cache="no-populate-cache" in compile_help,
@@ -225,7 +230,6 @@ class DbtCli:
             supports_target_path="target-path" in compile_help,
         )
         self._capabilities = caps
-        _ = help_text
         return caps
 
     def parse(self, invocation: DbtInvocation) -> CommandResult:
@@ -340,7 +344,3 @@ class DbtCli:
         if res.timed_out:
             raise DbtError("dbt run-operation timed out", argv=res.argv_redacted)
         return res
-
-    @staticmethod
-    def shlex_join(argv: tuple[str, ...]) -> str:
-        return shlex.join(argv)
