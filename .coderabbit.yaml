@@ -24,18 +24,18 @@ reviews:
       enabled: false
     resolve_merge_conflict:
       enabled: false
-path_instructions:
-  - path: "src/dbt_refmerge/verification/**"
-    instructions: >
-      This is proof code. Any path that can report success without executing
-      the warehouse comparison, or that catches an exception and continues as
-      if verified, is a blocking defect.
-  - path: "src/dbt_refmerge/adapters.py"
-    instructions: >
-      Fold rules must match the engine's real identifier semantics; a wrong
-      fold silently merges distinct columns. Demand a source for each rule.
-  - path: "tests/**"
-    instructions: >
-      Tests must assert observable behavior. Reject tests that pin wording,
-      implementation details, or incidental defaults.
-abort_on_close: true
+  path_instructions:
+    - path: "src/dbt_refmerge/verification/**"
+      instructions: >
+        This is proof code. Any path that can report success without executing
+        the warehouse comparison, or that catches an exception and continues as
+        if verified, is a blocking defect.
+    - path: "src/dbt_refmerge/adapters.py"
+      instructions: >
+        Fold rules must match the engine's real identifier semantics; a wrong
+        fold silently merges distinct columns. Demand a source for each rule.
+    - path: "tests/**"
+      instructions: >
+        Tests must assert observable behavior. Reject tests that pin wording,
+        implementation details, or incidental defaults.
+  abort_on_close: true
