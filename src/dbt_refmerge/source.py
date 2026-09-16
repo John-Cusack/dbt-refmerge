@@ -166,8 +166,8 @@ def _interpret_ref_call(
     func: str, args: tuple[str | int, ...], kwargs: dict[str, str | int], span: SourceSpan
 ) -> RefCall | None:
     names = [a for a in args if isinstance(a, str)]
-    if len(names) != len(args):
-        return None
+    if len(names) != len(args) or any(isinstance(value, bool) for value in kwargs.values()):
+        return None  # a bool version would group with its int twin (True == 1)
     if func == "source":
         # dbt's source() takes exactly (source_name, table_name) and no kwargs.
         if len(names) != 2 or kwargs:
@@ -182,7 +182,8 @@ def _interpret_ref_call(
         package=names[0] if len(names) == 2 else None,
         name=names[-1],
         source_name=None,
-        version=next(iter(kwargs.values()), None),
+        # dbt resolves `version or v`, so 0 and "" mean unversioned.
+        version=next(iter(kwargs.values()), None) or None,
         span=span,
     )
 
@@ -207,8 +208,31 @@ _TAG_KIND: dict[str, Literal["expression", "statement", "comment", "raw"]] = {
     "{%": "statement",
     "{#": "comment",
 }
-_RAW_OPEN_INNER = re.compile(r"\s*raw\s*")
-_RAW_CLOSE = re.compile(r"\{%\s*endraw\s*%}")
+# Jinja accepts whitespace control on both raw tags: {%- raw %}, {% raw +%}, {%- endraw -%}, ...
+_RAW_OPEN_INNER = re.compile(r"[-+]?\s*raw\s*[-+]?")
+_RAW_CLOSE = re.compile(r"\{%[-+]?\s*endraw\s*[-+]?%}")
+_STRING_TOKEN = re.compile(r"'[^'\\]*(?:\\.[^'\\]*)*'" + r'|"[^"\\]*(?:\\.[^"\\]*)*"', re.DOTALL)
+_SENTINEL_LIKE = re.compile(r"__r\d+__")
+
+
+def _find_tag_close(text: str, tag: str, pos: int) -> int:
+    """Index of the delimiter closing ``tag``, or -1. Like Jinja's lexer, a string literal inside an
+    expression or statement is one token, so a "}}" or "%}" inside it does not close the tag."""
+    close = _TAG_CLOSE[tag]
+    if tag == "{#":
+        return text.find(close, pos)
+    while pos < len(text):
+        char = text[pos]
+        if char in "'\"":
+            string = _STRING_TOKEN.match(text, pos)
+            if string is None:
+                return -1  # unterminated string: the tag never closes
+            pos = string.end()
+        elif text.startswith(close, pos):
+            return pos
+        else:
+            pos += 1
+    return -1
 
 
 def mask_jinja(decoded: DecodedSource) -> MaskedSource:
@@ -217,11 +241,12 @@ def mask_jinja(decoded: DecodedSource) -> MaskedSource:
     masked_chars = list(text)
     jinja_spans: list[JinjaSpan] = []
     ref_calls: dict[str, RefCall] = {}
+    in_tag = [False] * len(text)
     pos = 0
     while (opening := _TAG_OPEN.search(text, pos)) is not None:
         start, tag = opening.start(), opening.group()
         kind = _TAG_KIND[tag]
-        close = text.find(_TAG_CLOSE[tag], start + 2)
+        close = _find_tag_close(text, tag, start + 2)
         if close == -1:
             raise SourceParseError(ReasonCode.INTERNAL_ERROR, f"unterminated Jinja {kind}")
         inner = text[start + 2 : close]
@@ -236,6 +261,7 @@ def mask_jinja(decoded: DecodedSource) -> MaskedSource:
             JinjaSpan(span=span, kind=kind, text=decoded.original_bytes[span.start_byte : span.end_byte])
         )
         for j in range(start, pos):
+            in_tag[j] = True
             if masked_chars[j] not in ("\n", "\r"):
                 masked_chars[j] = " "
         parsed = _parse_literal_call(_strip_whitespace_control(inner)) if tag == "{{" else None
@@ -248,6 +274,11 @@ def mask_jinja(decoded: DecodedSource) -> MaskedSource:
             continue  # left blank: a dynamic expression, so never an import
         masked_chars[start : start + len(sentinel)] = sentinel
         ref_calls[sentinel] = call
+    # Refuse SQL that already spells a sentinel: it could be read as another CTE's ref(). Only text outside
+    # Jinja tags counts (masked chars differ from the original there, or are blanks written over tags).
+    sql_only = "".join(" " if span_char else char for char, span_char in zip(text, in_tag, strict=True))
+    if _SENTINEL_LIKE.search(sql_only):
+        raise SourceParseError(ReasonCode.UNSUPPORTED_IMPORT_SHAPE, "SQL contains a name reserved for ref sentinels")
     masked_text = "".join(masked_chars)
     return MaskedSource(
         decoded=decoded,

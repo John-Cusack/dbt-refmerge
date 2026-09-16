@@ -219,3 +219,74 @@ def test_nested_cte_shadow_collected():
     )
     model = parse_source_model(src)
     assert "a" in model.nested_names
+
+
+@pytest.mark.parametrize(
+    ("src", "tags"),
+    [
+        ("select {{ \"a }} b\" }} from {{ ref('m') }}", ['{{ "a }} b" }}', "{{ ref('m') }}"]),
+        ("select {{ 'x' ~ '%}' }}{% set y = \"{{\" %}", ["{{ 'x' ~ '%}' }}", '{% set y = "{{" %}']),
+        ("select {{ 'it\\'s }}' }} from t", ["{{ 'it\\'s }}' }}"]),
+        ("select {# a '}}' #} x #}", ["{# a '}}' #}"]),
+    ],
+    ids=["double-quoted", "single-quoted-in-both-kinds", "escaped-quote", "comments-have-no-strings"],
+)
+def test_tag_ends_follow_jinja_string_tokens(src, tags):
+    # A "}}" or "%}" inside a Jinja string literal does not close the tag; it used to end it early and
+    # leave the rest of the expression (and anything it hid) as SQL.
+    masked = mask_jinja(decode_source(src.encode()))
+    assert [span.text.decode() for span in masked.jinja_spans] == tags
+
+
+def test_unterminated_string_inside_a_tag_is_refused():
+    with pytest.raises(SourceParseError):
+        mask_jinja(decode_source(b"select {{ 'oops }} from t"))
+
+
+@pytest.mark.parametrize(
+    "src",
+    [
+        "{%- raw %}{{ x }}{% endraw %}",
+        "{% raw -%}{{ x }}{%- endraw %}",
+        "{%+ raw +%}{{ x }}{%+ endraw -%}",
+        "{%-raw-%}{{ x }}{%-endraw-%}",
+    ],
+)
+def test_raw_blocks_accept_whitespace_control(src):
+    masked = mask_jinja(decode_source(f"select {src} from t".encode()))
+    assert [(span.kind, span.text.decode()) for span in masked.jinja_spans] == [("raw", src)]
+    assert masked.ref_calls == {}
+
+
+@pytest.mark.parametrize("sql", ["select __r0__ from t", "select x as __r12__ from t", "select '__r3__' from t"])
+def test_sql_that_already_contains_a_sentinel_name_is_refused(sql):
+    # A user name spelled like a ref sentinel could be read as another CTE's ref().
+    with pytest.raises(SourceParseError) as exc_info:
+        parse_source_model(f"with a as (select x from {{{{ ref('m') }}}}) {sql}".encode())
+    assert exc_info.value.reason_code is ReasonCode.UNSUPPORTED_IMPORT_SHAPE
+
+
+def test_sentinel_spelled_inside_jinja_is_not_user_sql():
+    model = parse_source_model(b"with a as (select x from {{ ref('m') }}) select {{ '__r5__' }} from a")
+    assert [c.identifier.value for c in model.ctes] == ["a"]
+
+
+@pytest.mark.parametrize(
+    ("call", "version"),
+    [
+        ("{{ ref('m', version=0) }}", None),
+        ("{{ ref('m', v='') }}", None),
+        ("{{ ref('m', version='0') }}", "0"),
+        ("{{ ref('m', version=2) }}", 2),
+    ],
+    ids=["zero", "empty-string", "string-zero", "two"],
+)
+def test_falsy_versions_are_unversioned_like_dbt(call, version):
+    # dbt resolves `kwargs.get("version") or kwargs.get("v")`.
+    assert [c.version for c in _calls(call)] == [version]
+
+
+@pytest.mark.parametrize("call", ["{{ ref('m', version=true) }}", "{{ ref('m', v=False) }}"])
+def test_boolean_versions_are_dynamic(call):
+    # True == 1 would group ref('m', version=true) with ref('m', version=1).
+    assert _calls(call) == []

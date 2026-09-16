@@ -9,7 +9,8 @@ Flow per model:
 3. Read both views' column names and exact types from ``pg_catalog``. Unsupported types refuse;
    a schema difference is DIFFERENT.
 4. Compare the two views as bags in ONE statement (one snapshot).
-5. Drop the views (views only, by exact name) and confirm they are gone, whatever happened above.
+5. Drop the views (views only, by exact name) and confirm they are gone, whatever happened above; both in
+   one dbt invocation.
 
 Every query runs through the harness ``dbt_refmerge_query`` macro, so dbt-refmerge needs no database
 driver: dbt and the user's profile provide the connection.
@@ -115,6 +116,18 @@ def catalog_sql(schema: str, identifiers: Sequence[str]) -> str:
     )
 
 
+def existing_relations_sql(schema: str, identifiers: Sequence[str]) -> str:
+    """Which of the named relations (of any kind) exist in ``schema``."""
+    names = ", ".join(sql_literal(name) for name in identifiers)
+    return (
+        "select c.relname\n"
+        "from pg_catalog.pg_class c\n"
+        "join pg_catalog.pg_namespace n on n.oid = c.relnamespace\n"
+        f"where n.nspname = {sql_literal(schema)} and c.relname in ({names})\n"
+        "order by c.relname"
+    )
+
+
 def run_relations_pattern(run_token: str) -> str:
     suffixes = "|".join(DBT_INTERMEDIATE_SUFFIXES)
     return f"^({BASELINE_ALIAS_PREFIX}|{CANDIDATE_ALIAS_PREFIX}){re.escape(run_token)}_[0-9a-f]{{8}}({suffixes})?$"
@@ -174,14 +187,20 @@ class HarnessSession:
             raise DbtError(f"warehouse query {label!r} failed: {_tail(res)}", argv=res.argv_redacted)
         return _query_result(parse_marked_json(res.stdout, nonce))
 
-    def drop_views(self, schema: str, identifiers: Sequence[str]) -> None:
-        res = self.dbt.run_operation(
-            self.invocation,
-            "dbt_refmerge_drop_views",
-            {"schema": schema, "identifiers": list(identifiers)},
-        )
+    def drop_views(self, schema: str, identifiers: Sequence[str]) -> set[str]:
+        """Drop the named views and return the names that still exist afterwards (one dbt invocation)."""
+        nonce = secrets.token_hex(8)
+        args = {
+            "nonce": nonce,
+            "schema": schema,
+            "identifiers": list(identifiers),
+            "sql": existing_relations_sql(schema, identifiers),
+            "statement_timeout_ms": self.config.warehouse_statement_timeout_ms,
+        }
+        res = self.dbt.run_operation(self.invocation, "dbt_refmerge_drop_views", args)
         if res.returncode != 0:
             raise DbtError(f"dropping scratch views failed: {_tail(res)}", argv=res.argv_redacted)
+        return {row[0] for row in _query_result(parse_marked_json(res.stdout, nonce)).rows if row[0] is not None}
 
 
 def verify_postgres(request: VerificationRequest) -> VerificationReceipt:
@@ -245,11 +264,7 @@ def cleanup_run(config: AppConfig, dbt: DbtCli, run_id: str, ws: RunWorkspace) -
     pattern = re.compile(run_relations_pattern(_sanitize_run_token(run_id)))
     found = session.query("run-views", run_views_sql(scratch_schema, _sanitize_run_token(run_id)))
     names = sorted({row[0] for row in found.rows if row[0] is not None and pattern.fullmatch(row[0])})
-    remaining: list[str] = []
-    if names:
-        session.drop_views(scratch_schema, names)
-        rows = session.query("remaining", catalog_sql(scratch_schema, names)).rows
-        remaining = sorted({row[0] for row in rows if row[0] is not None})
+    remaining = sorted(session.drop_views(scratch_schema, names)) if names else []
     return {
         "run_id": run_id,
         "schema": scratch_schema,
@@ -299,8 +314,7 @@ def _drop_run_relations(
 ) -> bool:
     names = scratch_identifiers(token)
     try:
-        session.drop_views(schema, names)
-        remaining = {row[0] for row in session.query("remaining", catalog_sql(schema, names)).rows}
+        remaining = session.drop_views(schema, names)
     except RefmergeError:
         remaining = set(names)
     for relation in relations:

@@ -103,14 +103,16 @@ QUERY_MACRO = """{% macro dbt_refmerge_query(nonce, sql, statement_timeout_ms, l
 {% endmacro %}
 """
 
-# Drops only views, only in the given schema, only with the given names.
-DROP_VIEWS_MACRO = """{% macro dbt_refmerge_drop_views(schema, identifiers) %}
+# Drops only views, only in the given schema, only with the given names; then reports, in the same dbt
+# invocation, which of those names still exist (``sql`` is the catalog query, printed like dbt_refmerge_query).
+DROP_VIEWS_MACRO = """{% macro dbt_refmerge_drop_views(nonce, schema, identifiers, sql, statement_timeout_ms) %}
   {% for identifier in identifiers %}
     {% set relation = adapter.get_relation(database=target.database, schema=schema, identifier=identifier) %}
     {% if relation is not none and relation.is_view %}
       {% do adapter.drop_relation(relation) %}
     {% endif %}
   {% endfor %}
+  {% do dbt_refmerge_query(nonce, sql, statement_timeout_ms) %}
 {% endmacro %}
 """
 

@@ -1,15 +1,18 @@
 """End to end on PostgreSQL with real dbt: check proves merges, refuses divergence, and cleans up."""
 
 import dataclasses
+import shutil
 import subprocess
+import types
+import uuid
 from pathlib import Path
 
 import pytest
-from conftest import write_pg_profiles
+from conftest import drop_pg_schemas, find_dbt, require_pg_dsn, write_pg_profiles
 
 from dbt_refmerge.config import AppConfig
 from dbt_refmerge.domain import EqualityResult, ReasonCode, VerificationStatus, is_fixable
-from dbt_refmerge.orchestrator import CheckRequest, CleanupRequest, FixRequest, RefmergeService
+from dbt_refmerge.orchestrator import CheckRequest, CleanupRequest, FixRequest, RefmergeService, ScanRequest
 from dbt_refmerge.verification.runner import verify_postgres
 
 pytestmark = pytest.mark.warehouse
@@ -40,24 +43,65 @@ ORDERS = (
 )
 
 
-@pytest.fixture
-def warehouse_project(tmp_path, pg_dsn, pg_schemas, dbt_executable):
-    """A dbt project whose upstream model is already built; returns (root, config)."""
-    model_schema = pg_schemas("model")
-    scratch = pg_schemas("scratch")
-    root = tmp_path / "project"
+def _build_project(root: Path, profiles_dir: Path, dsn: str, dbt: str, model_schema: str) -> Path:
     (root / "models").mkdir(parents=True)
     (root / "dbt_project.yml").write_text("name: it\nversion: 1.0.0\nconfig-version: 2\nprofile: it\n")
     (root / "models" / "stg_orders.sql").write_text(STG_ORDERS)
     (root / "models" / "orders.sql").write_text(ORDERS)
-    profiles = write_pg_profiles(tmp_path / "profiles", pg_dsn, profile="it", schema=model_schema)
+    profiles = write_pg_profiles(profiles_dir, dsn, profile="it", schema=model_schema)
     subprocess.run(
-        [dbt_executable, "run", "--select", "stg_orders", "--profiles-dir", str(profiles)],
+        [dbt, "run", "--select", "stg_orders", "--profiles-dir", str(profiles)],
         cwd=root,
         check=True,
         capture_output=True,
     )
-    config = AppConfig(project_dir=root, profiles_dir=profiles, scratch_schema=scratch, dbt_command=(dbt_executable,))
+    return profiles
+
+
+@pytest.fixture(scope="module")
+def proven(tmp_path_factory):
+    """One built project and one real check, shared by the read-only tests.
+
+    The check keeps its workspace and records the verifier's request for the orders model, so the
+    divergence tests can re-run just the warehouse verification with a tampered candidate instead of
+    repeating the snapshot and both compiles.
+    """
+    dsn, dbt = require_pg_dsn(), find_dbt()
+    token = uuid.uuid4().hex[:8]
+    model_schema, scratch = f"refmerge_it_model_{token}", f"refmerge_it_scratch_{token}"
+    tmp = tmp_path_factory.mktemp("proven")
+    try:
+        profiles = _build_project(tmp / "project", tmp / "profiles", dsn, dbt, model_schema)
+        config = AppConfig(
+            project_dir=tmp / "project",
+            profiles_dir=profiles,
+            scratch_schema=scratch,
+            dbt_command=(dbt,),
+            keep_workspace=True,
+        )
+        requests = []
+
+        def recording(request):
+            requests.append(request)
+            return verify_postgres(request)
+
+        report = RefmergeService(verify_runner=recording).check(CheckRequest(config=config))
+        request = next(r for r in requests if r.baseline.unique_id == "model.it.orders")
+        yield types.SimpleNamespace(dsn=dsn, config=config, report=report, request=request)
+    finally:
+        drop_pg_schemas(dsn, [model_schema, scratch])
+        for workspace in tmp_path_factory.getbasetemp().parent.glob("dbt_refmerge_*"):
+            shutil.rmtree(workspace, ignore_errors=True)
+
+
+@pytest.fixture
+def warehouse_project(tmp_path, pg_dsn, pg_schemas, dbt_executable):
+    """A fresh project for tests that edit files; returns (root, config)."""
+    root = tmp_path / "project"
+    profiles = _build_project(root, tmp_path / "profiles", pg_dsn, dbt_executable, pg_schemas("model"))
+    config = AppConfig(
+        project_dir=root, profiles_dir=profiles, scratch_schema=pg_schemas("scratch"), dbt_command=(dbt_executable,)
+    )
     return root, config
 
 
@@ -76,16 +120,13 @@ def _orders_receipt(report):
     return next(r.receipt for r in report.results if r.model_unique_id == "model.it.orders")
 
 
-def test_check_proves_merge_and_leaves_scratch_schema_empty(warehouse_project, pg_dsn):
-    _root, config = warehouse_project
+def test_check_proves_merge_and_leaves_scratch_schema_empty(proven):
+    receipt = _orders_receipt(proven.report)
 
-    report = RefmergeService().check(CheckRequest(config=config))
-
-    receipt = _orders_receipt(report)
     assert (receipt.status, receipt.reason_codes) == (VerificationStatus.SNAPSHOT_EQUIVALENT, (ReasonCode.OK,))
     assert receipt.equality == EqualityResult(True, 6, 6, 0, 0)
     assert is_fixable(receipt)
-    assert _relations_in(pg_dsn, config.scratch_schema) == []
+    assert _relations_in(proven.dsn, proven.config.scratch_schema) == []
 
 
 def test_fix_applies_the_proven_merge(warehouse_project):
@@ -97,18 +138,13 @@ def test_fix_applies_the_proven_merge(warehouse_project):
     rewritten = (root / "models" / "orders.sql").read_text()
     assert "join orders as order_financials" in rewritten
     assert "order_financials as (" not in rewritten
-    after = _orders_receipt(RefmergeService().check(CheckRequest(config=config)))
-    assert after.reason_codes == (ReasonCode.NO_DUPLICATE_IMPORT,)
+    assert RefmergeService().scan(ScanRequest(config=config.model_copy(update={"adapter": "postgres"}))).findings == ()
 
 
-def _tampered(replace_from: str, replace_to: str):
-    def runner(request):
-        compiled = request.candidate.compiled_code or ""
-        assert replace_from in compiled
-        candidate = request.candidate.model_copy(update={"compiled_code": compiled.replace(replace_from, replace_to)})
-        return verify_postgres(dataclasses.replace(request, candidate=candidate))
-
-    return runner
+def _with_compiled(node, replace_from: str, replace_to: str):
+    compiled = node.compiled_code or ""
+    assert replace_from in compiled
+    return node.model_copy(update={"compiled_code": compiled.replace(replace_from, replace_to)})
 
 
 @pytest.mark.parametrize(
@@ -141,53 +177,48 @@ def _tampered(replace_from: str, replace_to: str):
     ],
     ids=["fewer-rows", "extra-duplicate", "column-order", "column-type"],
 )
-def test_divergent_candidate_is_refused(warehouse_project, pg_dsn, replace_to, status, codes, equality):
-    _root, config = warehouse_project
-
-    report = RefmergeService(verify_runner=_tampered("select * from final", replace_to)).check(
-        CheckRequest(config=config)
+def test_divergent_candidate_is_refused(proven, replace_to, status, codes, equality):
+    request = proven.request
+    tampered = dataclasses.replace(
+        request, candidate=_with_compiled(request.candidate, "select * from final", replace_to)
     )
 
-    receipt = _orders_receipt(report)
+    receipt = verify_postgres(tampered)
+
     assert (receipt.status, receipt.reason_codes, receipt.equality) == (status, codes, equality)
     assert not is_fixable(receipt)
-    assert _relations_in(pg_dsn, config.scratch_schema) == []
+    assert _relations_in(proven.dsn, proven.config.scratch_schema) == []
 
 
-def test_unsupported_column_type_is_unverifiable(warehouse_project, pg_dsn):
-    _root, config = warehouse_project
-    runner = _tampered("select * from final", "select order_id, customer_id, amount::double precision from final")
+def test_unsupported_column_type_is_unverifiable(proven):
+    request = proven.request
+    as_float = "select order_id, customer_id, amount::double precision from final"
+    tampered = dataclasses.replace(
+        request,
+        baseline=_with_compiled(request.baseline, "select * from final", as_float),
+        candidate=_with_compiled(request.candidate, "select * from final", as_float),
+    )
 
-    def both_sides(request):
-        baseline = request.baseline.model_copy(
-            update={
-                "compiled_code": (request.baseline.compiled_code or "").replace(
-                    "select * from final", "select order_id, customer_id, amount::double precision from final"
-                )
-            }
-        )
-        return runner(dataclasses.replace(request, baseline=baseline))
-
-    receipt = _orders_receipt(RefmergeService(verify_runner=both_sides).check(CheckRequest(config=config)))
+    receipt = verify_postgres(tampered)
 
     assert (receipt.status, receipt.reason_codes) == (
         VerificationStatus.UNVERIFIABLE,
         (ReasonCode.UNSUPPORTED_COMPARISON_TYPE,),
     )
-    assert _relations_in(pg_dsn, config.scratch_schema) == []
+    assert _relations_in(proven.dsn, proven.config.scratch_schema) == []
 
 
-def test_cleanup_drops_leftover_views_for_the_run_only(warehouse_project, pg_dsn):
+def test_cleanup_drops_leftover_views_for_the_run_only(proven, pg_schemas):
     import psycopg2
 
-    _root, config = warehouse_project
-    scratch = config.scratch_schema
+    scratch = pg_schemas("cleanup")
+    config = proven.config.model_copy(update={"scratch_schema": scratch})
     run_id = "20260916T120000_0123456789ab"
     ours = "dbt_refmerge_baseline_000_0123456789ab_deadbeef"
     ours_tmp = "dbt_refmerge_candidate_000_0123456789ab_deadbeef__dbt_tmp"
     other_run = "dbt_refmerge_baseline_000_ffffffffffff_deadbeef"
     table_with_our_name = "dbt_refmerge_candidate_000_0123456789ab_cafebabe"
-    with psycopg2.connect(pg_dsn) as conn, conn.cursor() as cur:
+    with psycopg2.connect(proven.dsn) as conn, conn.cursor() as cur:
         cur.execute(f'create schema if not exists "{scratch}"')
         for view in (ours, ours_tmp, other_run):
             cur.execute(f'create view "{scratch}"."{view}" as select 1 as x')
@@ -196,4 +227,38 @@ def test_cleanup_drops_leftover_views_for_the_run_only(warehouse_project, pg_dsn
     result = RefmergeService().cleanup(CleanupRequest(config=config, run_id=run_id))
 
     assert result["dropped"] == sorted([ours, ours_tmp]) and result["complete"]
-    assert _relations_in(pg_dsn, scratch) == [(other_run, "VIEW"), (table_with_our_name, "BASE TABLE")]
+    assert _relations_in(proven.dsn, scratch) == [(other_run, "VIEW"), (table_with_our_name, "BASE TABLE")]
+
+
+def test_check_compiles_projects_that_use_a_local_package(tmp_path, pg_dsn, pg_schemas, dbt_executable):
+    # dbt deps links a local package into dbt_packages; the snapshot must carry it or the baseline compile of
+    # stg_orders (which calls the package macro) fails.
+    model_schema = pg_schemas("model")
+    root = tmp_path / "project"
+    package = tmp_path / "shared_macros"
+    (package / "macros").mkdir(parents=True)
+    (package / "dbt_project.yml").write_text("name: shared_macros\nversion: 1.0.0\nconfig-version: 2\n")
+    (package / "macros" / "doubled.sql").write_text("{% macro doubled(col) %}({{ col }} * 2){% endmacro %}\n")
+    (root / "models").mkdir(parents=True)
+    (root / "dbt_project.yml").write_text("name: it\nversion: 1.0.0\nconfig-version: 2\nprofile: it\n")
+    (root / "packages.yml").write_text(f"packages:\n  - local: {package.as_posix()}\n")
+    (root / "models" / "stg_orders.sql").write_text(
+        "select order_id, customer_id, {{ shared_macros.doubled('amount') }} as amount from ("
+        + STG_ORDERS.strip()
+        + ") as s\n"
+    )
+    (root / "models" / "orders.sql").write_text(ORDERS)
+    profiles = write_pg_profiles(tmp_path / "profiles", pg_dsn, profile="it", schema=model_schema)
+    for args in (["deps"], ["run", "--select", "stg_orders"]):
+        subprocess.run(
+            [dbt_executable, *args, "--profiles-dir", str(profiles)], cwd=root, check=True, capture_output=True
+        )
+    assert (root / "dbt_packages" / "shared_macros").is_symlink()
+    config = AppConfig(
+        project_dir=root, profiles_dir=profiles, scratch_schema=pg_schemas("scratch"), dbt_command=(dbt_executable,)
+    )
+
+    receipt = _orders_receipt(RefmergeService().check(CheckRequest(config=config)))
+
+    assert (receipt.status, receipt.reason_codes) == (VerificationStatus.SNAPSHOT_EQUIVALENT, (ReasonCode.OK,))
+    assert receipt.equality == EqualityResult(True, 6, 6, 0, 0)

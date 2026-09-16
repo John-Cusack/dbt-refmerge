@@ -311,3 +311,48 @@ def test_expected_transform_refuses_inconsistent_baseline(baseline, canonical, a
         build_expected_transform(parse_model(baseline), canonical, ("b",), {canonical: additions})
     assert exc_info.value.reason_code is ReasonCode.COMPILE_DRIFT
     assert exc_info.value.message.startswith(message)
+
+
+@pytest.mark.parametrize(
+    "final",
+    [
+        "select id, amount from a order by id limit 5",
+        "select * from a order by id limit 5",
+        "select a.* from a order by id limit 5",
+        "select distinct on (id) id, amount from a order by id",
+        "select id, amount from a order by id offset 5",
+        "select id, amount from a union all select id, amount from a order by 1 limit 3",
+    ],
+    ids=["one-of-two-columns", "star", "qualified-star", "distinct-on-partial", "offset-partial", "union-partial"],
+)
+def test_volatility_refuses_row_selection_whose_order_can_tie(final):
+    # Rows that tie on the ORDER BY but differ in another output column make LIMIT pick different rows.
+    result = analyze_volatility(parse_model(f"with a as (select id, amount from t) {final}", "postgres"))
+    assert (result.ok, result.reason_codes) == (False, (ReasonCode.NONDETERMINISTIC,))
+
+
+@pytest.mark.parametrize(
+    "final",
+    [
+        "select id, amount from a order by 1, 2 limit 5",
+        "select id, amount as amt from a order by amt desc, id limit 5",
+        "select id, sum(amount) as total from a group by id order by id, sum(amount) limit 5",
+        "select a.id, a.amount from a order by a.amount, a.id limit 5",
+        "select id, amount from a order by amount, id nulls first limit 5",
+        "select distinct on (id) id, amount from a order by id, amount",
+        "select id, amount from a union all select id, amount from a order by 2, 1 limit 3",
+        "select id, amount + 1 from a order by amount + 1, id limit 5",
+    ],
+    ids=[
+        "ordinals",
+        "alias",
+        "expression",
+        "qualified",
+        "nulls-first",
+        "distinct-on-total",
+        "union-total",
+        "unaliased-expression",
+    ],
+)
+def test_volatility_accepts_row_selection_ordered_by_every_output(final):
+    assert analyze_volatility(parse_model(f"with a as (select id, amount from t) {final}", "postgres")).ok

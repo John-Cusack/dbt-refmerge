@@ -555,16 +555,20 @@ def analyze_volatility(parsed: ParsedModel) -> VolatilityResult:
             return VolatilityResult(
                 ok=False, reason_codes=(ReasonCode.NONDETERMINISTIC,), unknown_functions=("window_frame",)
             )
+    fold = _fold_for_dialect(parsed.dialect)
     for query in _iter_nodes(parsed.tree):
-        if not isinstance(query, exp.Query) or query.args.get("order") is not None:
+        if not isinstance(query, exp.Query):
             continue
         distinct = query.args.get("distinct")
-        if query.args.get("limit") is not None or query.args.get("offset") is not None:
-            unordered = "unordered_limit"
-        elif isinstance(distinct, exp.Distinct) and distinct.args.get("on") is not None:
-            unordered = "unordered_distinct_on"
-        else:
+        limits_rows = query.args.get("limit") is not None or query.args.get("offset") is not None
+        distinct_on = isinstance(distinct, exp.Distinct) and distinct.args.get("on") is not None
+        if not (limits_rows or distinct_on):
             continue
+        order = query.args.get("order")
+        prefix = "unordered" if order is None else "partially_ordered"
+        if order is not None and _orders_every_output(query, order, fold):
+            continue
+        unordered = f"{prefix}_limit" if limits_rows else f"{prefix}_distinct_on"
         return VolatilityResult(
             ok=False,
             reason_codes=(ReasonCode.NONDETERMINISTIC,),
@@ -577,6 +581,38 @@ def analyze_volatility(parsed: ParsedModel) -> VolatilityResult:
             unknown_functions=tuple(sorted(set(unknown))),
         )
     return VolatilityResult(ok=True, reason_codes=(ReasonCode.OK,), unknown_functions=())
+
+
+def _orders_every_output(query: Any, order: Any, fold: str) -> bool:
+    """True when the ORDER BY covers every output column of ``query``.
+
+    Rows that tie on such an ORDER BY are identical in every output column, so LIMIT / OFFSET / DISTINCT ON
+    return the same multiset whichever tied row the planner picks. A key covers a column by ordinal, by
+    output name, or by being the same expression. ``*`` cannot be checked and never counts as covered.
+    """
+    outputs = list(query.selects)
+    if not outputs or any(o.is_star for o in outputs):
+        return False
+    ordinals: set[int] = set()
+    names: set[str] = set()
+    expressions: list[Any] = []
+    for ordered in order.expressions:
+        key = ordered.this
+        if isinstance(key, exp.Literal) and not key.is_string and key.this.isdigit():
+            ordinals.add(int(key.this))
+        else:
+            if isinstance(key, exp.Column) and not key.table:
+                names.add(_normalize_ident(key.name, bool(key.this.args.get("quoted")), fold))
+            expressions.append(_canonical(key, fold))
+    for position, output in enumerate(outputs, start=1):
+        name = ""
+        if isinstance(output, (exp.Alias, exp.Column)):
+            identifier = output.args["alias"] if isinstance(output, exp.Alias) else output.this
+            name = _normalize_ident(identifier.name, bool(identifier.args.get("quoted")), fold)
+        if position in ordinals or name in names or _canonical(output.unalias(), fold) in expressions:
+            continue
+        return False
+    return True
 
 
 def validate_compiled_delta(baseline: ParsedModel, candidate: ParsedModel, expected_fingerprint: str) -> None:

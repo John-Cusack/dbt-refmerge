@@ -156,8 +156,8 @@ def faults() -> Iterator[Faults]:
 # -- warehouse ---------------------------------------------------------------------------------------
 
 
-@pytest.fixture
-def pg_dsn() -> str:
+def require_pg_dsn() -> str:
+    """The warehouse DSN, or skip (fail when REQUIRE_WAREHOUSE=1 so CI cannot skip silently)."""
     if not _PG_DSN:
         if _REQUIRE_WAREHOUSE:
             pytest.fail("REQUIRE_WAREHOUSE=1 but REFMERGE_TEST_PG_DSN is not set")
@@ -165,20 +165,20 @@ def pg_dsn() -> str:
     return _PG_DSN
 
 
-@pytest.fixture
-def pg_schemas(pg_dsn: str) -> Iterator[Callable[[str], str]]:
-    """Unique schema names (``pg_schemas("model")``); all dropped with cascade after the test."""
+def find_dbt() -> str:
+    """The dbt installed next to the running interpreter (the `integration` extra)."""
+    import shutil
+
+    found = shutil.which("dbt", path=str(Path(sys.executable).parent))
+    if found is None:
+        pytest.fail("dbt is not installed next to this interpreter; install the `integration` extra")
+    return found
+
+
+def drop_pg_schemas(dsn: str, names: list[str]) -> None:
     import psycopg2
 
-    names: list[str] = []
-
-    def make(purpose: str) -> str:
-        name = f"refmerge_it_{purpose}_{uuid.uuid4().hex[:8]}"
-        names.append(name)
-        return name
-
-    yield make
-    conn = psycopg2.connect(pg_dsn)
+    conn = psycopg2.connect(dsn)
     conn.autocommit = True
     try:
         with conn.cursor() as cur:
@@ -189,14 +189,27 @@ def pg_schemas(pg_dsn: str) -> Iterator[Callable[[str], str]]:
 
 
 @pytest.fixture
-def dbt_executable() -> str:
-    """The dbt installed next to the running interpreter (the `integration` extra)."""
-    import shutil
+def pg_dsn() -> str:
+    return require_pg_dsn()
 
-    found = shutil.which("dbt", path=str(Path(sys.executable).parent))
-    if found is None:
-        pytest.fail("dbt is not installed next to this interpreter; install the `integration` extra")
-    return found
+
+@pytest.fixture
+def pg_schemas(pg_dsn: str) -> Iterator[Callable[[str], str]]:
+    """Unique schema names (``pg_schemas("model")``); all dropped with cascade after the test."""
+    names: list[str] = []
+
+    def make(purpose: str) -> str:
+        name = f"refmerge_it_{purpose}_{uuid.uuid4().hex[:8]}"
+        names.append(name)
+        return name
+
+    yield make
+    drop_pg_schemas(pg_dsn, names)
+
+
+@pytest.fixture
+def dbt_executable() -> str:
+    return find_dbt()
 
 
 def write_pg_profiles(directory: Path, dsn: str, *, profile: str, schema: str) -> Path:

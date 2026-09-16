@@ -3,6 +3,7 @@
 import hashlib
 import os
 import re
+import shutil
 import sys
 import tempfile
 from pathlib import Path
@@ -163,21 +164,68 @@ def test_snapshot_includes_installed_dbt_packages(make_project):
 
 
 @pytest.mark.parametrize("where", ["inside", "outside"])
-def test_snapshot_refuses_symlinked_directory(make_project, tmp_path, where):
-    # §2.3: os.walk never descends into a symlinked directory, so its files silently vanished.
-    # A local dbt package installed by `dbt deps` is such a symlink; refusing is the fail-closed choice.
+def test_snapshot_refuses_symlinked_directory_outside_dbt_packages(make_project, tmp_path, where):
+    # os.walk never descends into a symlinked directory, so its files silently vanished.
     root = make_project({"shared/m.sql": "select 1\n"})
-    target = root / "shared" if where == "inside" else tmp_path / "local_pkg"
+    target = root / "shared" if where == "inside" else tmp_path / "elsewhere"
     target.mkdir(exist_ok=True)
-    link = root / "dbt_packages" / "shared"
-    _symlink(link, target, directory=True)
+    _symlink(root / "models" / "shared", target, directory=True)
 
     error = _snapshot_error(root)
 
     assert error.reason_code is ReasonCode.INTERNAL_ERROR
-    assert (
-        error.message == f"linked directory in project is not supported: {root.resolve() / 'dbt_packages' / 'shared'}"
-    )
+    assert error.message == f"linked directory in project is not supported: {root.resolve() / 'models' / 'shared'}"
+
+
+def test_snapshot_copies_local_packages_that_dbt_deps_linked(make_project, tmp_path):
+    # `dbt deps` installs a `local:` package as a symlink in dbt_packages; compiling the snapshot needs it.
+    root = make_project({"models/a.sql": "select 1\n"})
+    package = tmp_path / "shared_package"
+    for rel, content in {
+        "dbt_project.yml": "name: shared\n",
+        "macros/m.sql": "{% macro m() %}1{% endmacro %}\n",
+        "target/manifest.json": "{}",
+        "dbt_packages/nested/x.sql": "select 2\n",
+        "macros/__pycache__/c.pyc": "x",
+    }.items():
+        (package / rel).parent.mkdir(parents=True, exist_ok=True)
+        (package / rel).write_text(content, newline="")
+    _symlink(root / "dbt_packages" / "shared", package, directory=True)
+    ws = RunWorkspace.create()
+
+    result = ws.snapshot_project(root)
+
+    snapshot = _files(ws.source_snapshot)
+    assert sorted(snapshot) == [
+        "dbt_packages/shared/dbt_project.yml",
+        "dbt_packages/shared/macros/m.sql",
+        "dbt_project.yml",
+        "models/a.sql",
+    ]
+    assert snapshot["dbt_packages/shared/macros/m.sql"] == b"{% macro m() %}1{% endmacro %}\n"
+    assert result.file_count == 4
+    assert _files(ws.candidate_project) == snapshot
+
+
+@pytest.mark.parametrize("case", ["ancestor", "project", "dangling", "nested-link", "file-link-escapes"])
+def test_snapshot_refuses_unsafe_local_package_links(make_project, tmp_path, case):
+    root = make_project({"models/a.sql": "select 1\n"})
+    package = tmp_path / "shared_package"
+    (package / "macros").mkdir(parents=True)
+    target = {
+        "ancestor": tmp_path,
+        "project": root,
+        "dangling": tmp_path / "missing",
+    }
+    if case == "nested-link":
+        _symlink(package / "macros" / "more", tmp_path, directory=True)
+    if case == "file-link-escapes":
+        _symlink(package / "macros" / "secret.sql", root / "models" / "a.sql")
+    _symlink(root / "dbt_packages" / "shared", target.get(case, package), directory=True)
+
+    error = _snapshot_error(root)
+
+    assert error.reason_code is ReasonCode.INTERNAL_ERROR
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="directory junctions are Windows-only")
@@ -419,3 +467,25 @@ def test_snapshot_skips_project_virtualenvs(make_project, tmp_path):
     ws.snapshot_project(root)
 
     assert sorted(_files(ws.source_snapshot)) == ["dbt_project.yml", "models/a.sql"]
+
+
+def test_snapshot_refuses_package_link_that_breaks_during_the_snapshot(make_project, tmp_path, faults):
+    root = make_project({"models/a.sql": "select 1\n"})
+    package = tmp_path / "shared_package"
+    (package / "macros").mkdir(parents=True)
+    _symlink(root / "dbt_packages" / "shared", package, directory=True)
+    packages_dir = str(root.resolve() / "dbt_packages")
+    listings = []
+
+    def remove_package(args):
+        # The walk lists dbt_packages first; break the link just before the package copy lists it again.
+        if str(args[0]) == packages_dir:
+            listings.append(args[0])
+            if len(listings) == 2:
+                shutil.rmtree(package)
+
+    for event in ("os.listdir", "os.scandir"):
+        faults.on(event, remove_package)
+    error = _snapshot_error(root)
+
+    assert error.message.startswith("unsafe package link: ")
