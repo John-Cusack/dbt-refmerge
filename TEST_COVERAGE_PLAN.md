@@ -32,7 +32,7 @@ Measured 2026-09-16 on `acf0184` (the PR #4 branch; production code matches `mai
 | 1 | done (option A) | — | — |
 | 2 | done: B2–B7, S1–S11 | #6 | 71.3% (`fail_under = 71`) |
 | 3 | done: unit lane for reporting, config, errors, domain, analyze, rewrite, semantics, source, artifacts, adapters, workspace, apply | #7 | 85% (`fail_under = 85`) |
-| 4 | done: dbt_cli, CLI and orchestrator in the fake_dbt lane; remaining verifier helpers; CLI/orchestrator bugs from §2.3 | Phase 4 PR | **100%** (`fail_under = 100`) |
+| 4 | done: dbt_cli, CLI and orchestrator in the fake_dbt lane; remaining verifier helpers; CLI/orchestrator bugs from §2.3 | #9 | **100%** (`fail_under = 100`) |
 | 5 | verifier built (B1) and warehouse lane added; phase order swapped with 4 so CLI tests target final behavior | #8 | 90% (`fail_under = 90`) |
 
 Discrepancies found while implementing:
