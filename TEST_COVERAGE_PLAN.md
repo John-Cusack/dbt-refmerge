@@ -33,7 +33,7 @@ Measured 2026-09-16 on `acf0184` (the PR #4 branch; production code matches `mai
 | 2 | done: B2–B7, S1–S11 | #6 | 71.3% (`fail_under = 71`) |
 | 3 | done: unit lane for reporting, config, errors, domain, analyze, rewrite, semantics, source, artifacts, adapters, workspace, apply | #7 | 85% (`fail_under = 85`) |
 | 4 | not started | | |
-| 5 | verifier built (B1) and warehouse lane added; phase order swapped with 4 so CLI tests target final behavior | Verifier PR | 90% (`fail_under = 90`) |
+| 5 | verifier built (B1) and warehouse lane added; phase order swapped with 4 so CLI tests target final behavior | #8 | 90% (`fail_under = 90`) |
 
 Discrepancies found while implementing:
 
