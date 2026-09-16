@@ -33,9 +33,11 @@ Harness query results (``run-operation dbt_refmerge_query``), keyed by the call'
 - ``schema``: both harness views with the columns in ``FAKE_DBT_BASELINE_COLUMNS`` /
   ``FAKE_DBT_CANDIDATE_COLUMNS`` (JSON ``[[name, type], ...]``, default ``[["id", "integer"]]``)
 - ``verdict``: ``FAKE_DBT_VERDICT`` = ``"baseline,candidate,baseline_only,candidate_only"`` (default ``1,1,0,0``)
-- ``remaining``: no rows, or every requested name when ``FAKE_DBT_REMAINING=all``
 - ``run-views``: the names in ``FAKE_DBT_RUN_VIEWS`` (comma separated)
 - ``FAKE_DBT_QUERY_OUTPUT`` replaces the marked output entirely (for malformed-result tests)
+
+``run-operation dbt_refmerge_drop_views`` reports no remaining relations, or every requested name when
+``FAKE_DBT_REMAINING=all``.
 """
 
 from __future__ import annotations
@@ -232,22 +234,27 @@ def _query_rows(label: str, sql: str) -> tuple[list[str], list[list[str | None]]
     if label == "verdict":
         counts = os.environ.get("FAKE_DBT_VERDICT", "1,1,0,0").split(",")
         return ["baseline_rows", "candidate_rows", "baseline_only_occurrences", "candidate_only_occurrences"], [counts]
-    if label == "remaining":
-        remaining = names if os.environ.get("FAKE_DBT_REMAINING") == "all" else []
-        return ["relname", "relkind", "attnum", "attname", "format_type"], [
-            [n, "v", None, None, None] for n in remaining
-        ]
     if label == "run-views":
         views = [v for v in os.environ.get("FAKE_DBT_RUN_VIEWS", "").split(",") if v]
         return ["relname"], [[v] for v in views]
     raise SystemExit(f"fake dbt: no scripted result for query label {label!r}")
 
 
+def _print_result(nonce: str, columns: list[str], rows: list[list[str | None]]) -> None:
+    print(f"DBT_REFMERGE_RESULT_{nonce}_BEGIN")
+    print(json.dumps({"columns": columns, "rows": rows}))
+    print(f"DBT_REFMERGE_RESULT_{nonce}_END")
+
+
 def _run_operation(args: list[str], modes: dict[str, str]) -> int:
     macro = args[1]
     macro_args = json.loads(_opt(args, "--args") or "{}")
     if macro == "dbt_refmerge_drop_views":
-        return 1 if "drop_fail" in modes else 0
+        if "drop_fail" in modes:
+            return 1
+        remaining = macro_args["identifiers"] if os.environ.get("FAKE_DBT_REMAINING") == "all" else []
+        _print_result(macro_args["nonce"], ["relname"], [[name] for name in remaining])
+        return 0
     if macro != "dbt_refmerge_query":
         print(f"fake dbt: unknown macro {macro}", file=sys.stderr)
         return 1
@@ -260,9 +267,7 @@ def _run_operation(args: list[str], modes: dict[str, str]) -> int:
         sys.stdout.write(os.environ["FAKE_DBT_QUERY_OUTPUT"].replace("{nonce}", nonce))
         return 0
     columns, rows = _query_rows(label, macro_args["sql"])
-    print(f"DBT_REFMERGE_RESULT_{nonce}_BEGIN")
-    print(json.dumps({"columns": columns, "rows": rows}))
-    print(f"DBT_REFMERGE_RESULT_{nonce}_END")
+    _print_result(nonce, columns, rows)
     return 0
 
 

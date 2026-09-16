@@ -70,7 +70,7 @@ def test_equivalent_views_are_fixable_and_dropped(make_project, fake_dbt, tmp_pa
         True,
     )
     assert is_fixable(receipt)
-    assert _query_labels(fake_dbt) == ["schema", "verdict", "remaining"]
+    assert _query_labels(fake_dbt) == ["schema", "verdict"]
     drop = next(c for c in fake_dbt.calls() if c[:2] == ["run-operation", "dbt_refmerge_drop_views"])
     drop_args = json.loads(drop[drop.index("--args") + 1])
     assert drop_args["schema"] == "refmerge_scratch"
@@ -141,11 +141,8 @@ def test_scratch_schema_equal_to_model_schema_refuses_before_dbt(make_project, f
     ("mode", "expected_ops"),
     [
         ("parse_fail", []),
-        ("run_fail", ["dbt_refmerge_drop_views", "dbt_refmerge_query"]),
-        (
-            "query_fail=verdict",
-            ["dbt_refmerge_query", "dbt_refmerge_query", "dbt_refmerge_drop_views", "dbt_refmerge_query"],
-        ),
+        ("run_fail", ["dbt_refmerge_drop_views"]),
+        ("query_fail=verdict", ["dbt_refmerge_query", "dbt_refmerge_query", "dbt_refmerge_drop_views"]),
     ],
 )
 def test_dbt_failures_are_errors_and_created_views_are_still_dropped(
