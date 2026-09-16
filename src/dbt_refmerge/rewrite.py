@@ -38,8 +38,9 @@ def _detect_newline_indent(select_list_bytes: bytes) -> tuple[bytes, bytes, bool
         nl: bytes = b"\r\n"
     else:
         nl = b"\n"
-    # indent = whitespace after first newline
-    j = idx + len(nl)
+    # indent = whitespace after first newline (idx points at b"\n"; for CRLF
+    # the b"\r" precedes it, so content always starts at idx + 1)
+    j = idx + 1
     k = j
     while k < len(select_list_bytes) and select_list_bytes[k : k + 1] in (b" ", b"\t"):
         k += 1

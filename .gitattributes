@@ -1,0 +1,5 @@
+# Normalize line endings on checkout: byte-exact tests and span
+# arithmetic assume LF. CRLF sources are still *parsed* (the frontend
+# strips \r for analysis and maps spans back to bytes), but fixtures
+# must be canonical.
+* text=auto eol=lf

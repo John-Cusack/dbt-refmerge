@@ -78,3 +78,23 @@ def test_golden_cases_match_planner():
         qualified = qualify_group(groups[0], whole_model_ok=True)
         plan = build_plan(raw, owner.unique_id, Path("m.sql"), (qualified,), src)
         assert apply_edits(raw, plan.edits) == expected
+
+
+def test_golden_crlf_source_rewrites_to_crlf():
+    """Windows checkouts / CRLF models: spans must map back to raw bytes exactly."""
+    root = Path(__file__).parent / "disjoint_projections"
+    raw = (root / "input.sql").read_bytes().replace(b"\n", b"\r\n")
+    expected = (root / "expected.sql").read_bytes().replace(b"\n", b"\r\n")
+    view, owner = _view("stg_orders")
+    src = parse_source_model(raw)
+    matched = match_source_ctes(
+        tuple(c for c in src.ctes if c.ref_call is not None),
+        parse_model(COMPILED["disjoint_projections"], "postgres"),
+        view,
+        owner,
+    )
+    groups = group_imports(list(matched), owner.unique_id)
+    assert len(groups) == 1
+    qualified = qualify_group(groups[0], whole_model_ok=True)
+    plan = build_plan(raw, owner.unique_id, Path("m.sql"), (qualified,), src)
+    assert apply_edits(raw, plan.edits) == expected
