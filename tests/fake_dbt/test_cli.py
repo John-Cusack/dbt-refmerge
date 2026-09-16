@@ -68,6 +68,28 @@ def test_check_human_output_and_fail_on_never(project):
     assert "+select a.customer_id, b.amount from a join a as b using (id)" in result.stdout
 
 
+def test_human_mode_reports_progress_on_stderr_and_json_mode_does_not(project):
+    root, common = project
+
+    human = _invoke("check", *common, "--fail-on", "never")
+    as_json = _invoke("check", *common, "--json", "--fail-on", "never")
+    fixed = _invoke("fix", "models/orders.sql", *common)
+
+    assert human.stderr.splitlines() == [
+        "dbt-refmerge: copying the project into a private workspace",
+        "dbt-refmerge: compiling the project with dbt (--select fqn:*)",
+        "dbt-refmerge: analyzing 2 models",
+        "dbt-refmerge: compiling 1 candidate merge",
+        "dbt-refmerge: verifying 1 merge on the warehouse (scratch schema refmerge_scratch; views are dropped "
+        "afterwards)",
+    ]
+    assert "dbt-refmerge:" not in human.stdout
+    assert as_json.stderr == "" and json.loads(as_json.stdout)["models"]
+    assert fixed.exit_code == 0
+    assert fixed.stderr.splitlines()[-1] == "dbt-refmerge: writing the verified merge to models/orders.sql"
+    assert "join a as b" in (root / "models" / "orders.sql").read_text()
+
+
 def test_check_select_uses_dbt_selection(project, fake_dbt):
     _root, common = project
 
@@ -136,7 +158,7 @@ def test_fix_unknown_or_partial_path_is_model_not_found(project, model_path):
     result = _invoke("fix", model_path, *common)
 
     assert result.exit_code == 1
-    assert result.stderr == "fix: model not found\n"
+    assert result.stderr.splitlines()[-1] == "fix: model not found"
 
 
 def test_fix_accepts_an_absolute_model_path(project):
@@ -164,7 +186,7 @@ def test_interrupt_exits_130(project, fake_dbt):
 
     result = _invoke("check", *common)
 
-    assert (result.exit_code, result.stderr) == (130, "interrupted\n")
+    assert (result.exit_code, result.stderr.splitlines()[-1]) == (130, "interrupted")
 
 
 def test_cleanup_prints_json_and_exits_1_when_views_remain(project, monkeypatch):

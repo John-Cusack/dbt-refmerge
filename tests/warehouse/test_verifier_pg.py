@@ -13,7 +13,7 @@ from conftest import drop_pg_schemas, find_dbt, require_pg_dsn, write_pg_profile
 from dbt_refmerge.config import AppConfig
 from dbt_refmerge.domain import EqualityResult, ReasonCode, VerificationStatus, is_fixable
 from dbt_refmerge.orchestrator import CheckRequest, CleanupRequest, FixRequest, RefmergeService, ScanRequest
-from dbt_refmerge.verification.runner import verify_postgres
+from dbt_refmerge.verification.runner import verify_postgres, verify_postgres_batch
 
 pytestmark = pytest.mark.warehouse
 
@@ -81,9 +81,9 @@ def proven(tmp_path_factory):
         )
         requests = []
 
-        def recording(request):
-            requests.append(request)
-            return verify_postgres(request)
+        def recording(batch):
+            requests.extend(batch)
+            return verify_postgres_batch(batch)
 
         report = RefmergeService(verify_runner=recording).check(CheckRequest(config=config))
         request = next(r for r in requests if r.baseline.unique_id == "model.it.orders")
@@ -262,3 +262,46 @@ def test_check_compiles_projects_that_use_a_local_package(tmp_path, pg_dsn, pg_s
 
     assert (receipt.status, receipt.reason_codes) == (VerificationStatus.SNAPSHOT_EQUIVALENT, (ReasonCode.OK,))
     assert receipt.equality == EqualityResult(True, 6, 6, 0, 0)
+
+
+def test_one_check_verifies_several_models_and_keeps_failures_per_model(warehouse_project, pg_dsn):
+    # Four merges share one harness run: two prove equivalent, one view cannot be built and one comparison
+    # fails at query time (the view is valid SQL, but reading it divides by zero).
+    root, config = warehouse_project
+    for name in ("orders_copy", "orders_unbuildable", "orders_failing_query"):
+        (root / "models" / f"{name}.sql").write_text(ORDERS)
+    tampering = {
+        "model.it.orders_unbuildable": "select * from final join no_such_relation using (order_id)",
+        "model.it.orders_failing_query": "select order_id / (order_id - order_id) as order_id, customer_id, amount from final",
+    }
+
+    def tamper(batch):
+        assert len(batch) == 4
+        return verify_postgres_batch(
+            [
+                dataclasses.replace(
+                    r,
+                    baseline=_with_compiled(r.baseline, "select * from final", tampering[r.baseline.unique_id]),
+                    candidate=_with_compiled(r.candidate, "select * from final", tampering[r.baseline.unique_id]),
+                )
+                if r.baseline.unique_id in tampering
+                else r
+                for r in batch
+            ]
+        )
+
+    report = RefmergeService(verify_runner=tamper).check(CheckRequest(config=config))
+
+    receipts = {r.model_unique_id: r.receipt for r in report.results}
+    for uid in ("model.it.orders", "model.it.orders_copy"):
+        assert (receipts[uid].status, receipts[uid].equality) == (
+            VerificationStatus.SNAPSHOT_EQUIVALENT,
+            EqualityResult(True, 6, 6, 0, 0),
+        )
+    for uid in tampering:
+        assert (receipts[uid].status, receipts[uid].reason_codes) == (
+            VerificationStatus.ERROR,
+            (ReasonCode.DBT_COMMAND_FAILED,),
+        )
+    assert all(receipt.cleanup_complete for receipt in receipts.values())
+    assert _relations_in(pg_dsn, config.scratch_schema) == []

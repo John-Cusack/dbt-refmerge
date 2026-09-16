@@ -46,7 +46,9 @@ working, not broken).
 To prove a merge, `check` builds the original and the merged model as two
 views in the scratch schema (dbt creates it if needed; it must not be a schema
 your models build into), compares their column types and their rows as
-multisets in a single query, then drops both views. If a run is interrupted,
+multisets in a single query, then drops both views. All models in a `check`
+share one harness run, so the number of dbt invocations stays the same however
+many models you check, and a model that fails doesn't block the others. If a run is interrupted,
 `dbt-refmerge cleanup --run-id <id>` drops whatever it left (the id is in
 `check --json`). Verification supports PostgreSQL in v0.1; `scan` parses 16
 dialects (snowflake, bigquery, duckdb, databricks, redshift, trino, spark,

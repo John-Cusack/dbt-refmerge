@@ -8,11 +8,10 @@ from dbt_refmerge.domain import ReasonCode
 from dbt_refmerge.errors import ScratchBoundaryError, VerificationError
 from dbt_refmerge.verification import comparator as comp
 from dbt_refmerge.verification.harness import (
-    build_harness_project,
     strip_single_terminal_semicolon,
     validate_scratch_schema,
+    write_harness_pair,
 )
-from dbt_refmerge.workspace import RunWorkspace
 
 
 def test_comparator_counts_and_markers():
@@ -50,9 +49,8 @@ def test_verdict_sql_is_one_statement():
 
 
 def test_harness_rejects_endraw(tmp_path):
-    ws = RunWorkspace("20260101T000000_abcdef123456", tmp_path)
     with pytest.raises(Exception):
-        build_harness_project(ws, profile="p", baseline_sql="select 1 {% endraw %}", candidate_sql="select 1")
+        write_harness_pair(tmp_path, "tok", "select 1 {% endraw %}", "select 1")
 
 
 def test_semicolon_rules():
@@ -87,11 +85,28 @@ def test_parse_equality_result_requires_boolean_schema_equal(schema_equal):
 )
 def test_harness_rejects_every_raw_block_terminator(tmp_path, candidate_sql):
     # S3: Jinja closes {% raw %} on any whitespace-control variant of endraw.
-    ws = RunWorkspace("20260101T000000_abcdef123456", tmp_path)
+    (tmp_path / "models").mkdir()
     with pytest.raises(VerificationError) as exc_info:
-        build_harness_project(ws, profile="p", baseline_sql="select 1", candidate_sql=candidate_sql)
+        write_harness_pair(tmp_path, "tok", "select 1", candidate_sql)
     assert exc_info.value.reason_code is ReasonCode.HARNESS_EMBEDDING_UNSAFE
-    assert not (tmp_path / "harness_project" / "models").exists()
+    assert list((tmp_path / "models").iterdir()) == []
+
+
+def test_harness_pair_files_are_named_for_the_token_and_macros_clear_earlier_views(tmp_path):
+    from dbt_refmerge.verification.harness import harness_node_id, write_harness_macros
+
+    write_harness_macros(tmp_path, "p")
+    spec = write_harness_pair(tmp_path, "tok", "select 1;", "select 2")
+
+    assert (spec.baseline_alias, spec.candidate_alias, spec.baseline_sql) == (
+        "dbt_refmerge_baseline_tok",
+        "dbt_refmerge_candidate_tok",
+        "select 1",
+    )
+    assert sorted(path.name for path in (tmp_path / "models").iterdir()) == ["baseline_tok.sql", "candidate_tok.sql"]
+    assert harness_node_id("baseline", "tok") == "model.dbt_refmerge_harness.baseline_tok"
+    write_harness_macros(tmp_path, "p")
+    assert list((tmp_path / "models").iterdir()) == []
 
 
 @pytest.mark.parametrize(
@@ -246,22 +261,15 @@ def _harness_manifest(tmp_path, *, baseline=None, candidate=None, extra=None):
     return path
 
 
-def _boundary():
-    from dbt_refmerge.domain import IdentifierIdentity, RelationIdentity, ScratchBoundary
-
-    def rel(alias):
-        return RelationIdentity(IdentifierIdentity("db"), IdentifierIdentity("scratch"), IdentifierIdentity(alias))
-
-    return ScratchBoundary(
-        database=IdentifierIdentity("db"),
-        schema=IdentifierIdentity("scratch"),
-        allowed_relations=(rel("dbt_refmerge_baseline_tok"), rel("dbt_refmerge_candidate_tok")),
-    )
-
-
-def test_preflight_accepts_the_two_harness_views_and_disabled_or_test_nodes(tmp_path):
+def _preflight(path, **overrides):
     from dbt_refmerge.verification.harness import preflight_harness_manifest
 
+    expected = {f"model.dbt_refmerge_harness.{role}": f"dbt_refmerge_{role}_tok" for role in ("baseline", "candidate")}
+    kwargs = {"database": "db", "schema": "scratch", "expected": expected, **overrides}
+    preflight_harness_manifest(path, **kwargs)
+
+
+def test_preflight_accepts_the_expected_views_and_disabled_or_test_nodes(tmp_path):
     extra = {
         "model.dbt_refmerge_harness.off": {
             "unique_id": "model.dbt_refmerge_harness.off",
@@ -279,11 +287,7 @@ def test_preflight_accepts_the_two_harness_views_and_disabled_or_test_nodes(tmp_
             "original_file_path": "tests/t.sql",
         },
     }
-    baseline, candidate = preflight_harness_manifest(_harness_manifest(tmp_path, extra=extra), _boundary())
-    assert (baseline.identifier.value, candidate.identifier.value) == (
-        "dbt_refmerge_baseline_tok",
-        "dbt_refmerge_candidate_tok",
-    )
+    _preflight(_harness_manifest(tmp_path, extra=extra))
 
 
 @pytest.mark.parametrize(
@@ -291,16 +295,35 @@ def test_preflight_accepts_the_two_harness_views_and_disabled_or_test_nodes(tmp_
     [
         {"candidate": False},
         {"baseline": {"config": {"materialized": "view", "post-hook": ["drop table x"]}}},
+        {"baseline": {"config": {"materialized": "table"}}},
         {"baseline": {"alias": "customers"}},
         {"baseline": {"database": "other"}},
+        {"baseline": {"schema": "public"}},
+        {"extra": {"model.dbt_refmerge_harness.other": {"resource_type": "model", "config": {}}}},
     ],
-    ids=["missing-candidate", "hook", "alias-not-allowed", "other-database"],
+    ids=["missing-candidate", "hook", "table", "alias-not-expected", "other-database", "other-schema", "extra-model"],
 )
 def test_preflight_refuses(tmp_path, kwargs):
-    from dbt_refmerge.verification.harness import preflight_harness_manifest
-
+    extra = kwargs.pop("extra", None)
+    if extra:
+        name = "other"
+        extra = {
+            uid: {
+                "unique_id": uid,
+                "package_name": "dbt_refmerge_harness",
+                "name": name,
+                "original_file_path": f"models/{name}.sql",
+                **node,
+            }
+            for uid, node in extra.items()
+        }
     with pytest.raises(ScratchBoundaryError):
-        preflight_harness_manifest(_harness_manifest(tmp_path, **kwargs), _boundary())
+        _preflight(_harness_manifest(tmp_path, extra=extra, **kwargs))
+
+
+def test_preflight_refuses_an_empty_batch(tmp_path):
+    with pytest.raises(ScratchBoundaryError):
+        _preflight(_harness_manifest(tmp_path), expected={})
 
 
 def test_build_verdict_sql_dispatches_by_strategy():

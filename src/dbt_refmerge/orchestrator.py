@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import difflib
 import hashlib
 import os
@@ -26,6 +27,7 @@ from dbt_refmerge.dbt_cli import DbtCli, DbtInvocation
 from dbt_refmerge.domain import (
     EqualityResult,
     ReasonCode,
+    RewritePlan,
     VerificationReceipt,
     VerificationStatus,
     is_fixable,
@@ -47,7 +49,7 @@ from dbt_refmerge.semantics import (
     semantic_fingerprint,
 )
 from dbt_refmerge.source import parse_source_model, source_sha256
-from dbt_refmerge.verification.runner import VerificationRequest, VerifyRunner, cleanup_run, verify_postgres
+from dbt_refmerge.verification.runner import VerificationRequest, VerifyRunner, cleanup_run, verify_postgres_batch
 from dbt_refmerge.workspace import RunWorkspace
 
 
@@ -224,9 +226,11 @@ class RefmergeService:
         self,
         dbt_factory: Callable[[AppConfig], DbtCli] | None = None,
         verify_runner: VerifyRunner | None = None,
+        progress: Callable[[str], None] | None = None,
     ) -> None:
         self._dbt_factory = dbt_factory or (lambda cfg: DbtCli(tuple(cfg.dbt_command)))
-        self._verify_runner = verify_runner or verify_postgres
+        self._verify_runner = verify_runner or verify_postgres_batch
+        self._progress = progress or (lambda message: None)
 
     # -- scan --
     def scan(self, request: ScanRequest) -> ScanReport:
@@ -283,6 +287,7 @@ class RefmergeService:
             )
         ws = RunWorkspace.create(keep=config.keep_workspace)
         try:
+            self._progress("copying the project into a private workspace")
             snapshot = ws.snapshot_project(config.project_dir)
             dbt = self._dbt_factory(config)
             version = dbt.version(cwd=snapshot.root)
@@ -314,6 +319,7 @@ class RefmergeService:
                 threads=1,
                 timeout_seconds=config.subprocess_timeout_seconds,
             )
+            self._progress(f"compiling the project with dbt (--select {selector})")
             res = dbt.compile(baseline_inv, selector)
             if res.returncode != 0:
                 raise DbtError(f"dbt compile failed: {res.stderr[-2000:]}", argv=res.argv_redacted)
@@ -326,15 +332,43 @@ class RefmergeService:
                 models = [n for n in models if n.original_file_path.replace("\\", "/") == request.model_path.as_posix()]
             elif not models:
                 raise RefmergeError(ReasonCode.INTERNAL_ERROR, f"no models selected by {selector!r}")
-            results: list[ModelResult] = []
-            cand_map: dict[str, bytes] = {}
+            results: dict[str, ModelResult] = {}
+            pending: list[_PendingMerge] = []
+            self._progress(f"analyzing {len(models)} model{'s' if len(models) != 1 else ''}")
             for node in sorted(models, key=lambda n: n.unique_id):
-                result, cand_bytes = self._check_one_model(config, ws, dbt, context, view, node, baseline_inv, spec)
-                results.append(result)
-                cand_map[result.model_unique_id] = cand_bytes
+                outcome = self._prepare_model(ws, context, view, node, spec)
+                if isinstance(outcome, ModelResult):
+                    results[node.unique_id] = outcome
+                else:
+                    pending.append(outcome)
+            verifiable = self._compile_candidates(config, ws, dbt, context, view, spec, pending, results)
+            cand_map = dict.fromkeys(results, b"")
+            if verifiable:
+                self._progress(
+                    f"verifying {len(verifiable)} merge{'s' if len(verifiable) != 1 else ''} on the warehouse "
+                    f"(scratch schema {config.scratch_schema}; views are dropped afterwards)"
+                )
+                requests = [
+                    VerificationRequest(
+                        config=config,
+                        workspace=ws,
+                        dbt=dbt,
+                        context=context,
+                        view=view,
+                        baseline=merge.node,
+                        candidate=candidate,
+                        plan=merge.plan,
+                        spec=spec,
+                    )
+                    for merge, candidate in verifiable
+                ]
+                for (merge, _candidate), receipt in zip(verifiable, self._verify_runner(requests), strict=True):
+                    diff = _unified_diff(merge.raw, merge.candidate_bytes, merge.rel.as_posix())
+                    results[merge.node.unique_id] = ModelResult(merge.node.unique_id, merge.src_path, receipt, diff)
+                    cand_map[merge.node.unique_id] = merge.candidate_bytes
             return CheckReport(
                 run_id=ws.run_id,
-                results=tuple(results),
+                results=tuple(results[uid] for uid in sorted(results)),
                 candidate_bytes_map=cand_map,
                 dbt_version=view.metadata.dbt_version,
                 manifest_schema_version=view.metadata.dbt_schema_version,
@@ -346,39 +380,36 @@ class RefmergeService:
                 with contextlib.suppress(CleanupError):
                     ws.cleanup_files()
 
-    def _check_one_model(
+    def _prepare_model(
         self,
-        config: AppConfig,
         ws: RunWorkspace,
-        dbt: DbtCli,
         context: CompilationContext,
         view: ManifestView,
         node: ManifestNodeModel,
-        baseline_inv: DbtInvocation,
         spec: AdapterSpec,
-    ) -> tuple[ModelResult, bytes]:
+    ) -> ModelResult | _PendingMerge:
+        """Static analysis and rewrite for one model: a final refusal, or a candidate written for compilation."""
         from dbt_refmerge.source import parse_source_model as _parse_src
 
+        def refuse(codes: tuple[ReasonCode, ...], path: Path) -> ModelResult:
+            return ModelResult(node.unique_id, path, _unverifiable_receipt(ws, context, view, node, codes), "")
+
         if node.config.get("materialized", "view") not in ("table", "view"):
-            receipt = _unverifiable_receipt(ws, context, view, node, (ReasonCode.UNSUPPORTED_MODEL_TYPE,))
-            return ModelResult(node.unique_id, Path(node.original_file_path), receipt, ""), b""
+            return refuse((ReasonCode.UNSUPPORTED_MODEL_TYPE,), Path(node.original_file_path))
         src_path = ws.source_snapshot / node.original_file_path
         if not src_path.is_file():
             # The rewrite edits this exact file; never substitute a same-named file or the manifest's raw_code.
-            receipt = _unverifiable_receipt(ws, context, view, node, (ReasonCode.SOURCE_MAPPING_AMBIGUOUS,))
-            return ModelResult(node.unique_id, Path(node.original_file_path), receipt, ""), b""
+            return refuse((ReasonCode.SOURCE_MAPPING_AMBIGUOUS,), Path(node.original_file_path))
         raw = src_path.read_bytes()
         try:
             parsed_src = _parse_src(raw, fold_unquoted=spec.fold_unquoted)
         except RefmergeError as exc:
             # One model the source frontend refuses must not abort the rest of the run.
-            receipt = _unverifiable_receipt(ws, context, view, node, (exc.reason_code,))
-            return ModelResult(node.unique_id, src_path, receipt, ""), b""
+            return refuse((exc.reason_code,), src_path)
         from dbt_refmerge.source import has_unsupported_duplicate_candidates
 
         if has_unsupported_duplicate_candidates(parsed_src):
-            receipt = _unverifiable_receipt(ws, context, view, node, (ReasonCode.UNSUPPORTED_IMPORT_SHAPE,))
-            return ModelResult(node.unique_id, src_path, receipt, ""), b""
+            return refuse((ReasonCode.UNSUPPORTED_IMPORT_SHAPE,), src_path)
         try:
             matched = match_source_ctes(
                 tuple(c for c in parsed_src.ctes if c.ref_call is not None),
@@ -387,16 +418,13 @@ class RefmergeService:
                 node,
             )
         except (SemanticError, ArtifactError) as exc:
-            receipt = _unverifiable_receipt(ws, context, view, node, (exc.reason_code,))
-            return ModelResult(node.unique_id, src_path, receipt, ""), b""
+            return refuse((exc.reason_code,), src_path)
         groups = group_imports(list(matched), node.unique_id)
         if not groups:
-            receipt = _ok_noop_receipt(ws, context, view, node, raw)
-            return ModelResult(node.unique_id, src_path, receipt, ""), b""
+            return ModelResult(node.unique_id, src_path, _ok_noop_receipt(ws, context, view, node, raw), "")
         # volatility gate on whole model
         parsed_compiled = parse_model(node.compiled_code or "", spec.sqlglot_dialect)
-        vol = analyze_volatility(parsed_compiled)
-        whole_ok = vol.ok
+        whole_ok = analyze_volatility(parsed_compiled).ok
         qualified = tuple(
             qualify_group(
                 g,
@@ -408,20 +436,37 @@ class RefmergeService:
         )
         eligible = tuple(q for q in qualified if q.status == FindingStatus.MERGE_ELIGIBLE)
         if not eligible:
-            codes = qualified[0].reason_codes if qualified else (ReasonCode.NO_DUPLICATE_IMPORT,)
-            receipt = _unverifiable_receipt(ws, context, view, node, codes)
-            return ModelResult(node.unique_id, src_path, receipt, ""), b""
+            return refuse(qualified[0].reason_codes, src_path)
         try:
             plan = build_plan(raw, node.unique_id, src_path, eligible, parsed_src)
         except RefmergeError as exc:
-            receipt = _unverifiable_receipt(ws, context, view, node, (exc.reason_code,))
-            return ModelResult(node.unique_id, src_path, receipt, ""), b""
+            return refuse((exc.reason_code,), src_path)
         candidate_bytes = apply_edits(raw, plan.edits)
-        # write candidate + compile
         rel = Path(node.original_file_path)
         (ws.candidate_project / rel).parent.mkdir(parents=True, exist_ok=True)
         (ws.candidate_project / rel).write_bytes(candidate_bytes)
-        cand_inv = DbtInvocation(
+        return _PendingMerge(node, src_path, rel, raw, plan, candidate_bytes, eligible)
+
+    def _compile_candidates(
+        self,
+        config: AppConfig,
+        ws: RunWorkspace,
+        dbt: DbtCli,
+        context: CompilationContext,
+        view: ManifestView,
+        spec: AdapterSpec,
+        pending: list[_PendingMerge],
+        results: dict[str, ModelResult],
+    ) -> list[tuple[_PendingMerge, ManifestNodeModel]]:
+        """Compile every candidate in one dbt call and apply the compiled-delta gate.
+
+        Refusals go into ``results``. A failed batch compile is retried one candidate at a time so the
+        failure is attributed to the models that caused it (dbt stops at parse errors without per-node results).
+        """
+        if not pending:
+            return []
+        self._progress(f"compiling {len(pending)} candidate merge{'s' if len(pending) != 1 else ''}")
+        invocation = DbtInvocation(
             project_dir=ws.candidate_project,
             profiles_dir=config.profiles_dir,
             profile=config.profile,
@@ -430,40 +475,34 @@ class RefmergeService:
             threads=1,
             timeout_seconds=config.subprocess_timeout_seconds,
         )
-        cres = dbt.compile(cand_inv, f"fqn:{node.name}")
-        if cres.returncode != 0:
-            receipt = _unverifiable_receipt(ws, context, view, node, (ReasonCode.DBT_COMMAND_FAILED,))
-            return ModelResult(node.unique_id, src_path, receipt, ""), b""
-        try:
-            cand_view = load_manifest(ws.artifacts_root / "candidate-target" / "manifest.json")
-        except ArtifactError as exc:
-            receipt = _unverifiable_receipt(ws, context, view, node, (exc.reason_code,))
-            return ModelResult(node.unique_id, src_path, receipt, ""), b""
-        cand_node = cand_view.get(node.unique_id)
-        if cand_node is None or not cand_node.compiled_code:
-            receipt = _unverifiable_receipt(ws, context, view, node, (ReasonCode.COMPILE_DRIFT,))
-            return ModelResult(node.unique_id, src_path, receipt, ""), b""
-        # compiled-delta validation: build expected transform from semantic plan
-        try:
-            self._validate_delta(node, cand_node, eligible, spec)
-        except SemanticError as exc:
-            receipt = _unverifiable_receipt(ws, context, view, node, (exc.reason_code,))
-            return ModelResult(node.unique_id, src_path, receipt, ""), b""
-        receipt = self._verify_runner(
-            VerificationRequest(
-                config=config,
-                workspace=ws,
-                dbt=dbt,
-                context=context,
-                view=view,
-                baseline=node,
-                candidate=cand_node,
-                plan=plan,
-                spec=spec,
-            )
-        )
-        diff = _unified_diff(raw, candidate_bytes, rel.as_posix())  # a/ b/ headers use forward slashes everywhere
-        return ModelResult(node.unique_id, src_path, receipt, diff), candidate_bytes
+        compiled = _compiled_candidates(dbt, invocation, pending)
+        if compiled is None:
+            # dbt parses the whole project, so a broken candidate fails every compile it is present in: each retry
+            # compiles one candidate with the other models restored to their original source.
+            compiled = {}
+            for merge in pending:
+                (ws.candidate_project / merge.rel).write_bytes(merge.raw)
+            for index, merge in enumerate(pending):
+                (ws.candidate_project / merge.rel).write_bytes(merge.candidate_bytes)
+                single = dataclasses.replace(invocation, target_path=ws.artifacts_root / f"candidate-target-{index}")
+                compiled.update(_compiled_candidates(dbt, single, [merge]) or {})
+                (ws.candidate_project / merge.rel).write_bytes(merge.raw)
+        verifiable: list[tuple[_PendingMerge, ManifestNodeModel]] = []
+        for merge in pending:
+            candidate = compiled[merge.node.unique_id]
+            if isinstance(candidate, ReasonCode):
+                codes: tuple[ReasonCode, ...] = (candidate,)
+            else:
+                try:
+                    self._validate_delta(merge.node, candidate, merge.eligible, spec)
+                except SemanticError as exc:
+                    codes = (exc.reason_code,)
+                else:
+                    verifiable.append((merge, candidate))
+                    continue
+            receipt = _unverifiable_receipt(ws, context, view, merge.node, codes)
+            results[merge.node.unique_id] = ModelResult(merge.node.unique_id, merge.src_path, receipt, "")
+        return verifiable
 
     def _validate_delta(
         self,
@@ -511,6 +550,7 @@ class RefmergeService:
         if request.dry_run:
             return FixReport(applied=False, dry_run=True, result=target, reason="dry-run")
         live_path = request.config.project_dir / rel
+        self._progress(f"writing the verified merge to {rel.as_posix()}")
         apply_verified_source(
             live_path,
             expected_original_sha256=target.receipt.original_source_sha256,
@@ -539,6 +579,41 @@ def _require_manifest_adapter(view: ManifestView, spec: AdapterSpec) -> None:
             f"manifest adapter {adapter_type!r} does not match resolved adapter {spec.name!r}; "
             "recompile for the selected target",
         )
+
+
+@dataclass(frozen=True)
+class _PendingMerge:
+    """A model whose rewrite is written to the candidate project and awaits compilation and verification."""
+
+    node: ManifestNodeModel
+    src_path: Path
+    rel: Path
+    raw: bytes
+    plan: RewritePlan
+    candidate_bytes: bytes
+    eligible: tuple[QualifiedDuplicateGroup, ...]
+
+
+def _compiled_candidates(
+    dbt: DbtCli, invocation: DbtInvocation, pending: list[_PendingMerge]
+) -> dict[str, ManifestNodeModel | ReasonCode] | None:
+    """Each pending model's compiled candidate node or refusal code.
+
+    None when a compile of several candidates failed, since dbt does not say which one broke it.
+    """
+    selector = " ".join(f"path:{merge.rel.as_posix()}" for merge in pending)
+    result = dbt.compile(invocation, selector)
+    if result.returncode != 0:
+        return None if len(pending) > 1 else {pending[0].node.unique_id: ReasonCode.DBT_COMMAND_FAILED}
+    try:
+        view = load_manifest(Path(str(invocation.target_path)) / "manifest.json")
+    except ArtifactError as exc:
+        return {merge.node.unique_id: exc.reason_code for merge in pending}
+    outcome: dict[str, ManifestNodeModel | ReasonCode] = {}
+    for merge in pending:
+        node = view.get(merge.node.unique_id)
+        outcome[merge.node.unique_id] = node if node is not None and node.compiled_code else ReasonCode.COMPILE_DRIFT
+    return outcome
 
 
 def _project_models(view: ManifestView) -> list[ManifestNodeModel]:

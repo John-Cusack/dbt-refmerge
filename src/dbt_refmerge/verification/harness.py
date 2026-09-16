@@ -5,6 +5,8 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import shutil
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -13,7 +15,6 @@ from dbt_refmerge.domain import (
     IdentifierIdentity,
     ReasonCode,
     RelationIdentity,
-    ScratchBoundary,
 )
 from dbt_refmerge.errors import ScratchBoundaryError, VerificationError
 from dbt_refmerge.workspace import RunWorkspace
@@ -103,6 +104,14 @@ QUERY_MACRO = """{% macro dbt_refmerge_query(nonce, sql, statement_timeout_ms, l
 {% endmacro %}
 """
 
+# Runs several statements from one dbt invocation; each result is printed under ``<nonce>_<key>``.
+QUERIES_MACRO = """{% macro dbt_refmerge_queries(nonce, queries, statement_timeout_ms, label='') %}
+  {% for query in queries %}
+    {% do dbt_refmerge_query(nonce ~ '_' ~ query['key'], query['sql'], statement_timeout_ms) %}
+  {% endfor %}
+{% endmacro %}
+"""
+
 # Drops only views, only in the given schema, only with the given names; then reports, in the same dbt
 # invocation, which of those names still exist (``sql`` is the catalog query, printed like dbt_refmerge_query).
 DROP_VIEWS_MACRO = """{% macro dbt_refmerge_drop_views(nonce, schema, identifiers, sql, statement_timeout_ms) %}
@@ -123,7 +132,9 @@ def write_harness_macros(root: Path, profile: str) -> None:
     """dbt_project.yml plus the harness macros; shared by verification runs and cleanup."""
     if not _PROFILE_NAME.fullmatch(profile):
         raise VerificationError(ReasonCode.HARNESS_EMBEDDING_UNSAFE, f"unsupported dbt profile name: {profile!r}")
-    (root / "models").mkdir(parents=True, exist_ok=True)
+    # One verification batch owns the whole harness project: views from an earlier batch must not linger.
+    shutil.rmtree(root / "models", ignore_errors=True)
+    (root / "models").mkdir(parents=True)
     (root / "macros").mkdir(parents=True, exist_ok=True)
     (root / "dbt_project.yml").write_text(
         f'name: {HARNESS_PROJECT_NAME}\nversion: 1.0.0\nconfig-version: 2\nprofile: "{profile}"\n\n'
@@ -133,6 +144,7 @@ def write_harness_macros(root: Path, profile: str) -> None:
     )
     (root / "macros" / "generate_schema_name.sql").write_text(GENERATE_SCHEMA_NAME_MACRO, encoding="utf-8")
     (root / "macros" / "dbt_refmerge_query.sql").write_text(QUERY_MACRO, encoding="utf-8")
+    (root / "macros" / "dbt_refmerge_queries.sql").write_text(QUERIES_MACRO, encoding="utf-8")
     (root / "macros" / "dbt_refmerge_drop_views.sql").write_text(DROP_VIEWS_MACRO, encoding="utf-8")
 
 
@@ -158,73 +170,55 @@ def strip_single_terminal_semicolon(sql: str) -> str:
     return s
 
 
-def build_harness_project(
-    ws: RunWorkspace,
-    *,
-    profile: str,
-    baseline_sql: str,
-    candidate_sql: str,
-    token: str | None = None,
-) -> HarnessSpec:
-    token = token or _sanitize_run_token(ws.run_id)
-    baseline_alias = f"{BASELINE_ALIAS_PREFIX}{token}"
-    candidate_alias = f"{CANDIDATE_ALIAS_PREFIX}{token}"
+def harness_node_id(role: str, token: str) -> str:
+    """The manifest unique_id of a harness view: ``role`` is ``baseline`` or ``candidate``."""
+    return f"model.{HARNESS_PROJECT_NAME}.{role}_{token}"
+
+
+def write_harness_pair(root: Path, token: str, baseline_sql: str, candidate_sql: str) -> HarnessSpec:
+    """Add one model's baseline and candidate views to the harness project; refuses unsafe compiled SQL."""
     for sql in (baseline_sql, candidate_sql):
         # Any "{%" could close the raw block ({%endraw%}, {%- endraw %}, ...); compiled SQL never needs one.
         if "{%" in sql:
             raise VerificationError(ReasonCode.HARNESS_EMBEDDING_UNSAFE, "Jinja block delimiter in compiled SQL")
-    baseline_body = strip_single_terminal_semicolon(baseline_sql)
-    candidate_body = strip_single_terminal_semicolon(candidate_sql)
-    root = ws.harness_project
-    write_harness_macros(root, profile)
-    (root / "models" / "baseline.sql").write_text(
-        HARNESS_MODELS_BASELINE % (baseline_alias, baseline_body), encoding="utf-8"
+    spec = HarnessSpec(
+        baseline_alias=f"{BASELINE_ALIAS_PREFIX}{token}",
+        candidate_alias=f"{CANDIDATE_ALIAS_PREFIX}{token}",
+        baseline_sql=strip_single_terminal_semicolon(baseline_sql),
+        candidate_sql=strip_single_terminal_semicolon(candidate_sql),
     )
-    (root / "models" / "candidate.sql").write_text(
-        HARNESS_MODELS_BASELINE % (candidate_alias, candidate_body), encoding="utf-8"
-    )
-    return HarnessSpec(
-        baseline_alias=baseline_alias,
-        candidate_alias=candidate_alias,
-        baseline_sql=baseline_body,
-        candidate_sql=candidate_body,
-    )
+    for role, alias, body in (
+        ("baseline", spec.baseline_alias, spec.baseline_sql),
+        ("candidate", spec.candidate_alias, spec.candidate_sql),
+    ):
+        (root / "models" / f"{role}_{token}.sql").write_text(HARNESS_MODELS_BASELINE % (alias, body), encoding="utf-8")
+    return spec
 
 
-def preflight_harness_manifest(
-    manifest_path: Path,
-    boundary: ScratchBoundary,
-) -> tuple[RelationIdentity, RelationIdentity]:
+def preflight_harness_manifest(manifest_path: Path, *, database: str, schema: str, expected: Mapping[str, str]) -> None:
+    """Refuse to run the harness unless dbt will build exactly the expected views, and only in the scratch schema.
+
+    ``expected`` maps each harness unique_id to the alias its view must have.
+    """
     view = load_manifest(manifest_path)
-    wanted = {f"model.{HARNESS_PROJECT_NAME}.baseline", f"model.{HARNESS_PROJECT_NAME}.candidate"}
-    nodes = {uid: view.nodes[uid] for uid in wanted if uid in view.nodes}
-    if set(nodes) != wanted:
-        raise ScratchBoundaryError("harness manifest must contain exactly baseline/candidate nodes")
-    allowed = {r.identifier.value for r in boundary.allowed_relations}
-    out: list[RelationIdentity] = []
-    for uid in sorted(wanted):
-        node: ManifestNodeModel = nodes[uid]
+    if not expected or not set(expected) <= set(view.nodes):
+        raise ScratchBoundaryError("harness manifest is missing a harness view")
+    for uid, alias in sorted(expected.items()):
+        node: ManifestNodeModel = view.nodes[uid]
         if node.config.get("materialized", "view") != "view":
             raise ScratchBoundaryError(f"harness node not a view: {uid}")
         for hook in ("pre-hook", "post-hook", "pre_hook", "post_hook"):
             if node.config.get(hook):
                 raise ScratchBoundaryError(f"harness hooks forbidden: {uid}")
         # dbt-postgres quotes every part, so the manifest spelling is the relation that will be created.
-        db = IdentifierIdentity(node.database or "")
-        schema = IdentifierIdentity(node.schema_ or "")
-        alias_ident = IdentifierIdentity(node.alias or "")
-        if db != boundary.database or schema != boundary.schema:
+        if node.database != database or node.schema_ != schema:
             raise ScratchBoundaryError(f"harness node outside scratch boundary: {uid}")
-        if alias_ident.value not in allowed:
+        if node.alias != alias:
             raise ScratchBoundaryError(f"harness alias not allowlisted: {uid}")
-        out.append(RelationIdentity(database=db, schema=schema, identifier=alias_ident))
-    # reject extra enabled writable nodes
     for uid, node in view.nodes.items():
-        if uid not in wanted and node.resource_type in ("model", "seed", "snapshot"):
-            cfg = node.config if isinstance(node.config, dict) else {}
-            if cfg.get("enabled", True):
+        if uid not in expected and node.resource_type in ("model", "seed", "snapshot"):
+            if node.config.get("enabled", True):
                 raise ScratchBoundaryError(f"unexpected writable node: {uid}")
-    return (out[0], out[1])
 
 
 def build_verdict_sql(baseline_quoted: str, candidate_quoted: str, columns: list[str], strategy: str) -> str:
