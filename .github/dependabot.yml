@@ -1,0 +1,18 @@
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      github-actions:
+        patterns: ["*"]
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: weekly
+    # Runtime floors are deliberate and tested by the lowest-deps job; only raise one when required.
+    versioning-strategy: increase-if-necessary
+    groups:
+      python:
+        patterns: ["*"]

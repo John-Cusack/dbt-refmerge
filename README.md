@@ -4,6 +4,7 @@
 [![Coverage](https://codecov.io/gh/John-Cusack/dbt-refmerge/graph/badge.svg)](https://codecov.io/gh/John-Cusack/dbt-refmerge)
 [![PyPI](https://img.shields.io/pypi/v/dbt-refmerge)](https://pypi.org/project/dbt-refmerge/)
 [![Python](https://img.shields.io/pypi/pyversions/dbt-refmerge)](https://pypi.org/project/dbt-refmerge/)
+[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/John-Cusack/dbt-refmerge/badge)](https://scorecard.dev/viewer/?uri=github.com/John-Cusack/dbt-refmerge)
 
 Finds duplicated import CTEs in your dbt models — two CTEs reading different
 columns from the same `{{ ref(...) }}` — proves the merged version returns
@@ -76,7 +77,8 @@ python3 -m pytest -q -m warehouse     # needs Postgres and dbt-postgres
 python3 -m pytest -q -m "" --cov      # every lane; enforces the coverage floor
 ```
 
-`TEST_COVERAGE_PLAN.md` tracks the path to 100% coverage.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for conventions and the release process, and
+[SECURITY.md](SECURITY.md) to report a vulnerability. `IMPROVEMENT_PLAN.md` tracks what comes next.
 
 ## Support
 

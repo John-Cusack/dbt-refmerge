@@ -1,10 +1,11 @@
 # Publishes to TestPyPI, then (after manual approval on the `pypi`
-# environment) to PyPI, using Trusted Publishing -- no API tokens.
+# environment) to PyPI, using Trusted Publishing -- no API tokens -- and
+# finally creates the GitHub release with the dists and a CycloneDX SBOM.
 #
 # To release: bump __version__ in src/dbt_refmerge/__init__.py, add a
-# CHANGELOG.md entry, merge, then `git tag vX.Y.Z && git push origin vX.Y.Z`.
-# PyPI never accepts the same version twice, so check the TestPyPI upload
-# before approving the PyPI job.
+# "# X.Y.Z (YYYY-MM-DD)" section to CHANGELOG.md, merge, then
+# `git tag vX.Y.Z && git push origin vX.Y.Z`. PyPI never accepts the same
+# version twice, so check the TestPyPI upload before approving the PyPI job.
 name: release
 
 on:
@@ -18,23 +19,37 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
-      - name: Tag matches package version
-        run: test "${GITHUB_REF_NAME#v}" = "$(grep -Po '__version__ = "\K[^"]+' src/dbt_refmerge/__init__.py)"
+      - name: Tag matches package version and has release notes
+        run: |
+          test "${GITHUB_REF_NAME#v}" = "$(grep -Po '__version__ = "\K[^"]+' src/dbt_refmerge/__init__.py)"
+          python scripts/release_notes.py "$GITHUB_REF_NAME" > /dev/null
       - name: Build
         run: |
-          pip install build twine
+          pip install build==1.6.1 twine==7.0.0
           python -m build
           twine check --strict dist/*
-      - uses: actions/upload-artifact@v5
+      - name: SBOM of the package and its runtime dependencies
+        run: |
+          python -m venv sbom-env
+          sbom-env/bin/pip install dist/*.whl
+          pip install cyclonedx-bom==7.4.0
+          mkdir sbom
+          cyclonedx-py environment --of JSON -o "sbom/dbt-refmerge-${GITHUB_REF_NAME#v}.cdx.json" \
+            --pyproject pyproject.toml sbom-env/bin/python
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: dist
           path: dist/
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: sbom
+          path: sbom/
 
   publish-testpypi:
     needs: build
@@ -43,13 +58,13 @@ jobs:
       name: testpypi
       url: https://test.pypi.org/p/dbt-refmerge
     permissions:
-      id-token: write
+      id-token: write # Trusted Publishing to TestPyPI
     steps:
-      - uses: actions/download-artifact@v6
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: dist
           path: dist/
-      - uses: pypa/gh-action-pypi-publish@release/v1
+      - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
         with:
           repository-url: https://test.pypi.org/legacy/
 
@@ -60,10 +75,42 @@ jobs:
       name: pypi
       url: https://pypi.org/p/dbt-refmerge
     permissions:
-      id-token: write
+      id-token: write # Trusted Publishing to PyPI
     steps:
-      - uses: actions/download-artifact@v6
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: dist
           path: dist/
-      - uses: pypa/gh-action-pypi-publish@release/v1
+      - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
+
+  github-release:
+    needs: publish-pypi
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the release and upload its assets
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: dist
+          path: dist/
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: sbom
+          path: sbom/
+      - name: Create the release, or add assets if it already exists
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          python scripts/release_notes.py "$TAG" > notes.md
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            gh release upload "$TAG" dist/* sbom/* --clobber
+          else
+            gh release create "$TAG" dist/* sbom/* --verify-tag --title "dbt-refmerge ${TAG#v}" --notes-file notes.md
+          fi

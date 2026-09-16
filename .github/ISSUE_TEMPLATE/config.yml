@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/John-Cusack/dbt-refmerge/security/advisories/new
+    about: False "equivalent" verdicts, writes outside the model, scratch objects outside the boundary, leaked secrets.
