@@ -4,6 +4,9 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    # Let a new release age a week before proposing it: most compromised releases are caught within days.
+    cooldown:
+      default-days: 7
     groups:
       github-actions:
         patterns: ["*"]
@@ -11,6 +14,9 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    # Let a new release age a week before proposing it: most compromised releases are caught within days.
+    cooldown:
+      default-days: 7
     # Runtime floors are deliberate and tested by the lowest-deps job; only raise one when required.
     versioning-strategy: increase-if-necessary
     groups:

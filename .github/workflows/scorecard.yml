@@ -13,6 +13,8 @@ jobs:
   analysis:
     runs-on: ubuntu-latest
     permissions:
+      contents: read # check out and analyze the repository
+      actions: read # read workflow runs for the checks
       security-events: write # upload results to code scanning
       id-token: write # publish results and the badge
     steps:
