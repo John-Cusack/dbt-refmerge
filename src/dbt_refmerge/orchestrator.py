@@ -5,7 +5,6 @@ from __future__ import annotations
 import contextlib
 import difflib
 import hashlib
-import json
 import os
 import sys
 from collections.abc import Callable
@@ -33,7 +32,6 @@ from dbt_refmerge.domain import (
 )
 from dbt_refmerge.errors import (
     ArtifactError,
-    CleanupError,
     DbtError,
     RefmergeError,
     SemanticError,
@@ -48,6 +46,7 @@ from dbt_refmerge.semantics import (
     semantic_fingerprint,
 )
 from dbt_refmerge.source import parse_source_model, source_sha256
+from dbt_refmerge.verification.runner import VerificationRequest, VerifyRunner, cleanup_run, verify_postgres
 from dbt_refmerge.workspace import RunWorkspace
 
 
@@ -76,7 +75,6 @@ class FixRequest:
 class CleanupRequest:
     config: AppConfig
     run_id: str
-    workspace_root: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -190,10 +188,10 @@ class RefmergeService:
     def __init__(
         self,
         dbt_factory: Callable[[AppConfig], DbtCli] | None = None,
-        verify_runner: Callable[..., VerificationReceipt] | None = None,
+        verify_runner: VerifyRunner | None = None,
     ) -> None:
         self._dbt_factory = dbt_factory or (lambda cfg: DbtCli(tuple(cfg.dbt_command)))
-        self._verify_runner = verify_runner
+        self._verify_runner = verify_runner or verify_postgres
 
     # -- scan --
     def scan(self, request: ScanRequest) -> ScanReport:
@@ -406,13 +404,19 @@ class RefmergeService:
         except SemanticError as exc:
             receipt = _unverifiable_receipt(ws, context, view, node, (exc.reason_code,))
             return ModelResult(node.unique_id, src_path, receipt, ""), b""
-        # warehouse verification (injected runner in unit tests; real harness otherwise)
-        if self._verify_runner is not None:
-            receipt = self._verify_runner(ws, context, view, node, plan, candidate_bytes)
-            diff = _unified_diff(raw, candidate_bytes, str(rel))
-            return ModelResult(node.unique_id, src_path, receipt, diff), candidate_bytes
-        # without warehouse in this environment -> unverifiable (no fake success)
-        receipt = _unverifiable_receipt(ws, context, view, node, (ReasonCode.INPUT_ISOLATION_UNAVAILABLE,))
+        receipt = self._verify_runner(
+            VerificationRequest(
+                config=config,
+                workspace=ws,
+                dbt=dbt,
+                context=context,
+                view=view,
+                baseline=node,
+                candidate=cand_node,
+                plan=plan,
+                spec=spec,
+            )
+        )
         diff = _unified_diff(raw, candidate_bytes, str(rel))
         return ModelResult(node.unique_id, src_path, receipt, diff), candidate_bytes
 
@@ -476,14 +480,12 @@ class RefmergeService:
         return FixReport(applied=True, dry_run=False, result=target, reason="applied")
 
     def cleanup(self, request: CleanupRequest) -> dict[str, Any]:
-        # ledger-based exact cleanup; without warehouse connection, validate ledger and report
-        if request.workspace_root is None:
-            return {"run_id": request.run_id, "objects": [], "complete": True}
-        ledger = request.workspace_root / "run-ledger.json"
-        if not ledger.is_file():
-            raise CleanupError(f"no ledger for run {request.run_id}")
-        data = json.loads(ledger.read_text())
-        return {"run_id": request.run_id, "objects": data.get("objects", []), "complete": True}
+        """Drop the scratch views a check run left behind, found by run id in the scratch schema."""
+        ws = RunWorkspace.create(keep=False)
+        try:
+            return cleanup_run(request.config, self._dbt_factory(request.config), request.run_id, ws)
+        finally:
+            ws.cleanup_files()
 
 
 def _require_manifest_adapter(view: ManifestView, spec: AdapterSpec) -> None:

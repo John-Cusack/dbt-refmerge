@@ -54,7 +54,7 @@ class Comparator(Protocol):
 def normalize_schema(raw: RawSchemaPayload) -> RelationSchema:
     # baseline authoritative for column order; candidate compared separately
     cols: list[ColumnSchema] = []
-    for entry in raw.baseline:
+    for entry in sorted(raw.baseline, key=lambda e: int(e["ordinal"])):
         cols.append(
             ColumnSchema(
                 ordinal=int(entry["ordinal"]),
