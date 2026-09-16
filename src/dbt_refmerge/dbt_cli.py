@@ -241,6 +241,8 @@ class DbtCli:
             argv += ["--no-partial-parse"]
         if invocation.target_path is not None:
             argv += ["--target-path", str(invocation.target_path)]
+        if invocation.vars_json:
+            argv += ["--vars", invocation.vars_json]
         argv += list(invocation.extra_args)
         return self._run_argv(
             argv,
@@ -292,6 +294,8 @@ class DbtCli:
             argv += ["--target", invocation.target]
         if invocation.target_path is not None:
             argv += ["--target-path", str(invocation.target_path)]
+        if invocation.vars_json:
+            argv += ["--vars", invocation.vars_json]
         argv += ["--threads", str(invocation.threads or 1), "--select", selector]
         argv += list(invocation.extra_args)
         res = self._run_argv(
@@ -322,6 +326,8 @@ class DbtCli:
             argv += ["--target", invocation.target]
         if invocation.target_path is not None:
             argv += ["--target-path", str(invocation.target_path)]
+        if invocation.vars_json:
+            argv += ["--vars", invocation.vars_json]
         if args:
             argv += ["--args", _json.dumps(dict(args))]
         argv += list(invocation.extra_args)

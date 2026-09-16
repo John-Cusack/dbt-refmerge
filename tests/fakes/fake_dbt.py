@@ -1,9 +1,10 @@
 """Fake dbt executable for the fake_dbt test lane.
 
 Run as ``(sys.executable, <this file>, *argv)``. It understands just enough of
-the dbt CLI for dbt-refmerge: ``--version``, ``--help``, ``compile --help`` and
-``compile``. ``compile`` renders ``{{ ref('x') }}`` and ``{{ source('s', 't') }}``
-to quoted three-part names and writes a v12 ``manifest.json``.
+the dbt CLI for dbt-refmerge: ``--version``, ``--help``, ``compile --help``,
+``compile`` and ``parse`` (render ``{{ ref('x') }}`` / ``{{ source('s', 't') }}``
+to quoted three-part names and write a v12 ``manifest.json``), ``run``, and the
+verification harness's ``run-operation`` macros, whose query results are scripted.
 
 Behaviour switches (``FAKE_DBT_MODE``, comma separated, ``key`` or ``key=value``):
 
@@ -17,9 +18,21 @@ Behaviour switches (``FAKE_DBT_MODE``, comma separated, ``key`` or ``key=value``
 - ``big_logs=<chars>``: write that many characters to stdout and stderr
 - ``echo_env=<NAME>``: print ``NAME=<value>`` to stdout
 - ``exit=<code>``: exit with ``code`` after everything else
+- ``parse_fail`` / ``run_fail`` / ``drop_fail``: that harness step exits 1
+- ``query_fail=<label>``: the ``dbt_refmerge_query`` call with that label exits 1
+- ``harness_materialized=<m>``, ``harness_schema=<s>``, ``harness_extra_node``: preflight violations
 
 ``FAKE_DBT_VERSION_OUTPUT`` / ``FAKE_DBT_COMPILE_HELP`` replace those outputs, and
 ``FAKE_DBT_ARGV_LOG`` appends each argv as a JSON line.
+
+Harness query results (``run-operation dbt_refmerge_query``), keyed by the call's ``label``:
+
+- ``schema``: both harness views with the columns in ``FAKE_DBT_BASELINE_COLUMNS`` /
+  ``FAKE_DBT_CANDIDATE_COLUMNS`` (JSON ``[[name, type], ...]``, default ``[["id", "integer"]]``)
+- ``verdict``: ``FAKE_DBT_VERDICT`` = ``"baseline,candidate,baseline_only,candidate_only"`` (default ``1,1,0,0``)
+- ``remaining``: no rows, or every requested name when ``FAKE_DBT_REMAINING=all``
+- ``run-views``: the names in ``FAKE_DBT_RUN_VIEWS`` (comma separated)
+- ``FAKE_DBT_QUERY_OUTPUT`` replaces the marked output entirely (for malformed-result tests)
 """
 
 from __future__ import annotations
@@ -73,19 +86,28 @@ def _project_name(project: Path) -> str:
     return "project"
 
 
+ALIAS_RE = re.compile(r"""alias\s*=\s*['"]([A-Za-z0-9_]+)['"]""")
+HARNESS_NAME_RE = re.compile(r"'(dbt_refmerge_(?:baseline|candidate)_[a-z0-9_]+)'")
+
+
 def _selected(selector: str | None, name: str) -> bool:
     if selector in (None, "fqn:*", "*"):
         return True
     return selector in (name, f"fqn:{name}")
 
 
-def _compile(args: list[str], modes: dict[str, str]) -> int:
+def _compile(args: list[str], modes: dict[str, str], *, parse_only: bool = False) -> int:
     project = Path(_opt(args, "--project-dir") or ".")
     is_candidate = project.name == "candidate_project"
     if ("compile_fail" in modes and not is_candidate) or ("candidate_compile_fail" in modes and is_candidate):
         print("fake dbt: compilation error", file=sys.stderr)
         return 1
+    if parse_only and "parse_fail" in modes:
+        print("fake dbt: parse error", file=sys.stderr)
+        return 1
     package = _project_name(project)
+    dbt_vars = json.loads(_opt(args, "--vars") or "{}")
+    schema = modes.get("harness_schema") or dbt_vars.get("dbt_refmerge_scratch_schema", "sch")
     selector = _opt(args, "--select")
     target_path = _opt(args, "--target-path")
     target = project / "target" if target_path is None or "ignore_target_path" in modes else Path(target_path)
@@ -100,9 +122,14 @@ def _compile(args: list[str], modes: dict[str, str]) -> int:
         raw = path.read_text(encoding="utf-8")
         config_match = CONFIG_RE.search(raw)
         materialized = "view"
+        alias = name
         if config_match:
             mat = MATERIALIZED_RE.search(config_match.group(1))
             materialized = mat.group(1) if mat else "view"
+            alias_match = ALIAS_RE.search(config_match.group(1))
+            alias = alias_match.group(1) if alias_match else name
+        if parse_only and "harness_materialized" in modes:
+            materialized = modes["harness_materialized"]
         refs = REF_RE.findall(raw)
         missing = sorted(set(refs) - names)
         if missing:
@@ -133,11 +160,11 @@ def _compile(args: list[str], modes: dict[str, str]) -> int:
             "path": path.relative_to(project / "models").as_posix(),
             "original_file_path": path.relative_to(project).as_posix(),
             "database": "db",
-            "schema": "sch",
-            "alias": name,
-            "relation_name": f'"db"."sch"."{name}"',
+            "schema": schema,
+            "alias": alias,
+            "relation_name": f'"db"."{schema}"."{alias}"',
             "raw_code": raw,
-            "compiled_code": compiled if _selected(selector, name) else None,
+            "compiled_code": compiled if _selected(selector, name) and not parse_only else None,
             "depends_on": {
                 "macros": [],
                 "nodes": sorted(
@@ -147,6 +174,15 @@ def _compile(args: list[str], modes: dict[str, str]) -> int:
             "refs": [{"name": r, "package": None, "version": None} for r in refs],
             "sources": [[s, t] for s, t in source_pairs],
             "config": {"materialized": materialized, "enabled": True},
+        }
+    if parse_only and "harness_extra_node" in modes:
+        nodes[f"seed.{package}.extra"] = {
+            "unique_id": f"seed.{package}.extra",
+            "resource_type": "seed",
+            "package_name": package,
+            "name": "extra",
+            "original_file_path": "seeds/extra.csv",
+            "config": {"enabled": True},
         }
     target.mkdir(parents=True, exist_ok=True)
     manifest = {
@@ -160,6 +196,57 @@ def _compile(args: list[str], modes: dict[str, str]) -> int:
         "sources": sources,
     }
     (target / "manifest.json").write_text(json.dumps(manifest, indent=1), encoding="utf-8")
+    return 0
+
+
+def _columns(env_name: str) -> list[list[str]]:
+    columns: list[list[str]] = json.loads(os.environ.get(env_name, '[["id", "integer"]]'))
+    return columns
+
+
+def _query_rows(label: str, sql: str) -> tuple[list[str], list[list[str | None]]]:
+    names = HARNESS_NAME_RE.findall(sql)
+    if label == "schema":
+        rows: list[list[str | None]] = []
+        for relname in sorted(names):
+            role = "BASELINE" if "_baseline_" in relname else "CANDIDATE"
+            for ordinal, (column, data_type) in enumerate(_columns(f"FAKE_DBT_{role}_COLUMNS"), start=1):
+                rows.append([relname, "v", str(ordinal), column, data_type])
+        return ["relname", "relkind", "attnum", "attname", "format_type"], rows
+    if label == "verdict":
+        counts = os.environ.get("FAKE_DBT_VERDICT", "1,1,0,0").split(",")
+        return ["baseline_rows", "candidate_rows", "baseline_only_occurrences", "candidate_only_occurrences"], [counts]
+    if label == "remaining":
+        remaining = names if os.environ.get("FAKE_DBT_REMAINING") == "all" else []
+        return ["relname", "relkind", "attnum", "attname", "format_type"], [
+            [n, "v", None, None, None] for n in remaining
+        ]
+    if label == "run-views":
+        views = [v for v in os.environ.get("FAKE_DBT_RUN_VIEWS", "").split(",") if v]
+        return ["relname"], [[v] for v in views]
+    raise SystemExit(f"fake dbt: no scripted result for query label {label!r}")
+
+
+def _run_operation(args: list[str], modes: dict[str, str]) -> int:
+    macro = args[1]
+    macro_args = json.loads(_opt(args, "--args") or "{}")
+    if macro == "dbt_refmerge_drop_views":
+        return 1 if "drop_fail" in modes else 0
+    if macro != "dbt_refmerge_query":
+        print(f"fake dbt: unknown macro {macro}", file=sys.stderr)
+        return 1
+    label = macro_args["label"]
+    if modes.get("query_fail") == label:
+        print(f"fake dbt: database error in {label}", file=sys.stderr)
+        return 1
+    nonce = macro_args["nonce"]
+    if "FAKE_DBT_QUERY_OUTPUT" in os.environ:
+        sys.stdout.write(os.environ["FAKE_DBT_QUERY_OUTPUT"].replace("{nonce}", nonce))
+        return 0
+    columns, rows = _query_rows(label, macro_args["sql"])
+    print(f"DBT_REFMERGE_RESULT_{nonce}_BEGIN")
+    print(json.dumps({"columns": columns, "rows": rows}))
+    print(f"DBT_REFMERGE_RESULT_{nonce}_END")
     return 0
 
 
@@ -194,6 +281,12 @@ def main(args: list[str]) -> int:
         sys.stdout.write(os.environ.get("FAKE_DBT_COMPILE_HELP", COMPILE_HELP))
     elif args and args[0] == "compile":
         code = _compile(args, modes)
+    elif args and args[0] == "parse":
+        code = _compile(args, modes, parse_only=True)
+    elif args and args[0] == "run":
+        code = 1 if "run_fail" in modes else 0
+    elif args and args[0] == "run-operation":
+        code = _run_operation(args, modes)
     else:
         print(f"fake dbt: unsupported arguments {args!r}", file=sys.stderr)
         code = 2

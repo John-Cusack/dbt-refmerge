@@ -33,7 +33,7 @@ Measured 2026-09-16 on `acf0184` (the PR #4 branch; production code matches `mai
 | 2 | done: B2–B7, S1–S11 | #6 | 71.3% (`fail_under = 71`) |
 | 3 | done: unit lane for reporting, config, errors, domain, analyze, rewrite, semantics, source, artifacts, adapters, workspace, apply | #7 | 85% (`fail_under = 85`) |
 | 4 | not started | | |
-| 5 | not started | | |
+| 5 | verifier built (B1) and warehouse lane added; phase order swapped with 4 so CLI tests target final behavior | #8 | 90% (`fail_under = 90`) |
 
 Discrepancies found while implementing:
 
@@ -74,6 +74,15 @@ Discrepancies found while implementing:
   - Sentinel-looking names (`__r1__`) in user SQL can create false `scan` leads (S7 catches them in `check`).
   - `version=0` or `''` counts as versioned.
   - Local `dbt deps` packages installed as symlinks are refused by the snapshot.
+- **Phase 5, verifier as built** (validated against dbt-core 1.12.5 and dbt-postgres 1.11 on postgres:16). Differences from the §5.1 sketch:
+  - The harness `generate_schema_name` reads the scratch schema from `--vars`, so the name is never embedded in Jinja.
+  - Every query goes through one `dbt_refmerge_query` run-operation macro. The SQL is passed via `--args`, which dbt does not render, and values come back as strings between nonce markers.
+  - Views are aliased per run and per model. `cleanup --run-id` finds leftovers by that name pattern in the scratch schema, so no ledger file has to outlive the temp workspace.
+  - Column types come from `pg_catalog` (`format_type`), not `adapter.get_columns_in_relation`, which loses typmods.
+  - The cleanup macro drops only views, by exact name. A table carrying one of our names is left alone.
+- **Phase 5, known limits:**
+  - `ORDER BY` with ties passes the static volatility gate (see the Phase 2 S1 note). The single-statement comparison is the backstop.
+  - Verification runs sequentially: two compiles, then parse, run and three queries per model, a few seconds each against a local Postgres.
 
 ## 1. Where coverage stands
 

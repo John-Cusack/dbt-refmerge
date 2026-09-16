@@ -31,17 +31,24 @@ into one. Then, on a branch:
 
 ```sh
 git checkout -b refmerge-cleanup
-dbt-refmerge check --scratch-schema refmerge_scratch   # proves each merge on your warehouse
-dbt-refmerge fix models/marts/orders.sql --dry-run     # preview the rewrite
-dbt-refmerge fix models/marts/orders.sql               # apply it, one model at a time
+export DBT_REFMERGE_SCRATCH_SCHEMA=refmerge_scratch     # where verification views go
+dbt-refmerge check                                      # proves each merge on your warehouse
+dbt-refmerge fix models/marts/orders.sql --dry-run      # preview the rewrite
+dbt-refmerge fix models/marts/orders.sql                # re-proves, then applies it
 git diff                                                # review, test, open a PR
-dbt-refmerge cleanup --run-id <id>                      # drops scratch tables (id is in check --json)
 ```
 
 `scan` and `check` never touch your files. `fix` refuses to write unless the
 proof passes on current data (`applied=false` plus a reason means it's
-working, not broken). Verification supports PostgreSQL in v0.1; `scan` parses
-16 dialects (snowflake, bigquery, duckdb, databricks, redshift, trino, spark,
+working, not broken).
+
+To prove a merge, `check` builds the original and the merged model as two
+views in the scratch schema (dbt creates it if needed; it must not be a schema
+your models build into), compares their column types and their rows as
+multisets in a single query, then drops both views. If a run is interrupted,
+`dbt-refmerge cleanup --run-id <id>` drops whatever it left (the id is in
+`check --json`). Verification supports PostgreSQL in v0.1; `scan` parses 16
+dialects (snowflake, bigquery, duckdb, databricks, redshift, trino, spark,
 sqlite, tsql, oracle, exasol, clickhouse, and more).
 
 ## Develop it

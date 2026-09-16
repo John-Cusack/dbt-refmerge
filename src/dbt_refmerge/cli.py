@@ -251,17 +251,32 @@ def fix(
 def cleanup(
     run_id: str = typer.Option(..., "--run-id"),
     project_dir: Path = typer.Option(Path("."), "--project-dir"),
+    profiles_dir: Path | None = typer.Option(None, "--profiles-dir"),
+    profile: str | None = typer.Option(None, "--profile"),
+    target: str | None = typer.Option(None, "--target"),
+    dbt_command_part: list[str] | None = typer.Option(None, "--dbt-command-part"),
+    scratch_schema: str | None = typer.Option(None, "--scratch-schema"),
 ) -> None:
-    svc = RefmergeService()
+    """Drop the scratch views a check run left behind (found by run id in the scratch schema)."""
+    overrides: dict[str, object] = {
+        "profiles_dir": profiles_dir,
+        "profile": profile,
+        "target": target,
+        "dbt_command": tuple(dbt_command_part) if dbt_command_part else None,
+        "scratch_schema": scratch_schema,
+    }
     try:
-        config = load_config(project_dir)
-    except Exception:
-        from dbt_refmerge.config import AppConfig
-
-        config = AppConfig(project_dir=project_dir.resolve())
-    result = svc.cleanup(CleanupRequest(config=config, run_id=run_id))
-    console.print(json.dumps(result, indent=2))
-    raise typer.Exit(code=0)
+        config = load_config(project_dir, cli_overrides=overrides)
+    except Exception as exc:
+        err_console.print(f"configuration error: {exc}")
+        raise typer.Exit(code=int(ExitCode.OPERATIONAL_ERROR)) from None
+    try:
+        result = RefmergeService().cleanup(CleanupRequest(config=config, run_id=run_id))
+    except Exception as exc:
+        err_console.print(f"cleanup failed: {exc}")
+        raise typer.Exit(code=int(ExitCode.OPERATIONAL_ERROR)) from None
+    sys.stdout.write(json.dumps(result, indent=2, sort_keys=True) + "\n")
+    raise typer.Exit(code=0 if result["complete"] else int(ExitCode.OPERATIONAL_ERROR))
 
 
 if __name__ == "__main__":

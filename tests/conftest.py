@@ -166,6 +166,64 @@ def pg_dsn() -> str:
 
 
 @pytest.fixture
+def pg_schemas(pg_dsn: str) -> Iterator[Callable[[str], str]]:
+    """Unique schema names (``pg_schemas("model")``); all dropped with cascade after the test."""
+    import psycopg2
+
+    names: list[str] = []
+
+    def make(purpose: str) -> str:
+        name = f"refmerge_it_{purpose}_{uuid.uuid4().hex[:8]}"
+        names.append(name)
+        return name
+
+    yield make
+    conn = psycopg2.connect(pg_dsn)
+    conn.autocommit = True
+    try:
+        with conn.cursor() as cur:
+            for name in names:
+                cur.execute(f'drop schema if exists "{name}" cascade')
+    finally:
+        conn.close()
+
+
+@pytest.fixture
+def dbt_executable() -> str:
+    """The dbt installed next to the running interpreter (the `integration` extra)."""
+    import shutil
+
+    found = shutil.which("dbt", path=str(Path(sys.executable).parent))
+    if found is None:
+        pytest.fail("dbt is not installed next to this interpreter; install the `integration` extra")
+    return found
+
+
+def write_pg_profiles(directory: Path, dsn: str, *, profile: str, schema: str) -> Path:
+    """profiles.yml for ``profile`` pointing at ``dsn`` with ``schema`` as the target schema."""
+    from urllib.parse import urlparse
+
+    url = urlparse(dsn)
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "profiles.yml").write_text(
+        f"{profile}:\n"
+        "  target: it\n"
+        "  outputs:\n"
+        "    it:\n"
+        "      type: postgres\n"
+        f"      host: {url.hostname}\n"
+        f"      port: {url.port or 5432}\n"
+        f"      user: {url.username}\n"
+        f"      password: {url.password or ''}\n"
+        f"      dbname: {url.path.lstrip('/')}\n"
+        f"      schema: {schema}\n"
+        "      threads: 1\n",
+        encoding="utf-8",
+    )
+    return directory
+
+
+@pytest.fixture
 def scratch_schema(pg_dsn: str) -> Iterator[str]:
     """A unique, empty schema dropped (cascade) after the test, independent of the tool's cleanup."""
     import psycopg2
