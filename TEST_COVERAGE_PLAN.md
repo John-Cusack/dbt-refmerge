@@ -33,6 +33,7 @@ Measured 2026-09-16 on `acf0184` (the PR #4 branch; production code matches `mai
 | 2 | done: B2–B7, S1–S11 | #6 | 71.3% (`fail_under = 71`) |
 | 3 | done: unit lane for reporting, config, errors, domain, analyze, rewrite, semantics, source, artifacts, adapters, workspace, apply | #7 | 85% (`fail_under = 85`) |
 | 4 | done: dbt_cli, CLI and orchestrator in the fake_dbt lane; remaining verifier helpers; CLI/orchestrator bugs from §2.3 | #9 | **100%** (`fail_under = 100`) |
+| known limits | done: Jinja string tokens, raw whitespace control, sentinel names, dbt version semantics, ORDER BY coverage, linked local packages, faster cleanup and warehouse tests | Known-limits PR | 100% |
 | 5 | verifier built (B1) and warehouse lane added; phase order swapped with 4 so CLI tests target final behavior | #8 | 90% (`fail_under = 90`) |
 
 Discrepancies found while implementing:
@@ -68,12 +69,12 @@ Discrepancies found while implementing:
   - `orchestrator.py` now has four win32 pragmas (S9 added one).
   - `semantics.py` 192 is tested instead of excluded.
   - Two rewrite separator guards stay typed refusals with `# pragma: no cover` rather than asserts, because asserts vanish under `-O` and abort the run.
-- **Phase 3, known gaps left for later:**
-  - Jinja strings containing `}}` or `%}` end a tag early (the delta gate catches the result).
-  - `{%- raw %}` is not recognized.
-  - Sentinel-looking names (`__r1__`) in user SQL can create false `scan` leads (S7 catches them in `check`).
-  - `version=0` or `''` counts as versioned.
-  - Local `dbt deps` packages installed as symlinks are refused by the snapshot.
+- **Phase 3, known gaps (all resolved in the known-limits PR):**
+  - Jinja strings containing `}}` or `%}` ended a tag early. Tag ends now follow Jinja's string tokens.
+  - `{%- raw %}` was not recognized. Whitespace control is accepted on both raw tags.
+  - Sentinel-looking names (`__r1__`) in user SQL could create false leads. Such SQL is refused.
+  - `version=0` or `''` counted as versioned. They now follow dbt's `version or v`, and a boolean version is dynamic.
+  - Local `dbt deps` packages installed as symlinks were refused. Links directly in `dbt_packages` are copied, with the same refusals inside the package.
 - **Phase 5, verifier as built** (validated against dbt-core 1.12.5 and dbt-postgres 1.11 on postgres:16). Differences from the §5.1 sketch:
   - The harness `generate_schema_name` reads the scratch schema from `--vars`, so the name is never embedded in Jinja.
   - Every query goes through one `dbt_refmerge_query` run-operation macro. The SQL is passed via `--args`, which dbt does not render, and values come back as strings between nonce markers.
@@ -81,8 +82,8 @@ Discrepancies found while implementing:
   - Column types come from `pg_catalog` (`format_type`), not `adapter.get_columns_in_relation`, which loses typmods.
   - The cleanup macro drops only views, by exact name. A table carrying one of our names is left alone.
 - **Phase 5, known limits:**
-  - `ORDER BY` with ties passes the static volatility gate (see the Phase 2 S1 note). The single-statement comparison is the backstop.
-  - Verification runs sequentially: two compiles, then parse, run and three queries per model, a few seconds each against a local Postgres.
+  - ~~`ORDER BY` with ties passes the static volatility gate.~~ Resolved: `LIMIT`/`OFFSET`/`FETCH`/`DISTINCT ON` need an `ORDER BY` covering every output column.
+  - Verification runs sequentially, one model at a time. Each model costs a candidate compile, then parse, run, two queries, and one drop-and-confirm call, at about 2–3 s of dbt startup each. Batching every model into one harness project would make the cost roughly constant; that is possible future work, not a correctness gap.
 - **Phase 4 (after the verifier), CLI behaviour changes:**
   - Unset flags no longer override config.
   - Output is plain text: no Rich markup, no wrapping.
