@@ -58,6 +58,29 @@ class DbtCliCapabilities:
     supports_target_path: bool = True
 
 
+def parse_dbt_version_output(text: str) -> str:
+    """dbt-core version from ``dbt --version``; falls back to the first non-empty line.
+
+    dbt >= 1.5 prints ``Core:`` on its own line followed by ``- installed: X``; older
+    releases print ``Core: X``.
+    """
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    for index, line in enumerate(lines):
+        if not line.lower().startswith("core:"):
+            continue
+        inline = line.split(":", 1)[1].split()
+        if inline:
+            return inline[0]
+        for following in lines[index + 1 :]:
+            if not following.startswith("-"):
+                break
+            key, _, value = following.lstrip("- ").partition(":")
+            if key.strip().lower() == "installed" and value.split():
+                return value.split()[0]
+        break
+    return lines[0] if lines else ""
+
+
 def _redact_argv(argv: list[str]) -> tuple[str, ...]:
     out: list[str] = []
     skip_next = False
@@ -176,13 +199,7 @@ class DbtCli:
         if res.timed_out or res.returncode != 0:
             raise DbtError("dbt --version failed", argv=res.argv_redacted)
         text = res.stdout.strip()
-        ver = ""
-        for line in text.splitlines():
-            line = line.strip()
-            if line.lower().startswith("core:"):
-                ver = line.split(":", 1)[1].strip().split()[0]
-                break
-        return DbtVersion(raw=text, version=ver or text.splitlines()[0] if text else "")
+        return DbtVersion(raw=text, version=parse_dbt_version_output(text))
 
     def discover_capabilities(self, cwd: Path | None = None) -> DbtCliCapabilities:
         res = self._run_argv([*self._command, "--help"], cwd=cwd or Path.cwd(), env=None, timeout_seconds=120)

@@ -21,7 +21,7 @@ from dbt_refmerge.domain import (
 from dbt_refmerge.errors import SemanticError
 
 COMPARATOR_VERSION = "1"
-SEMANTIC_FINGERPRINT_VERSION = "1"
+SEMANTIC_FINGERPRINT_VERSION = "2"
 
 VOLATILE_FUNCTIONS = frozenset(
     {
@@ -371,7 +371,9 @@ def _canonical(node: Any, fold: str = "lower") -> Any:
         name = type(node).__name__
         args: dict[str, Any] = {}
         for k, v in node.args.items():
-            if k in ("comments", "meta"):
+            # An unset arg and an explicit None/[] generate identical SQL; the parser fills some
+            # (e.g. TableAlias.columns) that synthesized nodes omit, so neither may affect the hash.
+            if k in ("comments", "meta") or v is None or v == []:
                 continue
             args[k] = _canonical(v, fold)
         if isinstance(node, exp.Identifier):
@@ -651,7 +653,9 @@ def build_expected_transform(
     canon_alias_expr = canonical.args.get("alias")
     canon_name, canon_quoted = _alias_name_and_quoted(canon_alias_expr)
     for scope_table in tree.find_all(exp.Table):
-        # determine name
+        # CTE references are unqualified; "db"."sch"."stg" is a physical relation even if a donor is named stg.
+        if scope_table.args.get("db") is not None or scope_table.args.get("catalog") is not None:
+            continue
         tname = scope_table.name
         table_identifier = scope_table.args.get("this")
         table_quoted = (

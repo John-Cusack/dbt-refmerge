@@ -326,7 +326,12 @@ class RefmergeService:
             # try resolved under snapshot root
             src_path = ws.source_snapshot / Path(node.original_file_path).name
         raw = src_path.read_bytes() if src_path.is_file() else node.raw_code.encode("utf-8")
-        parsed_src = _parse_src(raw, fold_unquoted=spec.fold_unquoted)
+        try:
+            parsed_src = _parse_src(raw, fold_unquoted=spec.fold_unquoted)
+        except RefmergeError as exc:
+            # One model the source frontend refuses must not abort the rest of the run.
+            receipt = _unverifiable_receipt(ws, context, view, node, (exc.reason_code,))
+            return ModelResult(node.unique_id, src_path, receipt, ""), b""
         from dbt_refmerge.source import has_unsupported_duplicate_candidates
 
         if has_unsupported_duplicate_candidates(parsed_src):
@@ -415,28 +420,29 @@ class RefmergeService:
         eligible: tuple[QualifiedDuplicateGroup, ...],
         spec: AdapterSpec,
     ) -> None:
+        from dbt_refmerge.semantics import ParsedModel, validate_compiled_delta
+
         bparsed = parse_model(baseline.compiled_code or "", spec.sqlglot_dialect)
         cparsed = parse_model(candidate.compiled_code or "", spec.sqlglot_dialect)
+        # The candidate merges every eligible group at once, so apply all of them before comparing.
+        expected = bparsed
         for qg in eligible:
             members = sorted(qg.group.imports, key=lambda m: m.source_cte.ordinal)
             canon_ident = members[0].semantic.cte_identity.value
             donor_idents = tuple(m.semantic.cte_identity.value for m in members[1:])
-            # added projections: output spellings missing from canonical
+            # Added projections, in the rewrite's order, rebuilt from the donor's own compiled SQL so
+            # aliases and quoting survive (the folded output identity is not SQL).
             have = {p.output_identity.value for p in members[0].semantic.projections}
             additions: list[str] = []
             for m in members[1:]:
-                for p in m.semantic.projections:
-                    if p.output_identity.value not in have:
-                        have.add(p.output_identity.value)
-                        additions.append(p.output_identity.value)
-            expected_tree = build_expected_transform(bparsed, canon_ident, donor_idents, {canon_ident: additions})
-            from dbt_refmerge.semantics import validate_compiled_delta
-
-            validate_compiled_delta(
-                bparsed,
-                cparsed,
-                semantic_fingerprint(expected_tree, fold=spec.fold_unquoted),
-            )
+                donor_select = bparsed.ctes[m.semantic.cte_identity.value].args["this"]
+                for projection, node in zip(m.semantic.projections, donor_select.expressions, strict=True):
+                    if projection.output_identity.value not in have:
+                        have.add(projection.output_identity.value)
+                        additions.append(node.sql(dialect=spec.sqlglot_dialect))
+            expected_tree = build_expected_transform(expected, canon_ident, donor_idents, {canon_ident: additions})
+            expected = ParsedModel(sql=bparsed.sql, dialect=bparsed.dialect, tree=expected_tree, ctes={})
+        validate_compiled_delta(bparsed, cparsed, semantic_fingerprint(expected.tree, fold=spec.fold_unquoted))
 
     # -- fix --
     def fix(self, request: FixRequest) -> FixReport:
