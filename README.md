@@ -56,7 +56,7 @@ python3 -m ruff check .
 python3 -m mypy --strict src
 ```
 
-The default run is the in-memory unit lane and should stay sub-second on a
+The default run is the in-memory unit lane and takes a few seconds on a
 typical development machine. Two slower lanes are opt-in:
 
 ```sh
