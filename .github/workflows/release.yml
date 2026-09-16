@@ -1,0 +1,66 @@
+# Publishes to TestPyPI, then (after manual approval on the `pypi`
+# environment) to PyPI, using Trusted Publishing -- no API tokens.
+#
+# To release: bump __version__ in src/dbt_refmerge/__init__.py, add a
+# CHANGELOG.md entry, merge, then `git tag vX.Y.Z && git push origin vX.Y.Z`.
+# PyPI never accepts the same version twice, so check the TestPyPI upload
+# before approving the PyPI job.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Tag matches package version
+        run: test "${GITHUB_REF_NAME#v}" = "$(grep -Po '__version__ = "\K[^"]+' src/dbt_refmerge/__init__.py)"
+      - name: Build
+        run: |
+          pip install build twine
+          python -m build
+          twine check --strict dist/*
+      - uses: actions/upload-artifact@v5
+        with:
+          name: dist
+          path: dist/
+
+  publish-testpypi:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: testpypi
+      url: https://test.pypi.org/p/dbt-refmerge
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v6
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+
+  publish-pypi:
+    needs: publish-testpypi
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/dbt-refmerge
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v6
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1

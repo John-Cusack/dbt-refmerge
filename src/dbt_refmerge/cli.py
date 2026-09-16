@@ -9,6 +9,7 @@ from pathlib import Path
 import typer
 from rich.console import Console
 
+from dbt_refmerge import __version__
 from dbt_refmerge.config import AppConfig, FailOn, load_config
 from dbt_refmerge.orchestrator import (
     CheckRequest,
@@ -28,6 +29,21 @@ from dbt_refmerge.reporting import (
 app = typer.Typer(add_completion=False, help="Safe merge of duplicate direct-import CTEs.")
 console = Console()
 err_console = Console(stderr=True)
+
+
+def _version_callback(value: bool) -> None:
+    if value:
+        sys.stdout.write(f"dbt-refmerge {__version__}\n")
+        raise typer.Exit(code=0)
+
+
+@app.callback()
+def main(
+    version: bool = typer.Option(
+        False, "--version", callback=_version_callback, is_eager=True, help="Show the version and exit."
+    ),
+) -> None:
+    pass
 
 
 def _common_config(

@@ -1,24 +1,47 @@
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling>=1.27"]
 build-backend = "hatchling.build"
 
 [project]
 name = "dbt-refmerge"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Safe merge of duplicate direct-import CTEs in dbt SQL models"
 readme = "README.md"
-license = { text = "MIT" }
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.11"
+authors = [{ name = "John Cusack" }]
+keywords = ["dbt", "sql", "cte", "refactoring", "sqlglot"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Topic :: Database",
+  "Topic :: Software Development :: Quality Assurance",
+]
+# Floors are exercised by the lowest-deps CI job: sqlglot<26.33 lacks the
+# exasol/materialize dialects; typer<0.26 fails (or warns) against current click.
 dependencies = [
-  "sqlglot>=25.0",
+  "sqlglot>=26.33",
   "jinja2>=3.1",
-  "typer>=0.9",
+  "typer>=0.26",
   "rich>=13.0",
   "pydantic>=2.0",
   "pyyaml>=6.0",
-  "platformdirs>=4.0",
 ]
-authors = [{ name = "dbt-refmerge maintainers" }]
+
+[project.urls]
+Homepage = "https://github.com/John-Cusack/dbt-refmerge"
+Issues = "https://github.com/John-Cusack/dbt-refmerge/issues"
+Changelog = "https://github.com/John-Cusack/dbt-refmerge/blob/main/CHANGELOG.md"
+Funding = "https://buymeacoffee.com/johncusack"
 
 [project.scripts]
 dbt-refmerge = "dbt_refmerge.cli:app"
@@ -36,8 +59,14 @@ integration = [
   "dbt-postgres>=1.7",
 ]
 
+[tool.hatch.version]
+path = "src/dbt_refmerge/__init__.py"
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/dbt_refmerge"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src", "tests", "CHANGELOG.md"]
 
 [tool.ruff]
 target-version = "py311"

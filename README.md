@@ -1,5 +1,10 @@
 # dbt-refmerge
 
+[![CI](https://github.com/John-Cusack/dbt-refmerge/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/John-Cusack/dbt-refmerge/actions/workflows/ci.yml)
+[![Coverage](https://codecov.io/gh/John-Cusack/dbt-refmerge/graph/badge.svg)](https://codecov.io/gh/John-Cusack/dbt-refmerge)
+[![PyPI](https://img.shields.io/pypi/v/dbt-refmerge)](https://pypi.org/project/dbt-refmerge/)
+[![Python](https://img.shields.io/pypi/pyversions/dbt-refmerge)](https://pypi.org/project/dbt-refmerge/)
+
 Finds duplicated import CTEs in your dbt models — two CTEs reading different
 columns from the same `{{ ref(...) }}` — proves the merged version returns
 identical rows on your warehouse, and rewrites the file. Anything it can't

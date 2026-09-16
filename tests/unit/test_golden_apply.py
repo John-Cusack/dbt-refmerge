@@ -116,3 +116,14 @@ def test_cli_help_runs():
     result = runner.invoke(app, ["--help"])
     assert result.exit_code == 0
     assert "scan" in result.output and "check" in result.output
+
+
+def test_cli_version_matches_package():
+    from typer.testing import CliRunner
+
+    from dbt_refmerge import __version__
+    from dbt_refmerge.cli import app
+
+    result = CliRunner().invoke(app, ["--version"])
+    assert result.exit_code == 0
+    assert result.output == f"dbt-refmerge {__version__}\n"
