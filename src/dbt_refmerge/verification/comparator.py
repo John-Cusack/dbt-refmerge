@@ -94,47 +94,76 @@ def quote_ident(name: str) -> str:
     return '"' + name.replace('"', '""') + '"'
 
 
+_QUOTED_PART = r'"(?:[^"]|"")+"'
+_QUOTED_RELATION = re.compile(rf"{_QUOTED_PART}\.{_QUOTED_PART}\.{_QUOTED_PART}")
+
+
+def _require_quoted_relation(ref: str) -> str:
+    """Verdict SQL only reads fully quoted database.schema.identifier relations.
+
+    An unqualified name could bind to one of the verdict's own CTEs instead of the relation.
+    """
+    if not _QUOTED_RELATION.fullmatch(ref):
+        raise VerificationError(
+            ReasonCode.HARNESS_EMBEDDING_UNSAFE, f"relation must be quoted database.schema.name: {ref!r}"
+        )
+    return ref
+
+
+def _unused_name(base: str, taken: set[str]) -> str:
+    name = base
+    while name in taken:
+        name += "_"
+    taken.add(name)
+    return name
+
+
 def generate_except_all_sql(baseline_ref: str, candidate_ref: str, columns: list[str]) -> str:
+    baseline_rel = _require_quoted_relation(baseline_ref)
+    candidate_rel = _require_quoted_relation(candidate_ref)
     cols = ", ".join(quote_ident(c) for c in columns)
     return (
         "with\n"
-        f"a as (\n    select {cols} from {baseline_ref}\n),\n"
-        f"b as (\n    select {cols} from {candidate_ref}\n),\n"
-        "a_minus_b as (\n    select * from a\n    except all\n    select * from b\n),\n"
-        "b_minus_a as (\n    select * from b\n    except all\n    select * from a\n)\n"
+        f"__dbt_refmerge_baseline as (\n    select {cols} from {baseline_rel}\n),\n"
+        f"__dbt_refmerge_candidate as (\n    select {cols} from {candidate_rel}\n),\n"
+        "__dbt_refmerge_baseline_only as (\n    select * from __dbt_refmerge_baseline\n    except all\n"
+        "    select * from __dbt_refmerge_candidate\n),\n"
+        "__dbt_refmerge_candidate_only as (\n    select * from __dbt_refmerge_candidate\n    except all\n"
+        "    select * from __dbt_refmerge_baseline\n)\n"
         "select\n"
-        "    (select count(*) from a) as baseline_rows,\n"
-        "    (select count(*) from b) as candidate_rows,\n"
-        "    (select count(*) from a_minus_b) as baseline_only_occurrences,\n"
-        "    (select count(*) from b_minus_a) as candidate_only_occurrences"
+        "    (select count(*) from __dbt_refmerge_baseline) as baseline_rows,\n"
+        "    (select count(*) from __dbt_refmerge_candidate) as candidate_rows,\n"
+        "    (select count(*) from __dbt_refmerge_baseline_only) as baseline_only_occurrences,\n"
+        "    (select count(*) from __dbt_refmerge_candidate_only) as candidate_only_occurrences"
     )
 
 
 def generate_grouped_counts_sql(baseline_ref: str, candidate_ref: str, columns: list[str]) -> str:
+    baseline_rel = _require_quoted_relation(baseline_ref)
+    candidate_rel = _require_quoted_relation(candidate_ref)
     cols = ", ".join(quote_ident(c) for c in columns)
-    marker = "__dbt_refmerge_side"
-    # ensure collision-free
-    suffix = ""
-    while marker + suffix in columns:
-        suffix += "_"
-    side = marker + suffix
-    group_cols = cols
+    taken = set(columns)
+    side = quote_ident(_unused_name("__dbt_refmerge_side", taken))
+    delta = quote_ident(_unused_name("__dbt_refmerge_delta", taken))
+    in_baseline = quote_ident(_unused_name("__dbt_refmerge_in_baseline", taken))
+    in_candidate = quote_ident(_unused_name("__dbt_refmerge_in_candidate", taken))
     return (
         "with\n"
-        f"a as (\n    select {cols}, 1 as {quote_ident(side)} from {baseline_ref}\n),\n"
-        f"b as (\n    select {cols}, -1 as {quote_ident(side)} from {candidate_ref}\n),\n"
-        f"u as (\n    select * from a\n    union all\n    select * from b\n),\n"
-        f"g as (\n    select {group_cols}, sum({quote_ident(side)}) as _delta,\n"
-        f"           sum(case when {quote_ident(side)} = 1 then 1 else 0 end) as _a,\n"
-        f"           sum(case when {quote_ident(side)} = -1 then 1 else 0 end) as _b\n"
-        f"    from u group by {group_cols}\n)\n"
+        f"__dbt_refmerge_baseline as (\n    select {cols}, 1 as {side} from {baseline_rel}\n),\n"
+        f"__dbt_refmerge_candidate as (\n    select {cols}, -1 as {side} from {candidate_rel}\n),\n"
+        "__dbt_refmerge_both as (\n    select * from __dbt_refmerge_baseline\n    union all\n"
+        "    select * from __dbt_refmerge_candidate\n),\n"
+        f"__dbt_refmerge_grouped as (\n    select {cols}, sum({side}) as {delta},\n"
+        f"           sum(case when {side} = 1 then 1 else 0 end) as {in_baseline},\n"
+        f"           sum(case when {side} = -1 then 1 else 0 end) as {in_candidate}\n"
+        f"    from __dbt_refmerge_both group by {cols}\n)\n"
         "select\n"
-        "    (select coalesce(sum(_a),0) from g) as baseline_rows,\n"
-        "    (select coalesce(sum(_b),0) from g) as candidate_rows,\n"
-        "    (select coalesce(sum(case when _delta > 0 then _delta else 0 end),0)\n"
-        "    from g) as baseline_only_occurrences,\n"
-        "    (select coalesce(sum(case when _delta < 0 then -_delta else 0 end),0)\n"
-        "    from g) as candidate_only_occurrences"
+        f"    (select coalesce(sum({in_baseline}),0) from __dbt_refmerge_grouped) as baseline_rows,\n"
+        f"    (select coalesce(sum({in_candidate}),0) from __dbt_refmerge_grouped) as candidate_rows,\n"
+        f"    (select coalesce(sum(case when {delta} > 0 then {delta} else 0 end),0)\n"
+        "    from __dbt_refmerge_grouped) as baseline_only_occurrences,\n"
+        f"    (select coalesce(sum(case when {delta} < 0 then -{delta} else 0 end),0)\n"
+        "    from __dbt_refmerge_grouped) as candidate_only_occurrences"
     )
 
 
@@ -158,13 +187,15 @@ def parse_marked_json(output: str, result_nonce: str) -> dict[str, Any]:
 
 def parse_equality_result(payload: dict[str, Any]) -> EqualityResult:
     try:
-        schema_equal = bool(payload["schema_equal"])
+        schema_equal = payload["schema_equal"]
         b = payload["baseline_rows"]
         c = payload["candidate_rows"]
         bo = payload["baseline_only_occurrences"]
         co = payload["candidate_only_occurrences"]
     except KeyError as exc:
         raise VerificationError(ReasonCode.DBT_COMMAND_FAILED, f"missing result field: {exc}") from exc
+    if not isinstance(schema_equal, bool):
+        raise VerificationError(ReasonCode.DBT_COMMAND_FAILED, f"invalid schema_equal field: {schema_equal!r}")
     for name, val in (
         ("baseline_rows", b),
         ("candidate_rows", c),

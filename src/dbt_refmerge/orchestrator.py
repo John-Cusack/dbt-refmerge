@@ -326,7 +326,12 @@ class RefmergeService:
             # try resolved under snapshot root
             src_path = ws.source_snapshot / Path(node.original_file_path).name
         raw = src_path.read_bytes() if src_path.is_file() else node.raw_code.encode("utf-8")
-        parsed_src = _parse_src(raw, fold_unquoted=spec.fold_unquoted)
+        try:
+            parsed_src = _parse_src(raw, fold_unquoted=spec.fold_unquoted)
+        except RefmergeError as exc:
+            # One model the source frontend refuses must not abort the rest of the run.
+            receipt = _unverifiable_receipt(ws, context, view, node, (exc.reason_code,))
+            return ModelResult(node.unique_id, src_path, receipt, ""), b""
         from dbt_refmerge.source import has_unsupported_duplicate_candidates
 
         if has_unsupported_duplicate_candidates(parsed_src):
@@ -415,28 +420,29 @@ class RefmergeService:
         eligible: tuple[QualifiedDuplicateGroup, ...],
         spec: AdapterSpec,
     ) -> None:
+        from dbt_refmerge.semantics import ParsedModel, validate_compiled_delta
+
         bparsed = parse_model(baseline.compiled_code or "", spec.sqlglot_dialect)
         cparsed = parse_model(candidate.compiled_code or "", spec.sqlglot_dialect)
+        # The candidate merges every eligible group at once, so apply all of them before comparing.
+        expected = bparsed
         for qg in eligible:
             members = sorted(qg.group.imports, key=lambda m: m.source_cte.ordinal)
             canon_ident = members[0].semantic.cte_identity.value
             donor_idents = tuple(m.semantic.cte_identity.value for m in members[1:])
-            # added projections: output spellings missing from canonical
+            # Added projections, in the rewrite's order, rebuilt from the donor's own compiled SQL so
+            # aliases and quoting survive (the folded output identity is not SQL).
             have = {p.output_identity.value for p in members[0].semantic.projections}
             additions: list[str] = []
             for m in members[1:]:
-                for p in m.semantic.projections:
-                    if p.output_identity.value not in have:
-                        have.add(p.output_identity.value)
-                        additions.append(p.output_identity.value)
-            expected_tree = build_expected_transform(bparsed, canon_ident, donor_idents, {canon_ident: additions})
-            from dbt_refmerge.semantics import validate_compiled_delta
-
-            validate_compiled_delta(
-                bparsed,
-                cparsed,
-                semantic_fingerprint(expected_tree, fold=spec.fold_unquoted),
-            )
+                donor_select = bparsed.ctes[m.semantic.cte_identity.value].args["this"]
+                for projection, node in zip(m.semantic.projections, donor_select.expressions, strict=True):
+                    if projection.output_identity.value not in have:
+                        have.add(projection.output_identity.value)
+                        additions.append(node.sql(dialect=spec.sqlglot_dialect))
+            expected_tree = build_expected_transform(expected, canon_ident, donor_idents, {canon_ident: additions})
+            expected = ParsedModel(sql=bparsed.sql, dialect=bparsed.dialect, tree=expected_tree, ctes={})
+        validate_compiled_delta(bparsed, cparsed, semantic_fingerprint(expected.tree, fold=spec.fold_unquoted))
 
     # -- fix --
     def fix(self, request: FixRequest) -> FixReport:
@@ -597,7 +603,12 @@ def apply_verified_source(
     candidate_bytes: bytes,
     expected_candidate_sha256: str,
 ) -> None:
-    """Atomic same-directory replacement with lock + hash/stat preconditions."""
+    """Atomic same-directory replacement under an exclusive lock, with content preconditions.
+
+    The lock file is opened without following symlinks and removed afterwards. The source is
+    re-hashed immediately before ``os.replace``; a stat comparison cannot see a same-size edit
+    inside the filesystem's mtime granularity.
+    """
     import tempfile
 
     if path.is_symlink() or not path.is_file():
@@ -605,54 +616,59 @@ def apply_verified_source(
     if hashlib.sha256(candidate_bytes).hexdigest() != expected_candidate_sha256:
         raise SourceChangedError(ReasonCode.SOURCE_CHANGED_BEFORE_APPLY, "candidate digest mismatch")
     lock_path = path.with_name(path.name + ".dbt-refmerge.lock")
-    with lock_path.open("w") as lock:
+    if lock_path.is_symlink():
+        raise RefmergeError(ReasonCode.INTERNAL_ERROR, f"refusing symlinked lock file: {lock_path}")
+    try:
+        lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    except OSError as exc:
+        raise RefmergeError(ReasonCode.INTERNAL_ERROR, f"cannot open lock file {lock_path}: {exc}") from exc
+    try:
         if sys.platform != "win32":
             import fcntl
 
             try:
-                fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-            except OSError:
-                pass
+                fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            except OSError as exc:
+                raise RefmergeError(ReasonCode.INTERNAL_ERROR, f"cannot lock {path}: {exc}") from exc
+        if hashlib.sha256(path.read_bytes()).hexdigest() != expected_original_sha256:
+            raise SourceChangedError(ReasonCode.SOURCE_CHANGED_BEFORE_APPLY, "source changed before apply")
+        mode = path.stat().st_mode
+        tmp_fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=".dbt-refmerge-")
         try:
-            current = path.read_bytes()
-            st_before = path.stat()
-            if hashlib.sha256(current).hexdigest() != expected_original_sha256:
+            with os.fdopen(tmp_fd, "wb") as fh:
+                fh.write(candidate_bytes)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.chmod(tmp_name, mode)
+            if hashlib.sha256(path.read_bytes()).hexdigest() != expected_original_sha256:
                 raise SourceChangedError(ReasonCode.SOURCE_CHANGED_BEFORE_APPLY, "source changed before apply")
-            mode = st_before.st_mode
-            tmp_fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=".dbt-refmerge-")
-            try:
-                with os.fdopen(tmp_fd, "wb") as fh:
-                    fh.write(candidate_bytes)
-                    fh.flush()
-                    os.fsync(fh.fileno())
-                os.chmod(tmp_name, mode)
-                st_after = path.stat()
-                if st_after.st_mtime_ns != st_before.st_mtime_ns or st_after.st_size != st_before.st_size:
-                    # re-read to confirm content unchanged (mtime may lack granularity)
-                    current2 = path.read_bytes()
-                    if hashlib.sha256(current2).hexdigest() != expected_original_sha256:
-                        raise SourceChangedError(ReasonCode.SOURCE_CHANGED_BEFORE_APPLY, "source changed before apply")
-                os.replace(tmp_name, path)
-                if sys.platform != "win32":
-                    try:
-                        dir_fd = os.open(str(path.parent), os.O_DIRECTORY)
-                        try:
-                            os.fsync(dir_fd)
-                        finally:
-                            os.close(dir_fd)
-                    except OSError:
-                        pass
-            finally:
+            os.replace(tmp_name, path)
+            if sys.platform != "win32":
                 try:
-                    if os.path.exists(tmp_name):
-                        os.unlink(tmp_name)
+                    dir_fd = os.open(str(path.parent), os.O_DIRECTORY)
+                    try:
+                        os.fsync(dir_fd)
+                    finally:
+                        os.close(dir_fd)
                 except OSError:
                     pass
         finally:
-            if sys.platform != "win32":
-                import fcntl
+            try:
+                if os.path.exists(tmp_name):
+                    os.unlink(tmp_name)
+            except OSError:
+                pass
+    finally:
+        if sys.platform != "win32":
+            # Unlink while still holding the lock; a waiter on the old inode re-hashes and refuses.
+            _unlink_quietly(lock_path)
+        os.close(lock_fd)
+        if sys.platform == "win32":
+            _unlink_quietly(lock_path)  # Windows cannot delete a file that is still open
 
-                try:
-                    fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
-                except OSError:
-                    pass
+
+def _unlink_quietly(path: Path) -> None:
+    try:
+        os.unlink(path)
+    except OSError:
+        pass

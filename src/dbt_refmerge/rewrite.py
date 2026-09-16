@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 from pathlib import Path
 
-from dbt_refmerge.analyze import QualifiedDuplicateGroup
+from dbt_refmerge.analyze import FindingStatus, QualifiedDuplicateGroup
 from dbt_refmerge.domain import Identifier, ReasonCode, RewritePlan, SourceSpan, TextEdit
 from dbt_refmerge.errors import InternalInvariantError, RewriteError
 from dbt_refmerge.source import DownstreamRef, ParsedSourceModel
@@ -115,6 +115,8 @@ def build_plan(
         return False
 
     for qg in groups:
+        if qg.status is not FindingStatus.MERGE_ELIGIBLE:
+            raise RewriteError(qg.reason_codes[0], f"group is not merge eligible: {qg.status.value}")
         members = sorted(qg.group.imports, key=lambda m: m.source_cte.ordinal)
         canonical = members[0].source_cte.identifier
         donors = [m.source_cte.identifier for m in members[1:]]

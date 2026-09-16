@@ -125,6 +125,8 @@ class SemanticImport:
     projections: tuple[SemanticProjection, ...]
     predicate_fingerprint: str | None
     ast_path: tuple[int | str, ...]
+    # Normalized (catalog, db, name) parts of the one relation the compiled import reads.
+    relation: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)

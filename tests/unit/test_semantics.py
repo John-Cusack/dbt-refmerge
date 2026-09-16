@@ -1,5 +1,8 @@
 """Semantics: allowlist, fingerprints, volatility."""
 
+import pytest
+
+from dbt_refmerge.domain import ReasonCode
 from dbt_refmerge.semantics import (
     analyze_volatility,
     parse_model,
@@ -37,3 +40,40 @@ def test_volatile_blocked():
 def test_unordered_limit_blocked():
     p = parse_model("with a as (select x from t) select * from a limit 5", "postgres")
     assert not analyze_volatility(p).ok
+
+
+def _volatility(final: str):
+    return analyze_volatility(parse_model(f"with a as (select id from t) {final}", "postgres"))
+
+
+@pytest.mark.parametrize(
+    "final",
+    [
+        "select id from a tablesample system (10)",
+        "select id from a fetch first 5 rows only",
+        "select id from a offset 5",
+        "select distinct on (id) id from a",
+        "select * from (select id from a limit 1) s order by id",
+        "select id from a union all select id from a limit 3",
+    ],
+    ids=["tablesample", "fetch-first", "offset", "distinct-on", "subquery-limit", "union-limit"],
+)
+def test_volatility_refuses_unordered_row_selection(final):
+    # S1: every query level that picks a subset of rows needs its own ORDER BY.
+    result = _volatility(final)
+    assert (result.ok, result.reason_codes) == (False, (ReasonCode.NONDETERMINISTIC,))
+
+
+@pytest.mark.parametrize(
+    "final",
+    [
+        "select id from a order by id limit 5",
+        "select id from a order by id fetch first 5 rows only",
+        "select id from a order by id offset 5",
+        "select distinct on (id) id from a order by id",
+        "select * from (select id from a order by id limit 1) s",
+    ],
+    ids=["limit", "fetch-first", "offset", "distinct-on", "subquery-limit"],
+)
+def test_volatility_accepts_ordered_row_selection(final):
+    assert _volatility(final).ok

@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from dbt_refmerge.config import redact_mapping
+from dbt_refmerge.config import is_secret_name
 from dbt_refmerge.errors import DbtError
 
 JSONValue = Any
@@ -58,18 +58,49 @@ class DbtCliCapabilities:
     supports_target_path: bool = True
 
 
+def parse_dbt_version_output(text: str) -> str:
+    """dbt-core version from ``dbt --version``; falls back to the first non-empty line.
+
+    dbt >= 1.5 prints ``Core:`` on its own line followed by ``- installed: X``; older
+    releases print ``Core: X``.
+    """
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    for index, line in enumerate(lines):
+        if not line.lower().startswith("core:"):
+            continue
+        inline = line.split(":", 1)[1].split()
+        if inline:
+            return inline[0]
+        for following in lines[index + 1 :]:
+            if not following.startswith("-"):
+                break
+            key, _, value = following.lstrip("- ").partition(":")
+            if key.strip().lower() == "installed" and value.split():
+                return value.split()[0]
+        break
+    return lines[0] if lines else ""
+
+
 def _redact_argv(argv: list[str]) -> tuple[str, ...]:
+    """Mask values of secret-looking flags, and ``--vars`` payloads that mention a secret."""
     out: list[str] = []
-    skip_next = False
+    pending: str | None = None  # "secret" or "vars": how to treat the next token
     for tok in argv:
-        if skip_next:
-            out.append("***")
-            skip_next = False
+        if pending is not None:
+            out.append("***" if pending == "secret" or is_secret_name(tok) else tok)
+            pending = None
             continue
-        low = tok.lower()
-        if any(h in low for h in ("password", "token", "secret")) and "=" not in tok:
-            out.append(tok)
-            continue
+        if tok.startswith("-"):
+            name, has_value, value = tok.partition("=")
+            flag = name.lstrip("-")
+            kind = "secret" if is_secret_name(flag) else "vars" if flag == "vars" else None
+            if kind is not None:
+                if not has_value:
+                    pending = kind
+                    out.append(tok)
+                else:
+                    out.append(f"{name}=***" if kind == "secret" or is_secret_name(value) else tok)
+                continue
         out.append(tok)
     return tuple(out)
 
@@ -136,7 +167,7 @@ class DbtCli:
                 start_new_session=True,
             )
         except OSError as exc:
-            raise DbtError(f"failed to launch dbt: {exc}", argv=tuple(argv)) from exc
+            raise DbtError(f"failed to launch dbt: {exc}", argv=_redact_argv(argv)) from exc
         timed_out = False
         try:
             stdout, stderr = proc.communicate(timeout=timeout_seconds)
@@ -157,7 +188,6 @@ class DbtCli:
             stdout = stdout[-MAX_RETAINED_LOG_BYTES:]
         if len(stderr.encode("utf-8", "ignore")) > MAX_RETAINED_LOG_BYTES:
             stderr = stderr[-MAX_RETAINED_LOG_BYTES:]
-        _ = redact_mapping(dict(full_env))
         return CommandResult(
             argv_redacted=_redact_argv(argv),
             returncode=proc.returncode,
@@ -176,13 +206,7 @@ class DbtCli:
         if res.timed_out or res.returncode != 0:
             raise DbtError("dbt --version failed", argv=res.argv_redacted)
         text = res.stdout.strip()
-        ver = ""
-        for line in text.splitlines():
-            line = line.strip()
-            if line.lower().startswith("core:"):
-                ver = line.split(":", 1)[1].strip().split()[0]
-                break
-        return DbtVersion(raw=text, version=ver or text.splitlines()[0] if text else "")
+        return DbtVersion(raw=text, version=parse_dbt_version_output(text))
 
     def discover_capabilities(self, cwd: Path | None = None) -> DbtCliCapabilities:
         res = self._run_argv([*self._command, "--help"], cwd=cwd or Path.cwd(), env=None, timeout_seconds=120)

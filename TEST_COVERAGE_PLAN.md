@@ -30,7 +30,7 @@ Measured 2026-09-16 on `acf0184` (the PR #4 branch; production code matches `mai
 |---|---|---|---:|
 | 0 | done | #5 | 61.2% (`fail_under = 61`) |
 | 1 | done (option A) | — | — |
-| 2 | not started | | |
+| 2 | done: B2–B7, S1–S11 | #6 | 71.3% (`fail_under = 71`) |
 | 3 | not started | | |
 | 4 | not started | | |
 | 5 | not started | | |
@@ -40,6 +40,16 @@ Discrepancies found while implementing:
 - **Phase 0:** the Postgres DSN variable is `REFMERGE_TEST_PG_DSN`, not `DBT_REFMERGE_TEST_PG_DSN`. `load_config` reads every `DBT_REFMERGE_*` variable as config, and the `isolated_env` fixture scrubs that prefix.
 - **Phase 0:** covdefaults excludes `if __name__ == "__main__":`, so the starting total is about 61% rather than 60%.
 - **B2 confirmed against real dbt-core 1.12.5:** `dbt --version` prints `Core:` on its own line.
+- **Phase 2, B4:** confirmed by the new two-group test: it failed with `COMPILE_DRIFT` once B3 was fixed.
+- **Phase 2, S1 scope:** `LIMIT`, `OFFSET`, `FETCH` and `DISTINCT ON` are refused only when their own query level has no `ORDER BY`. An `ORDER BY` with ties still passes the static gate. The warehouse comparison is the backstop, and this should be revisited when the verifier lands.
+- **Phase 2, S3:** the harness refuses any `{%` in compiled SQL, not just `endraw` spellings.
+- **Phase 2, S6:** verdict SQL requires fully quoted `"db"."schema"."name"` relations, and every CTE and helper column is namespaced `__dbt_refmerge_*`. This also removes the grouped-counts `_a`/`_b`/`_delta` collision.
+- **Phase 2, S7:** each `SemanticImport` now carries the normalized compiled relation, and `qualify_group` refuses a group whose members read different relations (`SOURCE_MAPPING_AMBIGUOUS`).
+- **Phase 2, S9:**
+  - A lock failure raises `RefmergeError(INTERNAL_ERROR)`.
+  - The lock file is opened with `O_NOFOLLOW`, never truncated, and removed afterwards (before closing on POSIX, after closing on Windows).
+  - The source is re-hashed unconditionally before `os.replace`.
+- **Phase 2, S11:** the launch-failure `DbtError` also carried an unredacted argv; now fixed.
 
 ## 1. Where coverage stands
 

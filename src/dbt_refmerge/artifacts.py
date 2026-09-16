@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -125,7 +125,7 @@ def load_manifest(path: Path | str) -> ManifestView:
                 raise ArtifactError(ReasonCode.INTERNAL_ERROR, f"invalid node {uid}: {exc}") from exc
             # path traversal guard: reject absolute or parent-escaping paths
             ofp = node.original_file_path.replace("\\", "/")
-            if ofp.startswith("/") or ".." in ofp.split("/"):
+            if ofp.startswith("/") or ".." in ofp.split("/") or PureWindowsPath(node.original_file_path).drive:
                 raise ArtifactError(ReasonCode.INTERNAL_ERROR, f"unsafe original_file_path: {uid}")
             nodes[uid] = node
     sources = raw.get("sources", {}) if isinstance(raw.get("sources"), dict) else {}
