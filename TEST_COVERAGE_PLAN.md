@@ -31,7 +31,7 @@ Measured 2026-09-16 on `acf0184` (the PR #4 branch; production code matches `mai
 | 0 | done | #5 | 61.2% (`fail_under = 61`) |
 | 1 | done (option A) | — | — |
 | 2 | done: B2–B7, S1–S11 | #6 | 71.3% (`fail_under = 71`) |
-| 3 | done: unit lane for reporting, config, errors, domain, analyze, rewrite, semantics, source, artifacts, adapters, workspace, apply | Phase 3 PR | 85% (`fail_under = 85`) |
+| 3 | done: unit lane for reporting, config, errors, domain, analyze, rewrite, semantics, source, artifacts, adapters, workspace, apply | #7 | 85% (`fail_under = 85`) |
 | 4 | not started | | |
 | 5 | not started | | |
 
