@@ -199,6 +199,19 @@ def build_plan(
                 start = terminal_deletion_start
                 end = terminal_donors[-1].cte_span.end_byte
                 allowed_ref_spans = terminal_ref_spans
+                terminal_tail_end = min(
+                    (
+                        model.decoded.char_to_byte[token.start]
+                        for token in model.tokens
+                        if token.kind not in ("space", "comment") and model.decoded.char_to_byte[token.start] >= end
+                    ),
+                    default=len(source),
+                )
+                if _has_sql_comment(end, terminal_tail_end) or _has_non_ref_jinja(end, terminal_tail_end):
+                    raise RewriteError(
+                        ReasonCode.COMMENT_RELOCATION_UNSUPPORTED,
+                        f"comment or Jinja after terminal donor {donor.source_text}",
+                    )
             elif donor_cte.separator_span is not None:
                 end = max(end, donor_cte.separator_span.end_byte)
             else:

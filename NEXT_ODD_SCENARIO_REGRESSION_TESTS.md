@@ -1,6 +1,6 @@
 # Next Odd-Scenario Regression Tests
 
-This document is the canonical, deduplicated regression-test strategy for `dbt-refmerge`. It reconciles the original proposal with `test-strategy.opus.md`; overlapping cases are listed once, and unsafe Opus expectations were corrected to follow the project's fail-closed policy. All 45 numbered scenarios are implemented, and every heading uses the exact pytest function name. The first group records cases that previously produced an unsafe plan, an incorrect no-op, or `INTERNAL_ERROR`. The second group pins behavior that is correct or conservatively fail-closed.
+This document is the canonical, deduplicated regression-test strategy for `dbt-refmerge`. It reconciles the original proposal with `test-strategy.opus.md`; overlapping cases are listed once, and unsafe Opus expectations were corrected to follow the project's fail-closed policy. All 46 numbered scenarios are implemented, and every heading uses the exact pytest function name. The first group records cases that previously produced an unsafe plan, an incorrect no-op, or `INTERNAL_ERROR`. The second group pins behavior that is correct or conservatively fail-closed.
 
 The implemented fast regression lane is `tests/unit/test_odd_scenarios.py`. It exercises these cases entirely in memory so the complete odd-scenario file remains sub-second. `qualify_group` consumes `downstream_refs`, `build_plan` reparses candidates with `model.fold_unquoted`, and the canonical comment/Jinja guard scans from `select_list_span.end_byte` through the canonical tail.
 
@@ -808,6 +808,10 @@ Put a SQL block comment containing a comma between the preceding CTE separator a
 ### 45. `test_consecutive_donors_with_last_donor_do_not_overlap_edits`
 
 Use a three-member group where the two donors are consecutive and the second donor is the final CTE. Assert both donors are removed, projections and downstream bindings are merged, no dangling comma remains, the candidate reparses, and no edits overlap. One combined deletion starts at the retained predecessor's separator and ends after the final donor.
+
+### 46. `test_terminal_donor_tail_comment_or_jinja_refuses`
+
+Parametrize a SQL line comment and a non-`ref` Jinja expression between a terminal donor's closing parenthesis and the main query. Assert `build_plan` raises `COMMENT_RELOCATION_UNSUPPORTED`; deleting the donor must not silently reattach its tail trivia to the retained canonical CTE or main query.
 
 ## Opus proposals deliberately rejected or corrected
 

@@ -360,6 +360,41 @@ def test_sql_comment_comma_overlapping_last_donor_deletion_refuses():
     assert exc_info.value.reason_code is ReasonCode.COMMENT_RELOCATION_UNSUPPORTED
 
 
+@pytest.mark.parametrize(
+    "terminal_tail",
+    [
+        "\n-- donor tail, ownership\n",
+        "\n{{ config(tags=['terminal']) }}\n",
+    ],
+)
+def test_terminal_donor_tail_comment_or_jinja_refuses(terminal_tail):
+    raw = (
+        "with a as (\n"
+        "    select\n"
+        "        id,\n"
+        "        customer_id\n"
+        "    from {{ ref('stg') }}\n"
+        "),\n"
+        "b as (\n"
+        "    select\n"
+        "        id,\n"
+        "        amount\n"
+        "    from {{ ref('stg') }}\n"
+        ")"
+        f"{terminal_tail}"
+        "select b.id from b\n"
+    )
+    compiled = (
+        "with a as (select id, customer_id from db.sch.stg), "
+        "b as (select id, amount from db.sch.stg) select b.id from b"
+    )
+    raw_bytes, source, owner, _group, qualified = _qualified(raw, compiled)
+    assert qualified.status is FindingStatus.MERGE_ELIGIBLE
+    with pytest.raises(RewriteError) as exc_info:
+        build_plan(raw_bytes, owner.unique_id, Path("m.sql"), (qualified,), source)
+    assert exc_info.value.reason_code is ReasonCode.COMMENT_RELOCATION_UNSUPPORTED
+
+
 def test_none_fold_predicate_case_remains_semantic():
     final = "select a.id from a join b on a.id = b.id"
     raw = _source(final, a_projection="id", b_projection="id", a_where=" where Status = 1", b_where=" where status = 1")
