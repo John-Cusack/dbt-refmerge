@@ -1,6 +1,52 @@
 """Jinja masking + offsets."""
 
+import pytest
+
+from dbt_refmerge.domain import RefCall, SourceSpan
 from dbt_refmerge.source import decode_source, mask_jinja, parse_source_model
+
+
+def _calls(src: str) -> list[RefCall]:
+    return list(mask_jinja(decode_source(src.encode())).ref_calls.values())
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        # dbt ignores unknown ref() kwargs, but a project macro can override ref(); fail closed.
+        "{{ ref('m', foo=1) }}",
+        # dbt resolves `version or v`; recording either one could name the wrong version.
+        "{{ ref('m', version=1, v=2) }}",
+        # dbt's source() takes no kwargs at all.
+        "{{ source('s', 't', x=1) }}",
+        # Star arguments are runtime values: ref('m', *names) can become ref('m', 'n').
+        "{{ ref('m', *names) }}",
+        "{{ ref('m', **options) }}",
+    ],
+)
+def test_unknown_or_dynamic_call_arguments_are_not_sentinels(call):
+    assert _calls(call) == []
+
+
+@pytest.mark.parametrize(
+    ("call", "expected"),
+    [
+        ("{{- ref('m') -}}", RefCall("ref", None, "m", None, None, SourceSpan(0, 16))),
+        ("{{-ref('m')-}}", RefCall("ref", None, "m", None, None, SourceSpan(0, 14))),
+        ("{{+ ref('m') }}", RefCall("ref", None, "m", None, None, SourceSpan(0, 15))),
+        ("{{- source('s', 't') }}", RefCall("source", None, "t", "s", None, SourceSpan(0, 23))),
+        ("{{ ref('m', v=2) -}}", RefCall("ref", None, "m", None, 2, SourceSpan(0, 20))),
+    ],
+)
+def test_whitespace_control_markers_keep_literal_calls(call, expected):
+    # The span still covers the markers, so the rewriter treats the whole tag as the ref.
+    assert _calls(call) == [expected]
+
+
+@pytest.mark.parametrize("call", ["{{ ref('m') +}}", "{{ ref('m') --}}", "{{-- ref('m') }}"])
+def test_invalid_whitespace_control_is_dynamic(call):
+    # Jinja rejects each of these, so none is a literal call.
+    assert _calls(call) == []
 
 
 def test_literal_ref_masked_with_sentinel():

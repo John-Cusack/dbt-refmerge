@@ -155,6 +155,8 @@ def _parse_literal_call(inner: str) -> tuple[str, tuple[str | int, ...], dict[st
         return None
     if func.name not in ("ref", "source"):
         return None
+    if out.dyn_args is not None or out.dyn_kwargs is not None:
+        return None  # *args / **kwargs are runtime values
     args: list[str | int] = []
     for a in out.args:
         if isinstance(a, _jnodes.Const):
@@ -180,6 +182,10 @@ def _interpret_ref_call(
             package: str | None = None
             name = ""
             version: str | int | None = None
+            # dbt reads `version or v` and ignores other kwargs, but a project can override ref():
+            # anything beyond one version kwarg is not a literal call.
+            if len(kwargs) > 1 or not set(kwargs) <= {"version", "v"}:
+                return None
             for k in ("version", "v"):
                 if k in kwargs:
                     version = kwargs[k]
@@ -199,7 +205,7 @@ def _interpret_ref_call(
                 return None
             return RefCall(kind="ref", package=package, name=name, source_name=None, version=version, span=span)
         else:
-            if len(args) != 2 or not all(isinstance(a, str) for a in args):
+            if len(args) != 2 or kwargs or not all(isinstance(a, str) for a in args):
                 return None
             return RefCall(
                 kind="source",
@@ -214,6 +220,19 @@ def _interpret_ref_call(
 
 
 _TOKEN = re.compile(r"\{\{|\}\}|\{%|%\}|\{#|#\}")
+
+
+def _strip_whitespace_control(inner: str) -> str:
+    """Drop Jinja's `{{-` / `{{+` / `-}}` markers from an expression's inner text.
+
+    They only strip template whitespace around the tag, which the rewriter never edits: the tag's
+    span still covers the markers, and an import's ref sits strictly inside its CTE body.
+    """
+    if inner[:1] in ("-", "+"):
+        inner = inner[1:]
+    if inner[-1:] == "-":
+        inner = inner[:-1]
+    return inner
 
 
 def mask_jinja(decoded: DecodedSource) -> MaskedSource:
@@ -254,7 +273,7 @@ def mask_jinja(decoded: DecodedSource) -> MaskedSource:
             if end == -1:
                 raise SourceParseError(ReasonCode.INTERNAL_ERROR, "unterminated Jinja expression")
             end_char = end + 2
-            inner = text[i + 2 : end]
+            inner = _strip_whitespace_control(text[i + 2 : end])
             span = byte_span_of(decoded, i, end_char)
             jinja_spans.append(
                 JinjaSpan(
@@ -615,6 +634,33 @@ def _split_depth_zero(body_tokens: list[Token]) -> list[list[Token]]:
     return parts
 
 
+# Clauses that can follow a WHERE predicate in some supported dialect. A predicate has no end
+# marker, so these words (any depth) end it. Two-word entries match only as a pair, which keeps
+# columns named `start`, `sort` or `cluster` usable in a predicate.
+_CLAUSES_AFTER_WHERE: tuple[tuple[str, ...], ...] = (
+    ("GROUP",),
+    ("HAVING",),
+    ("WINDOW",),
+    ("QUALIFY",),
+    ("ORDER",),
+    ("LIMIT",),
+    ("OFFSET",),
+    ("FETCH",),
+    ("UNION",),
+    ("INTERSECT",),
+    ("EXCEPT",),
+    ("MINUS",),
+    ("FOR",),
+    ("INTO",),
+    ("CONNECT", "BY"),
+    ("START", "WITH"),
+    ("CLUSTER", "BY"),
+    ("DISTRIBUTE", "BY"),
+    ("SORT", "BY"),
+    ("USING", "SAMPLE"),
+)
+
+
 def _parse_import_body(
     *,
     decoded: DecodedSource,
@@ -691,23 +737,10 @@ def _parse_import_body(
     # check trailing clause after WHERE: only WHERE allowed; any GROUP/ORDER/LIMIT/etc -> non-import
     if where_idx is not None:
         # predicate span: from WHERE token start... to end of sig? but must reject other clauses
-        rest = sig[where_idx + 1 :]
-        # scan for clause keywords that terminate WHERE
-        clause_keywords = {
-            "GROUP",
-            "ORDER",
-            "LIMIT",
-            "HAVING",
-            "WINDOW",
-            "QUALIFY",
-            "FETCH",
-            "UNION",
-            "INTERSECT",
-            "EXCEPT",
-            "OFFSET",
-        }
-        for t in rest:
-            if t.kind == "word" and t.text.upper() in clause_keywords:
+        rest = [t.text.upper() if t.kind == "word" else "" for t in sig[where_idx + 1 :]]
+        for k in range(len(rest)):
+            if any(tuple(rest[k : k + len(clause)]) == clause for clause in _CLAUSES_AFTER_WHERE):
+                # Same outcome as the clause without WHERE: not an import.
                 return SourceCTE(
                     identifier=ident,
                     ordinal=ordinal,
@@ -715,7 +748,7 @@ def _parse_import_body(
                     body_span=body_span,
                     select_list_span=select_list_span,
                     separator_span=separator_span,
-                    ref_call=ref_call,
+                    ref_call=None,
                     projections=(),
                     predicate_source_span=None,
                 )
@@ -752,7 +785,12 @@ def _parse_import_body(
         if any(t.kind == "string" and not t.text.startswith('"') for t in psig):
             valid = False
             break
-        # shapes: [col] | [col AS alias] | [col alias]
+        # shapes: [col] | [col AS alias] | [col alias]; any other token makes it an expression
+        if any(t.kind not in ("word", "string") for t in psig) or [
+            t.kind == "word" and t.text.upper() == "AS" for t in psig
+        ] not in ([False], [False, False], [False, True, False]):
+            valid = False
+            break
         words = [t for t in psig if t.kind in ("word", "string")]
         if len(words) == 1:
             col_tok = words[0]
@@ -854,6 +892,57 @@ def _parse_import_body(
     )
 
 
+def _is_word(tokens: list[Token], idx: int, upper: str) -> bool:
+    return 0 <= idx < len(tokens) and tokens[idx].kind == "word" and tokens[idx].text.upper() == upper
+
+
+def _is_punct(tokens: list[Token], idx: int, text: str) -> bool:
+    return 0 <= idx < len(tokens) and tokens[idx].kind == "punct" and tokens[idx].text == text
+
+
+def _nested_cte_names(sig: list[Token], model: ParsedSourceModel, fold_unquoted: FoldRule) -> frozenset[str]:
+    """Identities of CTEs declared anywhere except the top-level WITH list.
+
+    A nested CTE can shadow a top-level one, and neither the rewriter nor the compiled delta gate
+    resolves scopes. So every declaration counts, wherever it is (fail closed): ``name AS (``,
+    ``name AS [NOT] MATERIALIZED (`` and ``name (columns) AS (``. That covers ``WITH RECURSIVE``,
+    every CTE of a nested list, and nested WITHs in the main query. A declaration whose name is
+    not visible (masked Jinja) is refused, since it could shadow anything.
+    """
+    top_level_starts = {cte.cte_span.start_byte for cte in model.ctes}
+    opener: dict[int, int] = {}
+    stack: list[int] = []
+    for idx in range(len(sig)):
+        if _is_punct(sig, idx, "("):
+            stack.append(idx)
+        elif _is_punct(sig, idx, ")"):
+            opener[idx] = stack.pop() if stack else -1
+    names: set[str] = set()
+    for idx in range(len(sig)):
+        body = idx + 1
+        while _is_word(sig, body, "NOT") or _is_word(sig, body, "MATERIALIZED"):
+            body += 1
+        if not (_is_word(sig, idx, "AS") and _is_punct(sig, body, "(")):
+            continue
+        name_idx = opener.get(idx - 1, idx) - 1  # step over a column list
+        name = sig[name_idx] if name_idx >= 0 else None
+        if name is not None and model.decoded.char_to_byte[name.start] in top_level_starts:
+            continue
+        identity = _identity_for_token(name, fold_unquoted) if name is not None else None
+        if identity is None or name is None or name.text.upper() in ("WITH", "RECURSIVE"):
+            raise SourceParseError(ReasonCode.UNSUPPORTED_IMPORT_SHAPE, "nested CTE name is not visible")
+        names.add(identity)
+    return frozenset(names)
+
+
+def _identity_for_token(token: Token, fold_unquoted: FoldRule) -> str | None:
+    if token.kind == "word":
+        return make_identifier(token.text, False, fold_unquoted).identity.value
+    if token.kind == "string" and token.text.startswith('"'):
+        return make_identifier(token.text, True, fold_unquoted).identity.value
+    return None
+
+
 def _find_downstream_refs(
     model: ParsedSourceModel, fold_unquoted: FoldRule
 ) -> tuple[list[DownstreamRef], frozenset[str]]:
@@ -868,20 +957,7 @@ def _find_downstream_refs(
     decoded = model.decoded
     sig = _significant(model.tokens)
     refs: list[DownstreamRef] = []
-    # nested WITH shadowing: single pass collecting CTE names declared inside a
-    # CTE body. A WITH at top level declares a top-level CTE, not a shadow.
-    nested_names: set[str] = set()
-    body_ranges = [(c.body_span.start_byte, c.body_span.end_byte) for c in model.ctes]
-    for idx, t in enumerate(sig):
-        if t.kind != "word" or t.text.upper() != "WITH":
-            continue
-        tb = decoded.char_to_byte[t.start]
-        if not any(start <= tb < end for start, end in body_ranges):
-            continue
-        if idx + 1 < len(sig) and sig[idx + 1].kind in ("word", "string"):
-            nm = sig[idx + 1].text
-            q = sig[idx + 1].kind == "string"
-            nested_names.add(make_identifier(nm, q, fold_unquoted).identity.value)
+    nested_names = _nested_cte_names(sig, model, fold_unquoted)
 
     alias_stoppers = frozenset(
         {
@@ -1022,13 +1098,12 @@ def _find_downstream_refs(
         return False, relation_identity
 
     def _qualified_star(context_tokens: list[Token], alias_identity: str | None) -> bool:
-        if alias_identity is None:
-            return False
+        # An alias or qualifier the frontend cannot read may be the same name: count it.
         for token_idx in range(len(context_tokens) - 2):
             first, dot, star = context_tokens[token_idx : token_idx + 3]
             if dot.kind != "punct" or dot.text != "." or star.kind != "punct" or star.text != "*":
                 continue
-            if _identity_for_token(first) == alias_identity:
+            if alias_identity is None or _identity_for_token(first) in (alias_identity, None):
                 return True
         return False
 
