@@ -1,13 +1,11 @@
-"""Artifacts, harness, comparator tests."""
+"""Harness and comparator tests (manifest loading lives in test_artifacts.py)."""
 
 import json
-from pathlib import Path
 
 import pytest
 
-from dbt_refmerge.artifacts import load_manifest
 from dbt_refmerge.domain import ReasonCode
-from dbt_refmerge.errors import ArtifactError, ScratchBoundaryError, VerificationError
+from dbt_refmerge.errors import ScratchBoundaryError, VerificationError
 from dbt_refmerge.verification import comparator as comp
 from dbt_refmerge.verification.harness import (
     build_harness_project,
@@ -15,30 +13,6 @@ from dbt_refmerge.verification.harness import (
     validate_scratch_schema,
 )
 from dbt_refmerge.workspace import RunWorkspace
-
-
-def _write_manifest(tmp_path: Path, schema: str) -> Path:
-    payload = {
-        "metadata": {"dbt_schema_version": schema, "dbt_version": "1.8.0"},
-        "nodes": {},
-        "sources": {},
-    }
-    p = tmp_path / "manifest.json"
-    p.write_text(json.dumps(payload))
-    return p
-
-
-def test_supported_manifest_loads(tmp_path):
-    p = _write_manifest(tmp_path, "https://schemas.getdbt.com/dbt/manifest/v12.json")
-    view = load_manifest(p)
-    assert view.metadata.dbt_version == "1.8.0"
-
-
-def test_unknown_manifest_rejected(tmp_path):
-    p = _write_manifest(tmp_path, "https://schemas.getdbt.com/dbt/manifest/v99.json")
-    with pytest.raises(ArtifactError) as ei:
-        load_manifest(p)
-    assert ei.value.reason_code == ReasonCode.UNSUPPORTED_MANIFEST_SCHEMA
 
 
 def test_comparator_counts_and_markers():
@@ -170,23 +144,3 @@ def test_verdict_sql_names_cannot_collide_with_user_names(generate):
     for cte in tree.find_all(exp.CTE):
         aliases = [projection.alias_or_name for projection in cte.this.expressions]
         assert len(aliases) == len(set(aliases)), cte.alias
-
-
-@pytest.mark.parametrize("path", ["C:\\evil\\m.sql", "c:/evil/m.sql", "C:m.sql", "//server/share/m.sql"])
-def test_manifest_rejects_windows_absolute_paths(tmp_path, path):
-    # S10: drive-letter and UNC paths escape the project when joined on Windows.
-    node = {
-        "unique_id": "model.p.m",
-        "resource_type": "model",
-        "package_name": "p",
-        "name": "m",
-        "original_file_path": path,
-    }
-    payload = {
-        "metadata": {"dbt_schema_version": "https://schemas.getdbt.com/dbt/manifest/v12.json", "dbt_version": "1.9.0"},
-        "nodes": {"model.p.m": node},
-    }
-    manifest = tmp_path / "manifest.json"
-    manifest.write_text(json.dumps(payload))
-    with pytest.raises(ArtifactError):
-        load_manifest(manifest)

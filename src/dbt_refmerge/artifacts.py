@@ -90,14 +90,23 @@ def _no_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
 
 
 def load_manifest(path: Path | str) -> ManifestView:
+    """Load and validate a manifest. Every unusable input raises ArtifactError, never a bare exception."""
     p = Path(path)
-    size = p.stat().st_size
-    if size > MAX_ARTIFACT_BYTES:
-        raise ArtifactError(ReasonCode.INTERNAL_ERROR, f"manifest too large: {size} bytes")
-    text = p.read_bytes().decode("utf-8")  # strict
+    try:
+        size = p.stat().st_size
+        if size > MAX_ARTIFACT_BYTES:
+            raise ArtifactError(ReasonCode.INTERNAL_ERROR, f"manifest too large: {size} bytes")
+        data = p.read_bytes()
+    except OSError as exc:
+        raise ArtifactError(ReasonCode.INTERNAL_ERROR, f"cannot read manifest: {exc}") from exc
+    try:
+        text = data.decode("utf-8")  # strict; json.loads(bytes) would also accept UTF-16/32
+    except UnicodeDecodeError as exc:
+        raise ArtifactError(ReasonCode.INTERNAL_ERROR, f"manifest is not valid UTF-8: {exc}") from exc
+    # ValueError covers JSONDecodeError and over-long integer literals; RecursionError covers deep nesting.
     try:
         raw: Any = json.loads(text, object_pairs_hook=_no_duplicate_keys)
-    except (json.JSONDecodeError, ArtifactError) as exc:
+    except (ValueError, RecursionError, ArtifactError) as exc:
         raise ArtifactError(ReasonCode.INTERNAL_ERROR, f"invalid manifest JSON: {exc}") from exc
     if not isinstance(raw, dict):
         raise ArtifactError(ReasonCode.INTERNAL_ERROR, "manifest root must be an object")
@@ -113,22 +122,33 @@ def load_manifest(path: Path | str) -> ManifestView:
             ReasonCode.UNSUPPORTED_MANIFEST_SCHEMA,
             f"unsupported manifest schema: {metadata.dbt_schema_version}",
         )
+    # A malformed entry is refused, never skipped: dropping one of two same-named nodes (or sources)
+    # would turn an ambiguous ref()/source() into a unique one.
     nodes_raw = raw.get("nodes", {})
+    if not isinstance(nodes_raw, dict):
+        raise ArtifactError(ReasonCode.INTERNAL_ERROR, "manifest nodes must be an object")
     nodes: dict[str, ManifestNodeModel] = {}
-    if isinstance(nodes_raw, dict):
-        for uid, node_raw in nodes_raw.items():
-            if not isinstance(node_raw, dict):
-                continue
-            try:
-                node = ManifestNodeModel(**node_raw)
-            except Exception as exc:
-                raise ArtifactError(ReasonCode.INTERNAL_ERROR, f"invalid node {uid}: {exc}") from exc
-            # path traversal guard: reject absolute or parent-escaping paths
-            ofp = node.original_file_path.replace("\\", "/")
-            if ofp.startswith("/") or ".." in ofp.split("/") or PureWindowsPath(node.original_file_path).drive:
-                raise ArtifactError(ReasonCode.INTERNAL_ERROR, f"unsafe original_file_path: {uid}")
-            nodes[uid] = node
-    sources = raw.get("sources", {}) if isinstance(raw.get("sources"), dict) else {}
+    for uid, node_raw in nodes_raw.items():
+        if not isinstance(node_raw, dict):
+            raise ArtifactError(ReasonCode.INTERNAL_ERROR, f"invalid node {uid}: not an object")
+        try:
+            node = ManifestNodeModel(**node_raw)
+        except Exception as exc:
+            raise ArtifactError(ReasonCode.INTERNAL_ERROR, f"invalid node {uid}: {exc}") from exc
+        # depends_on and resolution use the key, callers use unique_id: they must name the same node.
+        if node.unique_id != uid:
+            raise ArtifactError(ReasonCode.INTERNAL_ERROR, f"node key {uid} does not match its unique_id")
+        # path traversal guard: reject absolute or parent-escaping paths
+        ofp = node.original_file_path.replace("\\", "/")
+        if ofp.startswith("/") or ".." in ofp.split("/") or PureWindowsPath(node.original_file_path).drive:
+            raise ArtifactError(ReasonCode.INTERNAL_ERROR, f"unsafe original_file_path: {uid}")
+        nodes[uid] = node
+    sources = raw.get("sources", {})
+    if not isinstance(sources, dict):
+        raise ArtifactError(ReasonCode.INTERNAL_ERROR, "manifest sources must be an object")
+    for uid, source in sources.items():
+        if not isinstance(source, dict):
+            raise ArtifactError(ReasonCode.INTERNAL_ERROR, f"invalid source {uid}: not an object")
     return ManifestView(metadata=metadata, nodes=nodes, sources=sources, path=p)
 
 
@@ -140,7 +160,12 @@ def resolve_literal_ref(
     name: str,
     source_name: str | None = None,
 ) -> str:
-    """Resolve a literal ref()/source() to exactly one unique_id or raise."""
+    """Resolve a literal ref()/source() to exactly one unique_id or raise.
+
+    When the owner carries refs/sources metadata, it must confirm the literal call: metadata that
+    contradicts every candidate means the manifest and the source disagree, which is refused rather
+    than resolved from the unfiltered candidates.
+    """
     candidates: list[str] = []
     if kind == "ref":
         for uid in owner.depends_on.nodes:
@@ -154,9 +179,8 @@ def resolve_literal_ref(
             if package is not None and node.package_name != package:
                 continue
             candidates.append(uid)
-        # cross-check manifest refs metadata when present
         if owner.refs:
-            filtered = [
+            candidates = [
                 uid
                 for uid in candidates
                 if any(
@@ -165,26 +189,16 @@ def resolve_literal_ref(
                     for r in owner.refs
                 )
             ]
-            if filtered:
-                candidates = filtered
     else:
         sname = source_name or ""
         for uid, src in view.sources.items():
             if not isinstance(src, dict):
-                continue
+                # No name to compare: it may be another candidate, so the mapping is unknowable.
+                raise ArtifactError(ReasonCode.INTERNAL_ERROR, f"invalid source {uid}: not an object")
             if src.get("source_name") == sname and src.get("name") == name:
                 candidates.append(uid)
-        # also consider owner depends_on
-        dep_hits = [u for u in owner.depends_on.nodes if u in view.sources and u not in candidates]
-        # filter dep hits by name match
-        for u in dep_hits:
-            src = view.sources.get(u, {})
-            if src.get("source_name") == sname and src.get("name") == name:
-                candidates.append(u)
-        if owner.sources:
-            keep = [u for u in candidates if [sname, name] in owner.sources]
-            if keep:
-                candidates = keep
+        if owner.sources and [sname, name] not in owner.sources:
+            candidates = []
     unique = sorted(set(candidates))
     if len(unique) != 1:
         raise ArtifactError(
