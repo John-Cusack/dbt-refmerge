@@ -25,7 +25,10 @@ def test_scan_prints_one_lead_per_line_with_the_project_relative_path(make_proje
     result = _invoke("scan", "--project-dir", str(root), "--adapter", "postgres")
 
     assert result.exit_code == 0, result.stderr
-    assert result.stdout == f"{long_dir}/orders.sql: a, b -> ?\n"
+    assert (
+        result.stdout
+        == f"{long_dir}/orders.sql:1: CTEs a, b import the same relation; run dbt-refmerge check to prove a merge\n"
+    )
 
 
 def test_scan_json_lists_findings(make_project):
@@ -36,6 +39,44 @@ def test_scan_json_lists_findings(make_project):
     payload = json.loads(result.stdout)
     assert (payload["command"], payload["summary"]) == ("scan", {"findings": 1})
     assert payload["findings"][0]["cte_names"] == ["a", "b"]
+
+
+def test_scan_format_github_annotates_the_first_duplicated_import(make_project, monkeypatch):
+    root = make_project({"models/core/orders.sql": "-- leading comment\n\n" + DUPLICATE})
+    monkeypatch.setenv("GITHUB_WORKSPACE", str(root.parent))
+
+    result = _invoke("scan", "--project-dir", str(root), "--adapter", "postgres", "--format", "github")
+
+    assert result.exit_code == 0, result.stderr
+    assert result.stdout == (
+        f"::warning file={root.name}/models/core/orders.sql,line=3,title=dbt-refmerge%3A duplicate import CTEs"
+        "::CTEs a, b import the same relation; run dbt-refmerge check to prove a merge\n"
+    )
+
+
+def test_scan_format_github_names_files_relative_to_the_working_directory_outside_actions(make_project, monkeypatch):
+    root = make_project({"models/orders.sql": DUPLICATE})
+    monkeypatch.chdir(root)
+
+    result = _invoke("scan", "--adapter", "postgres", "--format", "github")
+
+    assert result.stdout.startswith("::warning file=models/orders.sql,line=1,")
+
+
+def test_scan_format_json_is_the_same_as_the_json_flag_and_conflicts_are_refused(make_project):
+    root = make_project({"models/orders.sql": DUPLICATE})
+    common = ("scan", "--project-dir", str(root), "--adapter", "postgres")
+
+    as_format = _invoke(*common, "--format", "json")
+    as_flag = _invoke(*common, "--json")
+    text = _invoke(*common, "--format", "text")
+    conflict = _invoke(*common, "--json", "--format", "github")
+
+    assert json.loads(as_format.stdout)["findings"] == json.loads(as_flag.stdout)["findings"]
+    assert json.loads(as_format.stdout)["findings"][0]["line"] == 1
+    assert text.stdout.startswith("models/orders.sql:1: ")
+    assert conflict.exit_code == 1
+    assert conflict.stderr == "configuration error: --json conflicts with --format github\n"
 
 
 def test_scan_without_findings_prints_nothing(make_project):

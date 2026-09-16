@@ -7,6 +7,7 @@ value from ``.dbt-refmerge.toml`` or ``DBT_REFMERGE_*``.
 from __future__ import annotations
 
 import json
+import os
 import sys
 import traceback
 from collections.abc import Callable
@@ -28,9 +29,12 @@ from dbt_refmerge.orchestrator import (
 )
 from dbt_refmerge.reporting import (
     ExitCode,
+    OutputFormat,
     check_report_json,
     evaluate_exit_code_for_check,
+    render_github_scan,
     render_human_check,
+    render_human_scan,
     scan_report_json,
 )
 
@@ -103,28 +107,35 @@ def scan(
     profile: str | None = typer.Option(None, "--profile"),
     target: str | None = typer.Option(None, "--target"),
     adapter: str | None = typer.Option(None, "--adapter"),
-    json_: bool | None = typer.Option(None, "--json", show_default=False),
+    format_: OutputFormat | None = typer.Option(
+        None, "--format", help="text, json, or github (GitHub Actions annotations)."
+    ),
+    json_: bool | None = typer.Option(None, "--json", show_default=False, help="Same as --format json."),
     fail_on: FailOn | None = typer.Option(None, "--fail-on", help="finding: exit 2 when there are leads."),
     debug: bool | None = typer.Option(None, "--debug", show_default=False),
 ) -> None:
     """List duplicate import CTEs from source files (no dbt run, no warehouse)."""
+    if json_ and format_ not in (None, OutputFormat.JSON):
+        _fail("configuration error", ValueError(f"--json conflicts with --format {format_.value}"), debug=False)
     config = _load(
         project_dir,
         profiles_dir=profiles_dir,
         profile=profile,
         target=target,
         adapter=adapter,
-        json_output=json_,
+        json_output=json_ if format_ is None else format_ is OutputFormat.JSON,
         fail_on=fail_on,
         debug=debug,
     )
     report = _run("scan", config, lambda: RefmergeService().scan(ScanRequest(config=config)))
     if config.json_output:
         _write_json(scan_report_json(report, project_dir=config.project_dir))
+    elif format_ is OutputFormat.GITHUB:
+        # Annotations name files relative to the checkout, which is the working directory in a workflow.
+        workspace = Path(os.environ.get("GITHUB_WORKSPACE") or Path.cwd())
+        sys.stdout.write(render_github_scan(report, base_dir=workspace))
     else:
-        for f in report.findings:
-            path = f.source_path.relative_to(config.project_dir).as_posix()
-            console.print(f"{path}: {', '.join(f.cte_names)} -> {f.upstream_unique_id or '?'}")
+        sys.stdout.write(render_human_scan(report, project_dir=config.project_dir))
     failed = config.fail_on is FailOn.FINDING and report.findings
     raise typer.Exit(code=int(ExitCode.POLICY_FINDING) if failed else 0)
 

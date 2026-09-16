@@ -20,7 +20,9 @@ from dbt_refmerge.reporting import (
     ExitCode,
     check_report_json,
     evaluate_exit_code_for_check,
+    render_github_scan,
     render_human_check,
+    render_human_scan,
     scan_report_json,
 )
 
@@ -254,6 +256,7 @@ def test_scan_report_json_shape():
                 "cte_names": ["orders", "order_financials"],
                 "status": "merge_eligible",
                 "reason_codes": ["OK"],
+                "line": 1,
             },
             {
                 "model_unique_id": "model.p.items",
@@ -262,6 +265,7 @@ def test_scan_report_json_shape():
                 "cte_names": ["a", "b"],
                 "status": "not_eligible",
                 "reason_codes": ["DIFFERENT_PREDICATE", "PROJECTION_COLLISION"],
+                "line": 1,
             },
         ],
     }
@@ -297,3 +301,44 @@ def test_render_human_check_includes_diff_only_when_present():
 
 def test_render_human_check_empty_report():
     assert render_human_check(_report()) == ""
+
+
+def _finding(source_path, *, cte_names=("a", "b"), upstream="", line=1, codes=(ReasonCode.NEEDS_COMPILED_ANALYSIS,)):
+    return Finding(
+        model_unique_id="model.p.m",
+        source_path=source_path,
+        upstream_unique_id=upstream,
+        cte_names=cte_names,
+        status=FindingStatus.NEEDS_COMPILED_ANALYSIS,
+        reason_codes=codes,
+        line=line,
+    )
+
+
+def test_render_github_scan_escapes_properties_and_messages(tmp_path):
+    odd = tmp_path / "models" / "100%, a:b" / "m.sql"
+    report = ScanReport(
+        findings=(
+            _finding(odd, cte_names=('"50% off"', '"x\r\ny"'), upstream="model.p.stg", line=7),
+            _finding(tmp_path.parent / "elsewhere.sql", cte_names=(), codes=(ReasonCode.UNSUPPORTED_IMPORT_SHAPE,)),
+        )
+    )
+
+    lines = render_github_scan(report, base_dir=tmp_path).splitlines()
+
+    assert lines == [
+        "::warning file=models/100%25%2C a%3Ab/m.sql,line=7,title=dbt-refmerge%3A duplicate import CTEs"
+        '::CTEs "50%25 off", "x%0D%0Ay" import model.p.stg; run dbt-refmerge check to prove a merge',
+        f"::warning file={(tmp_path.parent / 'elsewhere.sql').as_posix()},line=1,title=dbt-refmerge%3A duplicate "
+        "import CTEs::several CTEs import the same relation in a shape dbt-refmerge cannot merge "
+        "(UNSUPPORTED_IMPORT_SHAPE)",
+    ]
+
+
+def test_render_human_scan_prints_project_relative_locations(tmp_path):
+    report = ScanReport(findings=(_finding(tmp_path / "models" / "m.sql", upstream="model.p.stg", line=4),))
+
+    assert render_human_scan(report, project_dir=tmp_path) == (
+        "models/m.sql:4: CTEs a, b import model.p.stg; run dbt-refmerge check to prove a merge\n"
+    )
+    assert render_human_scan(ScanReport(findings=()), project_dir=tmp_path) == ""

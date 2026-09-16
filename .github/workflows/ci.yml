@@ -52,6 +52,33 @@ jobs:
 
   # Every lane, including the warehouse lane against a Postgres service, with
   # coverage enforced by [tool.coverage.report] fail_under.
+  action:
+    # Runs the repository's own action (action.yml) against the sample project, installing this checkout.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - id: annotate
+        uses: $/
+        with:
+          package: .
+          project-dir: tests/fixtures/sample_project
+      - id: enforce
+        uses: $/
+        continue-on-error: true
+        with:
+          package: .
+          project-dir: tests/fixtures/sample_project
+          fail-on: finding
+      - name: One annotation, and fail-on finding fails the step
+        env:
+          FINDINGS: ${{ steps.annotate.outputs.findings }}
+          ENFORCED: ${{ steps.enforce.outcome }}
+        run: |
+          test "$FINDINGS" = 1
+          test "$ENFORCED" = failure
+
   coverage:
     runs-on: ubuntu-latest
     permissions:

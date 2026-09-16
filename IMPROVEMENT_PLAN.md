@@ -94,7 +94,7 @@ Items marked **Now** are implemented in this round, each with the tests or check
 - **Done when:** unit tests cover escaping of `%`, `:` and `,` in paths and messages, and the line numbers.
 
 **C3. Reusable GitHub Action.**
-- **What:** a composite `action.yml` in the repository root that installs dbt-refmerge at the requested version and runs `scan --format github` with a configurable project directory and adapter.
+- **What:** a composite `action.yml` in the repository root. It installs dbt-refmerge (a pip requirement, `dbt-refmerge` by default) into its own virtual environment, leaving the job's Python alone. It then runs `scan --format github` with a configurable project directory, adapter and `fail-on` (`never` by default, so it only annotates), and reports the number of leads as the `findings` output.
 - **Done when:** a CI job runs the action from the checkout against a sample project and checks the annotation output.
 
 **C4. `python -m dbt_refmerge`.**
