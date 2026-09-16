@@ -48,14 +48,15 @@ def make_project(tmp_path: Path) -> ProjectBuilder:
     def build(files: dict[str, str | bytes], *, name: str = "p", profile: str = "p") -> Path:
         root = tmp_path / "project"
         root.mkdir(exist_ok=True)
-        (root / "dbt_project.yml").write_text(f"name: {name}\nprofile: {profile}\n", encoding="utf-8")
+        # newline="": files hold exactly the given bytes on every platform (no \r\n on Windows).
+        (root / "dbt_project.yml").write_text(f"name: {name}\nprofile: {profile}\n", encoding="utf-8", newline="")
         for rel, content in files.items():
             path = root / rel
             path.parent.mkdir(parents=True, exist_ok=True)
             if isinstance(content, bytes):
                 path.write_bytes(content)
             else:
-                path.write_text(content, encoding="utf-8")
+                path.write_text(content, encoding="utf-8", newline="")
         return root
 
     return build

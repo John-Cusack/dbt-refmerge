@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from dbt_refmerge.config import FailOn
-from dbt_refmerge.domain import ReasonCode, VerificationStatus, is_fixable
+from dbt_refmerge.domain import ReasonCode, VerificationReceipt, VerificationStatus, is_fixable
 from dbt_refmerge.orchestrator import CheckReport, ScanReport
 
 
@@ -20,62 +20,61 @@ class ExitCode(IntEnum):
     INTERRUPTED = 130
 
 
-# Explicit severity table (never derived from enum ordering).
-_SEVERITY = {
-    ExitCode.OK: 0,
-    ExitCode.POLICY_FINDING: 1,
-    ExitCode.DIFFERENT: 2,
-    ExitCode.UNVERIFIABLE: 3,
-    ExitCode.OPERATIONAL_ERROR: 4,
+# Explicit severity tables (never derived from enum ordering). A result is classified by the most severe
+# --fail-on level it reaches; the same ranks order the --fail-on thresholds.
+_SEVERITY: dict[FailOn, int] = {
+    FailOn.FINDING: 1,
+    FailOn.FIXABLE: 2,
+    FailOn.DIFFERENT: 3,
+    FailOn.UNVERIFIABLE: 4,
+}
+_EXIT_CODE: dict[FailOn, ExitCode] = {
+    FailOn.FINDING: ExitCode.POLICY_FINDING,
+    FailOn.FIXABLE: ExitCode.POLICY_FINDING,
+    FailOn.DIFFERENT: ExitCode.DIFFERENT,
+    FailOn.UNVERIFIABLE: ExitCode.UNVERIFIABLE,
+}
+_STATUS_LEVEL: dict[VerificationStatus, FailOn] = {
+    VerificationStatus.SNAPSHOT_EQUIVALENT: FailOn.FIXABLE,
+    VerificationStatus.DIFFERENT: FailOn.DIFFERENT,
+    VerificationStatus.UNVERIFIABLE: FailOn.UNVERIFIABLE,
+    VerificationStatus.ERROR: FailOn.UNVERIFIABLE,
 }
 
 JSON_SCHEMA_VERSION = "1"
 
 
+def _result_level(receipt: VerificationReceipt) -> FailOn | None:
+    """The --fail-on level a result reaches, or None when the model has nothing to report."""
+    if receipt.status == VerificationStatus.NOT_RUN:
+        return None if receipt.reason_codes == (ReasonCode.NO_DUPLICATE_IMPORT,) else FailOn.FINDING
+    return _STATUS_LEVEL[receipt.status]
+
+
 def evaluate_exit_code_for_check(report: CheckReport, fail_on: FailOn) -> ExitCode:
+    """Exit code for ``check``: ``fail_on`` is the minimum result severity that fails the run.
+
+    Results are ranked finding < fixable < different < unverifiable. ``--fail-on X`` fails the run when
+    any result ranks at or above X, and ``--fail-on never`` never fails it. A failing run exits with the
+    code of its most severe result, so a lesser result can never mask a greater one:
+
+    ==========================================  =====  =======  =======  =========  ============
+    result                                      never  finding  fixable  different  unverifiable
+    ==========================================  =====  =======  =======  =========  ============
+    not_run with only NO_DUPLICATE_IMPORT       0      0        0        0          0
+    not_run with any other reason (finding)     0      2        0        0          0
+    snapshot_equivalent (fixable)               0      2        2        0          0
+    different                                   0      3        3        3          0
+    unverifiable or error                       0      4        4        4          4
+    ==========================================  =====  =======  =======  =========  ============
+    """
     if fail_on == FailOn.NEVER:
         return ExitCode.OK
-    worst = ExitCode.OK
-    for result in report.results:
-        receipt = result.receipt
-        code = ExitCode.OK
-        if receipt.status == VerificationStatus.DIFFERENT:
-            code = ExitCode.DIFFERENT
-        elif receipt.status in (VerificationStatus.UNVERIFIABLE, VerificationStatus.ERROR):
-            code = ExitCode.UNVERIFIABLE
-        elif receipt.status == VerificationStatus.SNAPSHOT_EQUIVALENT:
-            if fail_on in (FailOn.FINDING, FailOn.FIXABLE, FailOn.DIFFERENT, FailOn.UNVERIFIABLE):
-                # fixable finding triggers policy when fail_on <= FIXABLE
-                code = ExitCode.POLICY_FINDING if fail_on in (FailOn.FINDING, FailOn.FIXABLE) else ExitCode.OK
-            else:
-                code = ExitCode.OK
-        elif receipt.status == VerificationStatus.NOT_RUN:
-            has_finding = receipt.reason_codes != (ReasonCode.NO_DUPLICATE_IMPORT,)
-            if has_finding and fail_on == FailOn.FINDING:
-                code = ExitCode.POLICY_FINDING
-            else:
-                code = ExitCode.OK
-        # fail_on gates
-        if fail_on == FailOn.FIXABLE and receipt.status == VerificationStatus.DIFFERENT:
-            code = ExitCode.DIFFERENT  # still surfaces
-        if _SEVERITY[code] > _SEVERITY[worst]:
-            # apply fail_on filter: DIFFERENT only fails when fail_on == DIFFERENT or stricter?
-            # Spec: fail_on controls policy findings without changing operational-error meanings.
-            # DIFFERENT always surfaces as 3; UNVERIFIABLE as 4 when policy requires verification.
-            worst = code
-    # filter by fail_on level
-    if fail_on == FailOn.FINDING:
-        return worst
-    if fail_on == FailOn.FIXABLE:
-        if worst == ExitCode.POLICY_FINDING:
-            return worst
-        # DIFFERENT/UNVERIFIABLE still reported
-        return worst if worst in (ExitCode.DIFFERENT, ExitCode.UNVERIFIABLE) else ExitCode.OK
-    if fail_on == FailOn.DIFFERENT:
-        return worst if worst == ExitCode.DIFFERENT else ExitCode.OK
-    if fail_on == FailOn.UNVERIFIABLE:
-        return worst if worst == ExitCode.UNVERIFIABLE else ExitCode.OK
-    return worst
+    levels = [level for result in report.results if (level := _result_level(result.receipt)) is not None]
+    worst = max(levels, key=_SEVERITY.__getitem__, default=None)
+    if worst is None or _SEVERITY[worst] < _SEVERITY[fail_on]:
+        return ExitCode.OK
+    return _EXIT_CODE[worst]
 
 
 def check_report_json(
@@ -147,7 +146,7 @@ def check_report_json(
         },
         "summary": counts,
         "models": models,
-        "cleanup": {"complete": True, "objects": []},
+        "cleanup": {"complete": all(r.receipt.cleanup_complete for r in report.results), "objects": []},
     }
 
 

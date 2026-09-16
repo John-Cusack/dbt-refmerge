@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import shlex
 import tomllib
 from dataclasses import dataclass
 from decimal import Decimal
@@ -42,11 +43,6 @@ class AppConfig(BaseModel):
 
     model_config = ConfigDict(frozen=True)
 
-    @field_validator("project_dir", mode="before")
-    @classmethod
-    def _coerce_project_dir(cls, v: Any) -> Any:
-        return Path(v) if not isinstance(v, Path) else v
-
     @field_validator("subprocess_timeout_seconds", "warehouse_statement_timeout_ms", "warehouse_lock_timeout_ms")
     @classmethod
     def _positive(cls, v: int) -> int:
@@ -71,6 +67,8 @@ class CompilationContext:
 
 
 _SECRET_HINTS = ("secret", "password", "token", "key")
+_ENV_PREFIX = "DBT_REFMERGE_"
+_ENV_BOOL_FIELDS = ("keep_workspace", "allow_compile_introspection", "json_output", "debug")
 
 
 def is_secret_name(name: str) -> bool:
@@ -78,68 +76,62 @@ def is_secret_name(name: str) -> bool:
     return any(h in lowered for h in _SECRET_HINTS)
 
 
-def redact_mapping(mapping: dict[str, str]) -> dict[str, str]:
-    return {k: ("***" if is_secret_name(k) else v) for k, v in mapping.items()}
-
-
 def _check_external_string(value: str, field: str, max_len: int = 1024) -> str:
-    if "\x00" in value or any(ord(c) < 32 and c not in ("\t",) for c in value):
+    if any(ord(c) < 32 and c != "\t" for c in value):
         raise ValueError(f"{field} contains NUL/control characters")
     if len(value) > max_len:
         raise ValueError(f"{field} exceeds length limit")
     return value
 
 
+def _read_toml(path: Path) -> dict[str, Any]:
+    """Settings from ``[tool.dbt-refmerge]`` when the file has that table, else its top-level keys.
+
+    A ``tool`` entry that is not a table, or has no ``dbt-refmerge`` key, belongs to another tool and
+    means "no tool table". A ``tool.dbt-refmerge`` entry that is not a table is refused.
+    """
+    if not path.is_file():
+        return {}
+    with path.open("rb") as fh:
+        raw = tomllib.load(fh)
+    tool = raw.get("tool")
+    if not isinstance(tool, dict) or "dbt-refmerge" not in tool:
+        return raw
+    section = tool["dbt-refmerge"]
+    if not isinstance(section, dict):
+        raise ValueError(f"{path}: [tool.dbt-refmerge] must be a table")
+    return section
+
+
 def load_config(
     project_dir: Path | str = ".",
     cli_overrides: dict[str, Any] | None = None,
 ) -> AppConfig:
-    """Load config with precedence: CLI overrides > env > .dbt-refmerge.toml > defaults."""
+    """Load config with precedence: CLI overrides > env > .dbt-refmerge.toml > defaults.
+
+    ``DBT_REFMERGE_<FIELD>`` sets ``<field>``. A ``dbt_command`` given as a string, in the environment or
+    the TOML file, is split like a POSIX shell would (``shlex.split``), so quote paths containing spaces.
+    Every invalid configuration raises ``ValueError`` (pydantic's ``ValidationError`` and
+    ``tomllib.TOMLDecodeError`` are subclasses of it).
+    """
     root = Path(project_dir)
-    file_values: dict[str, Any] = {}
-    toml_path = root / ".dbt-refmerge.toml"
-    if toml_path.is_file():
-        with toml_path.open("rb") as fh:
-            raw = tomllib.load(fh)
-        if isinstance(raw, dict):
-            tool = raw.get("tool", {}).get("dbt-refmerge", raw)
-            if isinstance(tool, dict):
-                file_values = dict(tool)
-
-    env_values: dict[str, Any] = {}
-    prefix = "DBT_REFMERGE_"
-    for key, val in os.environ.items():
-        if not key.startswith(prefix):
-            continue
-        field = key[len(prefix) :].lower()
-        env_values[field] = val
-
     merged: dict[str, Any] = {"project_dir": str(root)}
-    merged.update(file_values)
-    # env keys are lowercase field names; coerce numerics/bools
-    for k, v in env_values.items():
-        if k in (
-            "subprocess_timeout_seconds",
-            "warehouse_statement_timeout_ms",
-            "warehouse_lock_timeout_ms",
-        ):
-            try:
-                merged[k] = int(v)
-            except ValueError:
-                merged[k] = v
-        elif k in ("keep_workspace", "allow_compile_introspection", "json_output", "debug"):
-            merged[k] = str(v).lower() in ("1", "true", "yes")
-        elif k == "dbt_command":
-            merged[k] = tuple(str(v).split())
-        else:
-            merged[k] = v
+    merged.update(_read_toml(root / ".dbt-refmerge.toml"))
+    for key, value in os.environ.items():
+        if not key.startswith(_ENV_PREFIX):
+            continue
+        field = key[len(_ENV_PREFIX) :].lower()
+        # Numbers stay strings: pydantic parses them and names the field when it cannot.
+        merged[field] = value.lower() in ("1", "true", "yes") if field in _ENV_BOOL_FIELDS else value
     if cli_overrides:
         merged.update({k: v for k, v in cli_overrides.items() if v is not None})
 
-    if "dbt_command" in merged and isinstance(merged["dbt_command"], list):
-        merged["dbt_command"] = tuple(merged["dbt_command"])
-    if "dbt_command" in merged and isinstance(merged["dbt_command"], str):
-        merged["dbt_command"] = tuple(merged["dbt_command"].split())
+    command = merged.get("dbt_command")
+    if isinstance(command, str):
+        try:
+            merged["dbt_command"] = tuple(shlex.split(command))
+        except ValueError as exc:
+            raise ValueError(f"dbt_command: {exc}") from None
 
     config = AppConfig(**merged)
     # validate external strings
@@ -159,10 +151,12 @@ def load_config(
         raise ValueError("project_dir must not be an untrusted final symlink")
     object.__setattr__(config, "project_dir", resolved)
     _check_external_string(str(resolved), "project_dir", 4096)
+    # dbt runs inside a snapshot, not the caller's working directory, so hand it an absolute profiles dir.
+    # dbt resolves a relative DBT_PROFILES_DIR against its working directory, i.e. the project root.
+    profiles_dir = config.profiles_dir
+    env_profiles_dir = os.environ.get("DBT_PROFILES_DIR")
+    if profiles_dir is None and env_profiles_dir:
+        profiles_dir = resolved / env_profiles_dir
+    if profiles_dir is not None:
+        object.__setattr__(config, "profiles_dir", profiles_dir.resolve())
     return config
-
-
-def require_scratch_schema(config: AppConfig) -> str:
-    if not config.scratch_schema:
-        raise ValueError("scratch_schema is required for check/fix")
-    return config.scratch_schema

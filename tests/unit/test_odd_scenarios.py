@@ -8,7 +8,7 @@ from dbt_refmerge.adapters import spec_for_dialect
 from dbt_refmerge.analyze import FindingStatus, group_imports, qualify_group
 from dbt_refmerge.artifacts import DependsOnModel, ManifestMetadataModel, ManifestNodeModel, ManifestView
 from dbt_refmerge.domain import ReasonCode
-from dbt_refmerge.errors import RewriteError, SourceParseError
+from dbt_refmerge.errors import RewriteError, SemanticError, SourceParseError
 from dbt_refmerge.orchestrator import detect_source_duplicates
 from dbt_refmerge.rewrite import apply_edits, build_plan
 from dbt_refmerge.semantics import analyze_volatility, match_source_ctes, parse_model
@@ -1002,3 +1002,159 @@ def test_build_plan_refuses_ineligible_group():
     with pytest.raises(RewriteError) as exc_info:
         build_plan(raw_bytes, owner.unique_id, Path("m.sql"), (qualified,), source)
     assert exc_info.value.reason_code is ReasonCode.DIFFERENT_PREDICATE
+
+
+_DRIFT_FINAL = "final as (select a.customer_id, b.amount from a join b using (id))\nselect * from final"
+
+
+@pytest.mark.parametrize(
+    ("compiled", "reason", "message"),
+    [
+        (_compiled(_DRIFT_FINAL, b_name="c"), ReasonCode.SOURCE_MAPPING_AMBIGUOUS, "no compiled CTE for b"),
+        (
+            _compiled(_DRIFT_FINAL, b_where=" group by id, amount"),
+            ReasonCode.UNSUPPORTED_IMPORT_SHAPE,
+            "import shape unsupported for b: ('group',)",
+        ),
+        (
+            _compiled(_DRIFT_FINAL, b_projection="id, amount, status"),
+            ReasonCode.SOURCE_MAPPING_AMBIGUOUS,
+            "projection count drift for b",
+        ),
+        (
+            _compiled(_DRIFT_FINAL, b_projection="stg.id as id, amount"),
+            ReasonCode.SOURCE_MAPPING_AMBIGUOUS,
+            "qualified projection",
+        ),
+        (
+            _compiled(_DRIFT_FINAL, b_projection="stg.id, amount"),
+            ReasonCode.SOURCE_MAPPING_AMBIGUOUS,
+            "qualified projection",
+        ),
+        (
+            _compiled(_DRIFT_FINAL, b_projection="1 as id, amount"),
+            ReasonCode.SOURCE_MAPPING_AMBIGUOUS,
+            "non-column projection",
+        ),
+        (
+            _compiled(_DRIFT_FINAL, b_projection="id, null"),
+            ReasonCode.SOURCE_MAPPING_AMBIGUOUS,
+            "unexpected projection node",
+        ),
+        (
+            _compiled(_DRIFT_FINAL, b_projection="idx as id, amount"),
+            ReasonCode.SOURCE_MAPPING_AMBIGUOUS,
+            "upstream drift for b",
+        ),
+        (
+            _compiled(_DRIFT_FINAL, b_projection="id as ident, amount"),
+            ReasonCode.SOURCE_MAPPING_AMBIGUOUS,
+            "output drift for b",
+        ),
+        (
+            _compiled(_DRIFT_FINAL, b_where=" where amount > 0"),
+            ReasonCode.SOURCE_MAPPING_AMBIGUOUS,
+            "predicate presence drift for b",
+        ),
+    ],
+    ids=[
+        "renamed-cte",
+        "added-group-by",
+        "added-projection",
+        "qualified-aliased-projection",
+        "qualified-projection",
+        "literal-aliased-projection",
+        "literal-projection",
+        "different-upstream-column",
+        "different-output-name",
+        "added-where",
+    ],
+)
+def test_compiled_import_drift_refuses(compiled, reason, message):
+    # The compiled SQL must be the source with each ref() resolved; anything else is not the same import.
+    source = parse_source_model(_source(_DRIFT_FINAL).encode())
+    view, owner = _manifest_for_refs()
+    imports = tuple(cte for cte in source.ctes if cte.ref_call is not None)
+    with pytest.raises(SemanticError) as exc_info:
+        match_source_ctes(imports, parse_model(compiled), view, owner)
+    assert (exc_info.value.reason_code, exc_info.value.message) == (reason, message)
+
+
+def test_match_source_ctes_ignores_non_import_ctes():
+    source = parse_source_model(_source(_DRIFT_FINAL).encode())
+    view, owner = _manifest_for_refs()
+    matched = match_source_ctes(source.ctes, parse_model(_compiled(_DRIFT_FINAL)), view, owner)
+    assert [cte.identifier.value for cte in source.ctes] == ["a", "b", "final"]
+    assert [(m.semantic.cte_identity.value, m.upstream_unique_id, m.semantic.relation) for m in matched] == [
+        ("a", "model.p.stg", ("db", "sch", "stg")),
+        ("b", "model.p.stg", ("db", "sch", "stg")),
+    ]
+
+
+def test_match_source_ctes_duplicate_semantic_match():
+    source = parse_source_model(_source(_DRIFT_FINAL).encode())
+    view, owner = _manifest_for_refs()
+    imports = tuple(cte for cte in source.ctes if cte.ref_call is not None)
+    with pytest.raises(SemanticError) as exc_info:
+        match_source_ctes((*imports, imports[0]), parse_model(_compiled(_DRIFT_FINAL)), view, owner)
+    assert (exc_info.value.reason_code, exc_info.value.message) == (
+        ReasonCode.SOURCE_MAPPING_AMBIGUOUS,
+        "duplicate semantic match a",
+    )
+
+
+def test_group_imports_drops_single_member_upstream():
+    raw = (
+        "with a as (select id from {{ ref('stg') }}), "
+        "c as (select customer_id from {{ ref('customers') }}), "
+        "b as (select id from {{ ref('stg') }}) "
+        "select b.id, c.customer_id from b join c on true"
+    )
+    compiled = raw.replace("{{ ref('stg') }}", "db.sch.stg").replace("{{ ref('customers') }}", "db.sch.customers")
+    view, owner = _manifest_for_two_refs()
+    source = parse_source_model(raw.encode())
+    matched = match_source_ctes(source.ctes, parse_model(compiled), view, owner)
+    groups = group_imports(list(matched), owner.unique_id)
+    assert [
+        (g.model_unique_id, g.upstream_unique_id, [m.semantic.cte_identity.value for m in g.imports]) for g in groups
+    ] == [("model.p.m", "model.p.stg", ["a", "b"])]
+
+
+@pytest.mark.parametrize(
+    ("a_projection", "b_projection"),
+    [
+        ("amount as x,\n        amount as y", "customer_id as x,\n        customer_id as y"),
+        ("id as x,\n        id as x", "id as x"),
+    ],
+    ids=["two-cross-member-collisions", "same-upstream-duplicate-output"],
+)
+def test_projection_collision_reported_once(a_projection, b_projection):
+    final = "select a.x from a join b on true"
+    raw = _source(final, a_projection=a_projection, b_projection=b_projection)
+    compiled = _compiled(
+        final,
+        a_projection=a_projection.replace(",\n        ", ", "),
+        b_projection=b_projection.replace(",\n        ", ", "),
+    )
+    *_unused, qualified = _qualified(raw, compiled)
+    assert qualified.status is FindingStatus.NOT_ELIGIBLE
+    assert qualified.reason_codes == (ReasonCode.PROJECTION_COLLISION,)
+
+
+@pytest.mark.parametrize("newline", ["\n", "\r\n"], ids=["lf", "crlf"])
+def test_whitespace_only_line_after_donor_is_collapsed(newline):
+    final = "final as (select b.id from b)\nselect b.id from final"
+    raw = _source(final).replace("),\nfinal", "),\n  \t\nfinal").replace("\n", newline)
+    candidate = _candidate(raw, _compiled(final.replace("\n", " ")))
+    expected = (
+        "with a as (\n"
+        "    select\n"
+        "        id,\n"
+        "        customer_id,\n"
+        "        amount\n"
+        "    from {{ ref('stg') }}\n"
+        "),\n"
+        "final as (select b.id from a as b)\n"
+        "select b.id from final\n"
+    ).replace("\n", newline)
+    assert candidate == expected.encode()

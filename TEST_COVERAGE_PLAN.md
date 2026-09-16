@@ -31,7 +31,7 @@ Measured 2026-09-16 on `acf0184` (the PR #4 branch; production code matches `mai
 | 0 | done | #5 | 61.2% (`fail_under = 61`) |
 | 1 | done (option A) | — | — |
 | 2 | done: B2–B7, S1–S11 | #6 | 71.3% (`fail_under = 71`) |
-| 3 | not started | | |
+| 3 | done: unit lane for reporting, config, errors, domain, analyze, rewrite, semantics, source, artifacts, adapters, workspace, apply | #7 | 85% (`fail_under = 85`) |
 | 4 | not started | | |
 | 5 | not started | | |
 
@@ -50,6 +50,30 @@ Discrepancies found while implementing:
   - The lock file is opened with `O_NOFOLLOW`, never truncated, and removed afterwards (before closing on POSIX, after closing on Windows).
   - The source is re-hashed unconditionally before `os.replace`.
 - **Phase 2, S11:** the launch-failure `DbtError` also carried an unredacted argv; now fixed.
+- **Phase 3, work split:** five parallel agents, one per module group, then integrated with reviewer fixes. Every module named in §6.1–§6.4 is at 100% line and branch coverage in the unit lane.
+- **Phase 3, `--fail-on` semantics:** `fail_on` is now the minimum failing severity, ordered finding < fixable < different < unverifiable. So `--fail-on unverifiable` with a `different` result exits 0, contrary to the second example in §2.3. `--fail-on different` now exits 4 when an unverifiable result is present.
+- **Phase 3, fixes found beyond the plan:**
+  - **Artifacts:** manifests that are missing, not UTF-8, deeply nested, or have over-long integers raise `ArtifactError`. So do non-object nodes and sources, a node whose key differs from its `unique_id`, and `refs`/`sources` metadata that contradicts every candidate.
+  - **Adapters:** profiles resolve like dbt: `DBT_PROFILES_DIR`, then `./profiles.yml`, then `~/.dbt`; the target defaults to `default`; `profiles.yaml` is not read.
+  - **Workspace:**
+    - `target`, `logs`, `.git`, `node_modules`, `.venv` and `venv` are pruned only at the project root.
+    - `dbt_packages` is copied.
+    - Linked directories and symlink loops are refused.
+    - `cleanup_files` reports failures, and `check` tolerates a leftover local temp dir.
+  - **Config:** `dbt_command` strings use `shlex.split`. Relative `--profiles-dir` and `DBT_PROFILES_DIR` are resolved up front.
+  - **Semantics:** the volatility allowlist is wired in (deterministic, aggregate and STABLE functions pass; volatile, order-sensitive and unknown functions refuse), and non-RANGE/GROUPS window frames refuse.
+  - **Source:** clauses after `WHERE` clear the import shape. Nested CTE shadowing is now detected everywhere; before, a donor referenced through a nested CTE of the same name could be merged and pass the delta gate. Unknown call kwargs and expression projections are no longer literal imports.
+- **Phase 3, pragma budget (§7) changes:**
+  - Added `# pragma: >=3.12 cover` / `<3.12 cover` for the `rmtree` callback split.
+  - `orchestrator.py` now has four win32 pragmas (S9 added one).
+  - `semantics.py` 192 is tested instead of excluded.
+  - Two rewrite separator guards stay typed refusals with `# pragma: no cover` rather than asserts, because asserts vanish under `-O` and abort the run.
+- **Phase 3, known gaps left for later:**
+  - Jinja strings containing `}}` or `%}` end a tag early (the delta gate catches the result).
+  - `{%- raw %}` is not recognized.
+  - Sentinel-looking names (`__r1__`) in user SQL can create false `scan` leads (S7 catches them in `check`).
+  - `version=0` or `''` counts as versioned.
+  - Local `dbt deps` packages installed as symlinks are refused by the snapshot.
 
 ## 1. Where coverage stands
 

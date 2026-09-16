@@ -23,12 +23,15 @@ from dbt_refmerge.errors import SemanticError
 COMPARATOR_VERSION = "1"
 SEMANTIC_FINGERPRINT_VERSION = "2"
 
+# Function names are lowercase; they match a call's own name and sqlglot's normalized name for it,
+# compared without underscores (sqlglot parses gen_random_uuid() as Uuid and string_agg as GroupConcat).
 VOLATILE_FUNCTIONS = frozenset(
     {
         "random",
         "rand",
         "setseed",
         "gen_random_uuid",
+        "uuid",
         "uuid_generate_v1",
         "uuid_generate_v4",
         "uuid_generate_v1mc",
@@ -36,59 +39,12 @@ VOLATILE_FUNCTIONS = frozenset(
         "nextval",
         "currval",
         "lastval",
-        "now",
         "clock_timestamp",
         "statement_timestamp",
         "transaction_timestamp",
         "timeofday",
         "pg_sleep",
         "txid_current",
-    }
-)
-_VOLATILE_FLAT = frozenset(v.replace("_", "") for v in VOLATILE_FUNCTIONS)
-
-# Conservative deterministic allowlist (unqualified names, lowercase).
-DETERMINISTIC_FUNCTIONS = frozenset(
-    {
-        "abs",
-        "ceil",
-        "ceiling",
-        "floor",
-        "round",
-        "trunc",
-        "power",
-        "sqrt",
-        "exp",
-        "ln",
-        "log",
-        "coalesce",
-        "nullif",
-        "greatest",
-        "least",
-        "lower",
-        "upper",
-        "trim",
-        "btrim",
-        "ltrim",
-        "rtrim",
-        "substring",
-        "substr",
-        "replace",
-        "concat",
-        "concat_ws",
-        "length",
-        "char_length",
-        "strpos",
-        "split_part",
-        "to_char",
-        "to_number",
-        "to_timestamp",
-        "to_date",
-        "date_part",
-        "date_trunc",
-        "extract",
-        "cast",
-        "case",
     }
 )
 
@@ -104,11 +60,77 @@ ORDER_SENSITIVE_FUNCTIONS = frozenset(
         "nth_value",
         "array_agg",
         "string_agg",
+        "group_concat",
         "json_agg",
+        "json_array_agg",
         "jsonb_agg",
     }
 )
-_ORDER_SENSITIVE_FLAT = frozenset(v.replace("_", "") for v in ORDER_SENSITIVE_FUNCTIONS)
+_REFUSED_FLAT = frozenset(v.replace("_", "") for v in VOLATILE_FUNCTIONS | ORDER_SENSITIVE_FUNCTIONS)
+
+# Allowlist of sqlglot function classes (exact class names, not SQL spellings) whose result depends only
+# on their arguments, or is STABLE: fixed for one statement, which is all the single-statement
+# baseline/candidate comparison needs. Judged for PostgreSQL, the only adapter that verifies.
+# Calls sqlglot does not recognize (exp.Anonymous: UDFs, schema-qualified calls) are never allowlisted.
+DETERMINISTIC_FUNCTIONS = frozenset(
+    {
+        # math: abs, ceil/ceiling, floor, round, trunc, power/^, sqrt, exp, ln, log
+        "Abs",
+        "Ceil",
+        "Floor",
+        "Round",
+        "Trunc",
+        "Pow",
+        "Sqrt",
+        "Exp",
+        "Ln",
+        "Log",
+        # null handling, conditionals (CASE WHEN parses as Case holding If nodes), boolean connectives
+        "Coalesce",
+        "Nullif",
+        "Greatest",
+        "Least",
+        "Case",
+        "If",
+        "And",
+        "Or",
+        # strings: lower, upper, trim/btrim/ltrim/rtrim, substring/substr, replace, concat, concat_ws,
+        # length/char_length, strpos/position, split_part
+        "Lower",
+        "Upper",
+        "Trim",
+        "Substring",
+        "Replace",
+        "Concat",
+        "ConcatWs",
+        "Length",
+        "StrPosition",
+        "SplitPart",
+        # conversion and dates: cast/::, to_char, to_number, to_timestamp(text, fmt), to_timestamp(epoch),
+        # to_date, date_part/extract, date_trunc (TimestampTrunc; DateTrunc in some dialects)
+        "Cast",
+        "TimeToStr",
+        "ToNumber",
+        "StrToTime",
+        "UnixToTime",
+        "StrToDate",
+        "Extract",
+        "TimestampTrunc",
+        "DateTrunc",
+        # order-insensitive aggregates (window frames are checked separately)
+        "Count",
+        "Sum",
+        "Min",
+        "Max",
+        "Avg",
+        # STABLE within a statement: now()/current_timestamp, current_date, current_time, localtimestamp, localtime
+        "CurrentTimestamp",
+        "CurrentDate",
+        "CurrentTime",
+        "Localtimestamp",
+        "Localtime",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -150,8 +172,26 @@ def _alias_name_and_quoted(alias_expr: Any) -> tuple[str, bool]:
     identifier = alias_expr.args.get("this") if hasattr(alias_expr, "args") else None
     if isinstance(identifier, exp.Identifier):
         return identifier.name, bool(identifier.args.get("quoted"))
-    name = alias_expr.name if hasattr(alias_expr, "name") else str(alias_expr)
-    return str(name), False
+    # sqlglot's parser always wraps a CTE alias in an Identifier; this only guards an API change.
+    name = alias_expr.name if hasattr(alias_expr, "name") else str(alias_expr)  # pragma: no cover
+    return str(name), False  # pragma: no cover
+
+
+def _top_level_with(tree: Any) -> Any:
+    # sqlglot>=~27 stores top-level CTEs under "with_"; older versions (26.x) use "with".
+    top_with = tree.args.get("with_")
+    if top_with is None:
+        top_with = tree.args.get("with")
+    return top_with
+
+
+def _cte_identity(cte: Any, fold: str) -> str:
+    """Normalized name of a CTE; empty when it has none (a zero-length quoted name such as ``""``)."""
+    alias_expr = cte.args.get("alias")
+    if alias_expr is None:  # pragma: no cover -- sqlglot's parser gives every CTE a TableAlias
+        return ""
+    alias_name, quoted = _alias_name_and_quoted(alias_expr)
+    return _normalize_ident(alias_name, quoted, fold)
 
 
 def parse_model(sql: str, dialect: str = "postgres") -> ParsedModel:
@@ -173,58 +213,20 @@ def parse_model(sql: str, dialect: str = "postgres") -> ParsedModel:
         raise SemanticError(ReasonCode.INTERNAL_ERROR, "unexpected semicolon node")
     if not isinstance(tree, (exp.Select, exp.Union, exp.Query)):
         raise SemanticError(ReasonCode.INTERNAL_ERROR, f"non-embeddable compiled root: {type(tree).__name__}")
-    if tree.find(exp.Semicolon) is not None:
+    # sqlglot's parser splits statements before building nodes, so none can sit inside the root.
+    if tree.find(exp.Semicolon) is not None:  # pragma: no cover
         raise SemanticError(ReasonCode.INTERNAL_ERROR, "terminal second statement")
     ctes: dict[str, Any] = {}
-    # sqlglot>=~26 stores top-level CTEs under "with_"; older versions use "with".
-    top_with = tree.args.get("with_")
-    if top_with is None:
-        top_with = tree.args.get("with")
+    top_with = _top_level_with(tree)
     scope_ctes: list[Any] = []
     if top_with is not None:
         scope_ctes = top_with.args.get("expressions", []) or []
     for cte in scope_ctes:
-        alias_expr = cte.args.get("alias")
-        if alias_expr is None:
-            continue
-        alias_name, quoted = _alias_name_and_quoted(alias_expr)
-        if not alias_name:
-            continue
-        ident = _normalize_ident(alias_name, quoted, _fold_for_dialect(dialect))
-        ctes[ident] = cte
+        ident = _cte_identity(cte, _fold_for_dialect(dialect))
+        if ident:
+            ctes[ident] = cte
     return ParsedModel(sql=stripped, dialect=dialect, tree=tree, ctes=ctes)
 
-
-_ALLOWED_PROJECTION_NODES = frozenset(
-    {
-        "Select",
-        "Column",
-        "Identifier",
-        "Alias",
-        "From",
-        "Table",
-        "Where",
-        "EQ",
-        "NEQ",
-        "GT",
-        "GTE",
-        "LT",
-        "LTE",
-        "And",
-        "Or",
-        "Not",
-        "Paren",
-        "Boolean",
-        "Literal",
-        "Null",
-        "Is",
-        "In",
-        "Between",
-        "Cast",
-        "Case",
-        "Star",
-    }
-)
 
 # Strict import allowlist: only these classes may appear inside an import CTE body.
 _IMPORT_ALLOWED = frozenset(
@@ -263,10 +265,6 @@ def _iter_nodes(node: Any) -> Any:
     """Yield expression nodes across sqlglot walk API variants (bare or tuple)."""
     for item in node.walk(bfs=False):
         yield item[0] if isinstance(item, tuple) else item
-
-
-def _walk_types(node: Any) -> list[str]:
-    return [type(n).__name__ for n in _iter_nodes(node)]
 
 
 def qualify_import_cte(cte_expr: Any) -> Qualification:
@@ -351,8 +349,9 @@ def qualify_import_cte(cte_expr: Any) -> Qualification:
             reason_codes=(ReasonCode.UNSUPPORTED_IMPORT_SHAPE,),
             unexpected_nodes=("MissingFrom",),
         )
+    # A second relation needs a Join, Subquery, Lateral or similar node, all refused above.
     tables = list(inner.find_all(exp.Table))
-    if len(tables) != 1:
+    if len(tables) != 1:  # pragma: no cover
         return Qualification(
             ok=False,
             reason_codes=(ReasonCode.UNSUPPORTED_IMPORT_SHAPE,),
@@ -362,9 +361,7 @@ def qualify_import_cte(cte_expr: Any) -> Qualification:
 
 
 def _canonical(node: Any, fold: str = "lower") -> Any:
-    """Versioned canonical serializer: tuple form without positions/comments."""
-    if node is None:
-        return None
+    """Versioned canonical serializer: tuple form without positions or comments (sqlglot keeps both off args)."""
     if isinstance(node, list):
         return tuple(_canonical(v, fold) for v in node)
     if isinstance(node, exp.Expression):
@@ -373,16 +370,13 @@ def _canonical(node: Any, fold: str = "lower") -> Any:
         for k, v in node.args.items():
             # An unset arg and an explicit None/[] generate identical SQL; the parser fills some
             # (e.g. TableAlias.columns) that synthesized nodes omit, so neither may affect the hash.
-            if k in ("comments", "meta") or v is None or v == []:
+            if v is None or v == []:
                 continue
             args[k] = _canonical(v, fold)
         if isinstance(node, exp.Identifier):
             quoted = bool(node.args.get("quoted"))
             nm = node.name
             args = {"this": _normalize_ident(nm, quoted, fold), "quoted": quoted}
-        if isinstance(node, exp.Column):
-            # normalize unquoted parts
-            pass
         if isinstance(node, exp.Literal):
             args = {"this": node.this, "is_string": node.is_string}
         return (name, tuple(sorted(args.items())))
@@ -438,12 +432,11 @@ def match_source_ctes(
         # resolve upstream
         rc = scte.ref_call
         upstream = resolve_literal_ref(manifest, owner, rc.kind, rc.package, rc.name, rc.source_name)
-        # confirm single input relation
+        # qualify_import_cte accepted it: a Select reading exactly one relation
         inner = compiled.args.get("this")
         assert isinstance(inner, exp.Select)
         tables = list(inner.find_all(exp.Table))
-        if len(tables) != 1:
-            raise SemanticError(ReasonCode.UNSUPPORTED_IMPORT_SHAPE, "compiled import must read one relation")
+        assert len(tables) == 1
         relation = tuple(
             _normalize_ident(part.name, bool(part.args.get("quoted")), fold)
             for part in (tables[0].args.get(key) for key in ("catalog", "db", "this"))
@@ -534,53 +527,34 @@ class VolatilityResult:
     unknown_functions: tuple[str, ...]
 
 
-def analyze_volatility(parsed: ParsedModel, deterministic_allowlist: frozenset[str] = frozenset()) -> VolatilityResult:
-    func_names: list[str] = []
-    for n in _iter_nodes(parsed.tree):
-        if isinstance(n, exp.Anonymous):
-            fname = str(n.this).lower() if n.this else "anonymous"
-            func_names.append(fname)
-        elif isinstance(n, exp.Func):
-            func_names.append(type(n).__name__.lower())
-            # also capture sql name
-            try:
-                sql_name = n.sql_name().lower()
-                if sql_name not in func_names:
-                    func_names.append(sql_name)
-            except Exception:  # noqa: S112 -- best-effort display name only
-                continue
-    allow = {a.lower() for a in deterministic_allowlist}
-    unknown: list[str] = []
-    for fn in func_names:
-        base = fn.split(".")[-1].lower()
-        flat = base.replace("_", "")
-        if base in VOLATILE_FUNCTIONS or flat in _VOLATILE_FLAT:
-            return VolatilityResult(ok=False, reason_codes=(ReasonCode.NONDETERMINISTIC,), unknown_functions=(fn,))
-        if base in ORDER_SENSITIVE_FUNCTIONS or flat in _ORDER_SENSITIVE_FLAT:
-            return VolatilityResult(ok=False, reason_codes=(ReasonCode.NONDETERMINISTIC,), unknown_functions=(fn,))
-        if base in allow or flat in allow:
+def analyze_volatility(parsed: ParsedModel) -> VolatilityResult:
+    """Refuse a model whose rows one statement comparing baseline and candidate cannot pin down."""
+    unknown: set[str] = set()
+    for node in _iter_nodes(parsed.tree):
+        if not isinstance(node, exp.Func):
             continue
-        # known sqlglot function classes that are deterministic but not in list: treat common ones
-        if base in (
-            "eq",
-            "neq",
-            "gt",
-            "gte",
-            "lt",
-            "lte",
-            "and",
-            "or",
-            "not",
-            "cast",
-            "alias",
-            "column",
-            "select",
-        ):
-            continue
-        unknown.append(fn)
+        if isinstance(node, exp.Anonymous):
+            name = node.name.lower()
+            spellings = {name}
+            allowlisted = False
+        else:
+            name = node.sql_name().lower()
+            spellings = {name, type(node).__name__.lower()}
+            allowlisted = type(node).__name__ in DETERMINISTIC_FUNCTIONS
+        if {spelling.replace("_", "") for spelling in spellings} & _REFUSED_FLAT:
+            return VolatilityResult(ok=False, reason_codes=(ReasonCode.NONDETERMINISTIC,), unknown_functions=(name,))
+        if not allowlisted:
+            unknown.add(name)
     # Row sampling, and any query level that picks a subset of rows without its own ORDER BY.
     if parsed.tree.find(exp.TableSample) is not None:
         return VolatilityResult(ok=False, reason_codes=(ReasonCode.NONDETERMINISTIC,), unknown_functions=("sample",))
+    # A ROWS frame counts physical rows, so ties make even an allowlisted aggregate order-dependent.
+    # RANGE and GROUPS frames always include every peer row.
+    for spec in parsed.tree.find_all(exp.WindowSpec):
+        if str(spec.args.get("kind") or "").lower() not in ("range", "groups"):
+            return VolatilityResult(
+                ok=False, reason_codes=(ReasonCode.NONDETERMINISTIC,), unknown_functions=("window_frame",)
+            )
     for query in _iter_nodes(parsed.tree):
         if not isinstance(query, exp.Query) or query.args.get("order") is not None:
             continue
@@ -616,33 +590,18 @@ def build_expected_transform(
     canonical_ident: str,
     donor_idents: tuple[str, ...],
     added_projections_sql: dict[str, list[str]],
-    redirected_aliases: dict[str, str] | None = None,
 ) -> Any:
     """Deep-copy baseline AST, apply merge, return expected tree. Pure sqlglot transform."""
     import copy
 
     fold = _fold_for_dialect(baseline.dialect)
+    donors = set(donor_idents)
     tree = copy.deepcopy(baseline.tree)
-    top_with = tree.args.get("with_")
-    if top_with is None:
-        top_with = tree.args.get("with")
+    top_with = _top_level_with(tree)
     if top_with is None:
         raise SemanticError(ReasonCode.COMPILE_DRIFT, "baseline has no WITH")
     ctes = list(top_with.args.get("expressions", []) or [])
-
-    def _cte_ident(c: object) -> str | None:
-        alias_expr: Any = c.args.get("alias") if isinstance(c, exp.CTE) else None
-        if alias_expr is None:
-            return None
-        alias_name, quoted = _alias_name_and_quoted(alias_expr)
-        return _normalize_ident(alias_name, quoted, fold)
-
-    by_ident = {}
-    for c in ctes:
-        key = _cte_ident(c)
-        if key:
-            by_ident[key] = c
-    canonical = by_ident.get(canonical_ident)
+    canonical = next((c for c in ctes if _cte_identity(c, fold) == canonical_ident), None)
     if canonical is None:
         raise SemanticError(ReasonCode.COMPILE_DRIFT, "canonical CTE missing in baseline")
     # add missing projections to canonical
@@ -659,7 +618,7 @@ def build_expected_transform(
         existing.append(node)
     inner.set("expressions", existing)
     # remove donors
-    remaining = [c for c in ctes if (_cte_ident(c) not in set(donor_idents))]
+    remaining = [c for c in ctes if _cte_identity(c, fold) not in donors]
     top_with.set("expressions", remaining)
     # redirect table refs bound to donors: rename table to canonical + alias donor
     canon_alias_expr = canonical.args.get("alias")
@@ -673,7 +632,7 @@ def build_expected_transform(
         table_quoted = (
             bool(table_identifier.args.get("quoted")) if isinstance(table_identifier, exp.Identifier) else False
         )
-        if _normalize_ident(tname, table_quoted, fold) in set(donor_idents):
+        if _normalize_ident(tname, table_quoted, fold) in donors:
             # preserve alias behavior: if table already aliased, keep alias; else add alias = donor
             existing_alias = scope_table.args.get("alias")
             donor_raw = tname
@@ -682,5 +641,4 @@ def build_expected_transform(
             scope_table.set("this", exp.to_identifier(canon_name, quoted=canon_quoted))
             if existing_alias is None:
                 scope_table.set("alias", exp.TableAlias(this=exp.to_identifier(donor_raw, quoted=donor_quoted)))
-    _ = redirected_aliases
     return tree
