@@ -197,3 +197,37 @@ def test_cleanup_drops_leftover_views_for_the_run_only(warehouse_project, pg_dsn
 
     assert result["dropped"] == sorted([ours, ours_tmp]) and result["complete"]
     assert _relations_in(pg_dsn, scratch) == [(other_run, "VIEW"), (table_with_our_name, "BASE TABLE")]
+
+
+def test_check_compiles_projects_that_use_a_local_package(tmp_path, pg_dsn, pg_schemas, dbt_executable):
+    # dbt deps links a local package into dbt_packages; the snapshot must carry it or the baseline compile of
+    # stg_orders (which calls the package macro) fails.
+    model_schema = pg_schemas("model")
+    root = tmp_path / "project"
+    package = tmp_path / "shared_macros"
+    (package / "macros").mkdir(parents=True)
+    (package / "dbt_project.yml").write_text("name: shared_macros\nversion: 1.0.0\nconfig-version: 2\n")
+    (package / "macros" / "doubled.sql").write_text("{% macro doubled(col) %}({{ col }} * 2){% endmacro %}\n")
+    (root / "models").mkdir(parents=True)
+    (root / "dbt_project.yml").write_text("name: it\nversion: 1.0.0\nconfig-version: 2\nprofile: it\n")
+    (root / "packages.yml").write_text(f"packages:\n  - local: {package.as_posix()}\n")
+    (root / "models" / "stg_orders.sql").write_text(
+        "select order_id, customer_id, {{ shared_macros.doubled('amount') }} as amount from ("
+        + STG_ORDERS.strip()
+        + ") as s\n"
+    )
+    (root / "models" / "orders.sql").write_text(ORDERS)
+    profiles = write_pg_profiles(tmp_path / "profiles", pg_dsn, profile="it", schema=model_schema)
+    for args in (["deps"], ["run", "--select", "stg_orders"]):
+        subprocess.run(
+            [dbt_executable, *args, "--profiles-dir", str(profiles)], cwd=root, check=True, capture_output=True
+        )
+    assert (root / "dbt_packages" / "shared_macros").is_symlink()
+    config = AppConfig(
+        project_dir=root, profiles_dir=profiles, scratch_schema=pg_schemas("scratch"), dbt_command=(dbt_executable,)
+    )
+
+    receipt = _orders_receipt(RefmergeService().check(CheckRequest(config=config)))
+
+    assert (receipt.status, receipt.reason_codes) == (VerificationStatus.SNAPSHOT_EQUIVALENT, (ReasonCode.OK,))
+    assert receipt.equality == EqualityResult(True, 6, 6, 0, 0)
