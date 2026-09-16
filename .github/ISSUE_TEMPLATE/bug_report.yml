@@ -1,0 +1,38 @@
+name: Bug report
+description: Something dbt-refmerge did wrong, or refused when it should not have
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: >-
+        If this is a false "equivalent" verdict, a write outside the model, or leaked credentials, please use
+        [private vulnerability reporting](https://github.com/John-Cusack/dbt-refmerge/security/advisories/new)
+        instead.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: The command you ran, what you expected, and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: output
+    attributes:
+      label: Output
+      description: The `--json` output (it includes status and reason codes), or the error with `--debug`.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: model
+    attributes:
+      label: Smallest model that shows it
+      description: The model's SQL (source, not compiled), trimmed as far as possible.
+      render: sql
+  - type: input
+    id: versions
+    attributes:
+      label: Versions
+      placeholder: dbt-refmerge 0.1.0, dbt-core 1.12.5, dbt-postgres 1.11.0, Python 3.12, macOS
+    validations:
+      required: true
