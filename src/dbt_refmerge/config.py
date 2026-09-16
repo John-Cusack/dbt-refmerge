@@ -151,4 +151,12 @@ def load_config(
         raise ValueError("project_dir must not be an untrusted final symlink")
     object.__setattr__(config, "project_dir", resolved)
     _check_external_string(str(resolved), "project_dir", 4096)
+    # dbt runs inside a snapshot, not the caller's working directory, so hand it an absolute profiles dir.
+    # dbt resolves a relative DBT_PROFILES_DIR against its working directory, i.e. the project root.
+    profiles_dir = config.profiles_dir
+    env_profiles_dir = os.environ.get("DBT_PROFILES_DIR")
+    if profiles_dir is None and env_profiles_dir:
+        profiles_dir = resolved / env_profiles_dir
+    if profiles_dir is not None:
+        object.__setattr__(config, "profiles_dir", profiles_dir.resolve())
     return config

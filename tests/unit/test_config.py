@@ -3,6 +3,7 @@
 import os
 import re
 import shlex
+from pathlib import Path
 
 import pytest
 
@@ -246,3 +247,35 @@ def test_load_config_rejects_symlinked_project_dir(make_project, tmp_path):
 )
 def test_is_secret_name_matches_hints_case_insensitively(name, secret):
     assert is_secret_name(name) is secret
+
+
+def test_load_config_resolves_relative_profiles_dir_against_the_working_directory(make_project, monkeypatch, tmp_path):
+    # dbt runs inside a snapshot elsewhere, so a relative --profiles-dir must be made absolute up front.
+    root = make_project({})
+    (tmp_path / "work").mkdir()
+    monkeypatch.chdir(tmp_path / "work")
+
+    config = load_config(root, cli_overrides={"profiles_dir": Path("../profiles")})
+
+    assert config.profiles_dir == (tmp_path / "profiles").resolve()
+
+
+@pytest.mark.parametrize("env_value", ["conf", "{absolute}"], ids=["relative", "absolute"])
+def test_load_config_uses_dbt_profiles_dir_resolved_like_dbt(make_project, monkeypatch, tmp_path, env_value):
+    # dbt resolves a relative DBT_PROFILES_DIR against its working directory: the project root.
+    root = make_project({})
+    absolute = tmp_path / "shared-profiles"
+    monkeypatch.setenv("DBT_PROFILES_DIR", env_value.format(absolute=absolute))
+
+    config = load_config(root)
+
+    assert config.profiles_dir == (absolute if env_value.startswith("{") else root.resolve() / "conf")
+
+
+def test_load_config_explicit_profiles_dir_wins_over_dbt_profiles_dir(make_project, monkeypatch, tmp_path):
+    root = make_project({})
+    monkeypatch.setenv("DBT_PROFILES_DIR", str(tmp_path / "env"))
+
+    config = load_config(root, cli_overrides={"profiles_dir": tmp_path / "cli"})
+
+    assert config.profiles_dir == tmp_path / "cli"
