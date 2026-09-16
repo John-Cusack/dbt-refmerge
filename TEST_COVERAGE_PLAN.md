@@ -28,7 +28,7 @@ Measured 2026-09-16 on `acf0184` (the PR #4 branch; production code matches `mai
 
 | Phase | Status | PR | Coverage after |
 |---|---|---|---:|
-| 0 | done | Phase 0 PR | 61.2% (`fail_under = 61`) |
+| 0 | done | #5 | 61.2% (`fail_under = 61`) |
 | 1 | done (option A) | — | — |
 | 2 | not started | | |
 | 3 | not started | | |
