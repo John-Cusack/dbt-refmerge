@@ -83,10 +83,11 @@ def build_plan(
     terminal_ref_spans: tuple[SourceSpan, ...] = ()
     if terminal_donors:
         # A group's canonical CTE precedes its donors, so a CTE is always retained before the terminal run,
-        # and parse_source_model gives every CTE but the last a separator.
-        assert terminal_donor_start > 0
-        predecessor_separator = model.ctes[terminal_donor_start - 1].separator_span
-        assert predecessor_separator is not None
+        # and parse_source_model gives every CTE but the last a separator. These guards rely on the source
+        # parser, so they stay typed refusals rather than asserts (which vanish under -O and abort the run).
+        predecessor_separator = model.ctes[terminal_donor_start - 1].separator_span if terminal_donor_start else None
+        if predecessor_separator is None:  # pragma: no cover
+            raise RewriteError(ReasonCode.UNSUPPORTED_IMPORT_SHAPE, "terminal donor separator is unavailable")
         terminal_deletion_start = predecessor_separator.start_byte
         terminal_deletion_owner = terminal_donors[0].identifier.identity.value
         terminal_ref_spans = tuple(cte.ref_call.span for cte in terminal_donors if cte.ref_call is not None)
@@ -214,7 +215,8 @@ def build_plan(
                     )
             else:
                 # A donor outside the terminal run has a retained CTE after it, so it is not last.
-                assert donor_cte.separator_span is not None
+                if donor_cte.separator_span is None:  # pragma: no cover
+                    raise RewriteError(ReasonCode.UNSUPPORTED_IMPORT_SHAPE, "donor separator is unavailable")
                 end = max(end, donor_cte.separator_span.end_byte)
             if _has_sql_comment(start, end) or _has_non_ref_jinja(start, end, allowed_ref_spans):
                 raise RewriteError(
