@@ -623,7 +623,7 @@ def apply_verified_source(
     except OSError as exc:
         raise RefmergeError(ReasonCode.INTERNAL_ERROR, f"cannot open lock file {lock_path}: {exc}") from exc
     try:
-        if sys.platform != "win32":
+        if sys.platform != "win32":  # pragma: win32 no cover
             import fcntl
 
             try:
@@ -634,6 +634,7 @@ def apply_verified_source(
             raise SourceChangedError(ReasonCode.SOURCE_CHANGED_BEFORE_APPLY, "source changed before apply")
         mode = path.stat().st_mode
         tmp_fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=".dbt-refmerge-")
+        replaced = False
         try:
             with os.fdopen(tmp_fd, "wb") as fh:
                 fh.write(candidate_bytes)
@@ -643,7 +644,9 @@ def apply_verified_source(
             if hashlib.sha256(path.read_bytes()).hexdigest() != expected_original_sha256:
                 raise SourceChangedError(ReasonCode.SOURCE_CHANGED_BEFORE_APPLY, "source changed before apply")
             os.replace(tmp_name, path)
-            if sys.platform != "win32":
+            replaced = True
+            if sys.platform != "win32":  # pragma: win32 no cover
+                # Best effort: the rename is done, so a failure here must not report the apply as failed.
                 try:
                     dir_fd = os.open(str(path.parent), os.O_DIRECTORY)
                     try:
@@ -653,17 +656,14 @@ def apply_verified_source(
                 except OSError:
                     pass
         finally:
-            try:
-                if os.path.exists(tmp_name):
-                    os.unlink(tmp_name)
-            except OSError:
-                pass
+            if not replaced:
+                _unlink_quietly(Path(tmp_name))  # never mask the error that stopped the apply
     finally:
-        if sys.platform != "win32":
+        if sys.platform != "win32":  # pragma: win32 no cover
             # Unlink while still holding the lock; a waiter on the old inode re-hashes and refuses.
             _unlink_quietly(lock_path)
         os.close(lock_fd)
-        if sys.platform == "win32":
+        if sys.platform == "win32":  # pragma: win32 cover
             _unlink_quietly(lock_path)  # Windows cannot delete a file that is still open
 
 
