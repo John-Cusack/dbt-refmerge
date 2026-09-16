@@ -50,6 +50,7 @@ dbt-refmerge = "dbt_refmerge.cli:app"
 dev = [
   "pytest>=8.0",
   "pytest-cov>=5.0",
+  "covdefaults>=2.3",
   "hypothesis>=6.0",
   "ruff>=0.4",
   "mypy>=1.0",
@@ -91,7 +92,17 @@ warn_unused_ignores = true
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 filterwarnings = ["error"]
+# Default run is the in-memory unit lane; `-m fake_dbt`, `-m warehouse` or `-m ""` select the others.
+addopts = ["--strict-markers", "-m", "not fake_dbt and not warehouse"]
+markers = [
+  "fake_dbt: runs against tests/fakes/fake_dbt.py in a subprocess",
+  "warehouse: needs Postgres (REFMERGE_TEST_PG_DSN) and dbt-postgres",
+]
 
 [tool.coverage.run]
 source = ["src/dbt_refmerge"]
-branch = true
+plugins = ["covdefaults"]
+
+[tool.coverage.report]
+# Ratchet: raise to the measured total in every coverage PR (TEST_COVERAGE_PLAN.md §5).
+fail_under = 61

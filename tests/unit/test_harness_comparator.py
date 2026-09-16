@@ -71,13 +71,10 @@ def test_verdict_sql_is_one_statement():
     assert "union all" in grouped.lower()
 
 
-def test_harness_rejects_endraw():
-    ws = RunWorkspace.create(keep=True)
-    try:
-        with pytest.raises(Exception):
-            build_harness_project(ws, profile="p", baseline_sql="select 1 {% endraw %}", candidate_sql="select 1")
-    finally:
-        ws.cleanup_files()
+def test_harness_rejects_endraw(tmp_path):
+    ws = RunWorkspace("20260101T000000_abcdef123456", tmp_path)
+    with pytest.raises(Exception):
+        build_harness_project(ws, profile="p", baseline_sql="select 1 {% endraw %}", candidate_sql="select 1")
 
 
 def test_semicolon_rules():
