@@ -21,7 +21,8 @@ from dbt_refmerge.errors import CleanupError, RefmergeError
 
 # dbt's default target-path and log-path, VCS metadata and JS tooling: skipped only at the project root, so
 # a models/logs/ directory is still copied. dbt_packages is copied: the snapshot must compile with them.
-ROOT_EXCLUDES = frozenset({"target", "logs", ".git", "node_modules"})
+# Project-local virtualenvs are excluded too: their interpreter symlinks point outside the project.
+ROOT_EXCLUDES = frozenset({"target", "logs", ".git", "node_modules", ".venv", "venv"})
 # Bytecode caches are never dbt inputs, at any depth.
 EXCLUDES_AT_ANY_DEPTH = frozenset({"__pycache__"})
 

@@ -402,3 +402,20 @@ def test_cleanup_files_reports_entries_it_cannot_remove():
         assert _files(ws.root) == {"source_snapshot/locked/m.sql": b"select 1\n"}
     finally:
         locked.chmod(0o755)
+
+
+def test_snapshot_skips_project_virtualenvs(make_project, tmp_path):
+    # A .venv/venv in the project root holds interpreter symlinks that point outside the project.
+    root = make_project({"models/a.sql": "select 1\n", ".venv/pyvenv.cfg": "home = /usr\n", "venv/pyvenv.cfg": "x\n"})
+    outside = tmp_path / "python3"
+    outside.write_text("interpreter\n")
+    try:
+        (root / ".venv" / "bin").mkdir()
+        os.symlink(outside, root / ".venv" / "bin" / "python")
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks unavailable")
+    ws = RunWorkspace.create()
+
+    ws.snapshot_project(root)
+
+    assert sorted(_files(ws.source_snapshot)) == ["dbt_project.yml", "models/a.sql"]

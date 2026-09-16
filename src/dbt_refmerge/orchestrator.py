@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import difflib
 import hashlib
 import json
@@ -303,7 +304,9 @@ class RefmergeService:
             return CheckReport(run_id=ws.run_id, results=tuple(results), candidate_bytes_map=cand_map)
         finally:
             if not config.keep_workspace:
-                ws.cleanup_files()
+                # A leftover local temp directory must not replace the report or the real error.
+                with contextlib.suppress(CleanupError):
+                    ws.cleanup_files()
 
     def _check_one_model(
         self,

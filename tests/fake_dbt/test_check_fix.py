@@ -112,3 +112,16 @@ def test_fix_applies_candidate_when_verifier_reports_equivalence(make_project, f
 
     assert (report.applied, report.reason) == (True, "applied")
     assert "join orders as order_financials" in (root / "models" / "orders.sql").read_text()
+
+
+def test_check_report_survives_local_workspace_cleanup_failure(make_project, fake_dbt, tmp_path, faults):
+    root = make_project({"models/stg_orders.sql": STG, "models/orders.sql": README_MODEL})
+
+    def refuse_rmdir(args):
+        if "dbt_refmerge_" in str(args[0]):
+            raise OSError("directory busy")
+
+    faults.on("os.rmdir", refuse_rmdir)
+    report = RefmergeService().check(CheckRequest(config=_config(root, fake_dbt, tmp_path)))
+
+    assert {r.model_unique_id for r in report.results} == {"model.p.orders", "model.p.stg_orders"}
