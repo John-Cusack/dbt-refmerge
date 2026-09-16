@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import re
 from dataclasses import dataclass, field
+from typing import Literal
 
 from jinja2 import Environment
 from jinja2 import nodes as _jnodes
@@ -133,93 +134,57 @@ def _parse_simple_call(inner: str) -> tuple[str, tuple[str | int, ...], dict[str
 
 
 def _parse_literal_call(inner: str) -> tuple[str, tuple[str | int, ...], dict[str, str | int]] | None:
-    """Return (func_name, args, kwargs) for constant-only calls, else None."""
-    from typing import Any as _Any
-
+    """Return (func_name, args, kwargs) for a ref()/source() call whose arguments are all constants."""
     fast = _parse_simple_call(inner)
     if fast is not None:
         return fast
     try:
-        mod = _JINJA_ENV.parse("{{ " + inner + " }}")
+        template = _JINJA_ENV.parse("{{ " + inner + " }}")
     except Exception:
         return None
-    try:
-        stmts: _Any = mod.body
-        out: _Any = stmts[0].nodes[0]
-    except Exception:
+    # Invariant: the scanner ends an expression at its first "}}", so `inner` never contains one and
+    # a template that parses is a single {{ }} holding a single expression.
+    output = template.body[0]
+    assert isinstance(output, _jnodes.Output) and len(template.body) == len(output.nodes) == 1
+    call = output.nodes[0]
+    if not (isinstance(call, _jnodes.Call) and isinstance(call.node, _jnodes.Name)):
         return None
-    if not isinstance(out, _jnodes.Call):
-        return None
-    func = out.node
-    if not isinstance(func, _jnodes.Name):
-        return None
-    if func.name not in ("ref", "source"):
-        return None
-    if out.dyn_args is not None or out.dyn_kwargs is not None:
+    if call.node.name not in ("ref", "source") or call.dyn_args is not None or call.dyn_kwargs is not None:
         return None  # *args / **kwargs are runtime values
-    args: list[str | int] = []
-    for a in out.args:
-        if isinstance(a, _jnodes.Const):
-            if not isinstance(a.value, (str, int)):
-                return None
-            args.append(a.value)
-        else:
-            return None
-    kwargs: dict[str, str | int] = {}
-    for kw in out.kwargs:
-        if not isinstance(kw.value, _jnodes.Const) or not isinstance(kw.value.value, (str, int)):
-            return None
-        kwargs[kw.key] = kw.value.value
-    # filters/tests/calls rejected: jinja Call node with func attribute etc already excluded
-    return str(func.name), tuple(args), kwargs
+    args = [a.value for a in call.args if isinstance(a, _jnodes.Const) and isinstance(a.value, (str, int))]
+    kwargs = {
+        kw.key: kw.value.value
+        for kw in call.kwargs
+        if isinstance(kw.value, _jnodes.Const) and isinstance(kw.value.value, (str, int))
+    }
+    if len(args) != len(call.args) or len(kwargs) != len(call.kwargs):
+        return None
+    return call.node.name, tuple(args), kwargs
 
 
 def _interpret_ref_call(
     func: str, args: tuple[str | int, ...], kwargs: dict[str, str | int], span: SourceSpan
 ) -> RefCall | None:
-    try:
-        if func == "ref":
-            package: str | None = None
-            name = ""
-            version: str | int | None = None
-            # dbt reads `version or v` and ignores other kwargs, but a project can override ref():
-            # anything beyond one version kwarg is not a literal call.
-            if len(kwargs) > 1 or not set(kwargs) <= {"version", "v"}:
-                return None
-            for k in ("version", "v"):
-                if k in kwargs:
-                    version = kwargs[k]
-            if len(args) == 1 and isinstance(args[0], str):
-                name = args[0]
-            elif len(args) == 2 and all(isinstance(a, str) for a in args):
-                package = str(args[0])
-                name = str(args[1])
-            elif len(args) == 1 and kwargs:
-                if isinstance(args[0], str):
-                    name = args[0]
-                else:
-                    return None
-            else:
-                return None
-            if not name:
-                return None
-            return RefCall(kind="ref", package=package, name=name, source_name=None, version=version, span=span)
-        else:
-            if len(args) != 2 or kwargs or not all(isinstance(a, str) for a in args):
-                return None
-            return RefCall(
-                kind="source",
-                package=None,
-                name=str(args[1]),
-                source_name=str(args[0]),
-                version=None,
-                span=span,
-            )
-    except Exception:
+    names = [a for a in args if isinstance(a, str)]
+    if len(names) != len(args):
         return None
-
-
-_TOKEN = re.compile(r"\{\{|\}\}|\{%|%\}|\{#|#\}")
+    if func == "source":
+        # dbt's source() takes exactly (source_name, table_name) and no kwargs.
+        if len(names) != 2 or kwargs:
+            return None
+        return RefCall(kind="source", package=None, name=names[1], source_name=names[0], version=None, span=span)
+    # ref(name) or ref(package, name) with at most one of version= / v=. dbt reads `version or v` and
+    # ignores other kwargs, but a project can override ref(): anything else is not a literal call.
+    if len(names) not in (1, 2) or not names[-1] or len(kwargs) > 1 or not set(kwargs) <= {"version", "v"}:
+        return None
+    return RefCall(
+        kind="ref",
+        package=names[0] if len(names) == 2 else None,
+        name=names[-1],
+        source_name=None,
+        version=next(iter(kwargs.values()), None),
+        span=span,
+    )
 
 
 def _strip_whitespace_control(inner: str) -> str:
@@ -235,133 +200,59 @@ def _strip_whitespace_control(inner: str) -> str:
     return inner
 
 
+_TAG_OPEN = re.compile(r"\{[{%#]")
+_TAG_CLOSE = {"{{": "}}", "{%": "%}", "{#": "#}"}
+_TAG_KIND: dict[str, Literal["expression", "statement", "comment", "raw"]] = {
+    "{{": "expression",
+    "{%": "statement",
+    "{#": "comment",
+}
+_RAW_OPEN_INNER = re.compile(r"\s*raw\s*")
+_RAW_CLOSE = re.compile(r"\{%\s*endraw\s*%}")
+
+
 def mask_jinja(decoded: DecodedSource) -> MaskedSource:
+    """Blank every Jinja tag, keeping newlines, and write a sentinel over each literal ref()/source()."""
     text = decoded.text
-    n = len(text)
-    # byte-level mutable mask over original bytes? operate on chars then map to bytes.
     masked_chars = list(text)
     jinja_spans: list[JinjaSpan] = []
     ref_calls: dict[str, RefCall] = {}
-    sentinel_counter = 0
-    i = 0
-    in_raw = False
-    raw_start_char = 0
-    while i < n:
-        if in_raw:
-            # search for {% endraw %}
-            m = re.search(r"\{%\s*endraw\s*%}", text[i:])
-            if m is None:
+    pos = 0
+    while (opening := _TAG_OPEN.search(text, pos)) is not None:
+        start, tag = opening.start(), opening.group()
+        kind = _TAG_KIND[tag]
+        close = text.find(_TAG_CLOSE[tag], start + 2)
+        if close == -1:
+            raise SourceParseError(ReasonCode.INTERNAL_ERROR, f"unterminated Jinja {kind}")
+        inner = text[start + 2 : close]
+        pos = close + 2
+        if tag == "{%" and _RAW_OPEN_INNER.fullmatch(inner):
+            raw_close = _RAW_CLOSE.search(text, pos)
+            if raw_close is None:
                 raise SourceParseError(ReasonCode.INTERNAL_ERROR, "unterminated raw block")
-            end_char = i + m.end()
-            span = byte_span_of(decoded, raw_start_char, end_char)
-            jinja_spans.append(
-                JinjaSpan(
-                    span=span,
-                    kind="raw",
-                    text=decoded.original_bytes[span.start_byte : span.end_byte],
-                )
-            )
-            for j in range(raw_start_char, end_char):
-                if masked_chars[j] not in ("\n", "\r"):
-                    masked_chars[j] = " "
-            i = end_char
-            in_raw = False
+            pos, kind = raw_close.end(), "raw"
+        span = byte_span_of(decoded, start, pos)
+        jinja_spans.append(
+            JinjaSpan(span=span, kind=kind, text=decoded.original_bytes[span.start_byte : span.end_byte])
+        )
+        for j in range(start, pos):
+            if masked_chars[j] not in ("\n", "\r"):
+                masked_chars[j] = " "
+        parsed = _parse_literal_call(_strip_whitespace_control(inner)) if tag == "{{" else None
+        call = _interpret_ref_call(*parsed, span) if parsed is not None else None
+        if call is None:
             continue
-        two = text[i : i + 2]
-        if two == "{{":
-            end = text.find("}}", i + 2)
-            if end == -1:
-                raise SourceParseError(ReasonCode.INTERNAL_ERROR, "unterminated Jinja expression")
-            end_char = end + 2
-            inner = _strip_whitespace_control(text[i + 2 : end])
-            span = byte_span_of(decoded, i, end_char)
-            jinja_spans.append(
-                JinjaSpan(
-                    span=span,
-                    kind="expression",
-                    text=decoded.original_bytes[span.start_byte : span.end_byte],
-                )
-            )
-            parsed = _parse_literal_call(inner)
-            call: RefCall | None = None
-            if parsed is not None:
-                func, args, kwargs = parsed
-                call = _interpret_ref_call(func, args, kwargs, span)
-            if call is not None:
-                sentinel = _sentinel_name(sentinel_counter)
-                sentinel_counter += 1
-                width = end_char - i  # chars
-                if len(sentinel) > width:
-                    # cannot fit sentinel; mask as dynamic (not eligible)
-                    for j in range(i, end_char):
-                        if masked_chars[j] not in ("\n", "\r"):
-                            masked_chars[j] = " "
-                else:
-                    for k, ch in enumerate(sentinel):
-                        masked_chars[i + k] = ch
-                    for j in range(i + len(sentinel), end_char):
-                        if masked_chars[j] not in ("\n", "\r"):
-                            masked_chars[j] = " "
-                    ref_calls[sentinel] = call
-            else:
-                for j in range(i, end_char):
-                    if masked_chars[j] not in ("\n", "\r"):
-                        masked_chars[j] = " "
-                    # mark dynamic jinja: replace with spaces (no sentinel)
-            i = end_char
-        elif two == "{%":
-            end = text.find("%}", i + 2)
-            if end == -1:
-                raise SourceParseError(ReasonCode.INTERNAL_ERROR, "unterminated Jinja statement")
-            end_char = end + 2
-            tag_inner = text[i + 2 : end].strip()
-            span = byte_span_of(decoded, i, end_char)
-            # check raw start
-            if re.fullmatch(r"\s*raw\s*", text[i + 2 : end], flags=re.DOTALL):
-                in_raw = True
-                raw_start_char = i
-                i = end_char
-                continue
-            jinja_spans.append(
-                JinjaSpan(
-                    span=span,
-                    kind="statement",
-                    text=decoded.original_bytes[span.start_byte : span.end_byte],
-                )
-            )
-            # strings/escapes inside statements: already masked wholesale
-            for j in range(i, end_char):
-                if masked_chars[j] not in ("\n", "\r"):
-                    masked_chars[j] = " "
-            i = end_char
-            _ = tag_inner
-        elif two == "{#":
-            end = text.find("#}", i + 2)
-            if end == -1:
-                raise SourceParseError(ReasonCode.INTERNAL_ERROR, "unterminated Jinja comment")
-            end_char = end + 2
-            span = byte_span_of(decoded, i, end_char)
-            jinja_spans.append(
-                JinjaSpan(
-                    span=span,
-                    kind="comment",
-                    text=decoded.original_bytes[span.start_byte : span.end_byte],
-                )
-            )
-            for j in range(i, end_char):
-                if masked_chars[j] not in ("\n", "\r"):
-                    masked_chars[j] = " "
-            i = end_char
-        else:
-            i += 1
+        sentinel = _sentinel_name(len(ref_calls))
+        # The shortest literal call, {{ref('m')}}, is 12 chars; a sentinel is 13 from the 10**7th call.
+        if len(sentinel) > pos - start:  # pragma: no cover -- needs 10**7 calls in one file
+            continue  # left blank: a dynamic expression, so never an import
+        masked_chars[start : start + len(sentinel)] = sentinel
+        ref_calls[sentinel] = call
     masked_text = "".join(masked_chars)
-    masked_bytes = masked_text.encode(
-        "utf-8"
-    )  # masked bytes are positional over chars; multibyte Jinja replaced per char
-    # NOTE: masked bytes are positional over chars; source spans remain authoritative in original bytes.
     return MaskedSource(
         decoded=decoded,
-        masked_bytes=masked_bytes,
+        # Positional over chars, not bytes: source spans in original bytes stay authoritative.
+        masked_bytes=masked_text.encode("utf-8"),
         masked_text=masked_text,
         jinja_spans=jinja_spans,
         ref_calls=ref_calls,
@@ -373,7 +264,7 @@ def mask_jinja(decoded: DecodedSource) -> MaskedSource:
 
 @dataclass(frozen=True)
 class Token:
-    kind: str  # "word","quoted","string","comment","punct","space"
+    kind: str  # "space", "comment", "string", "word" or "punct" (any other single char)
     text: str
     start: int
     end: int
@@ -384,38 +275,36 @@ _TOKEN_RE = re.compile(
     r"|(?P<comment>--[^\n]*|/\*.*?\*/)"
     r"|(?P<string>'(?:[^']|'')*'?|\"(?:[^\"]|\"\")*\"?|`(?:[^`]|``)*`?)"
     r"|(?P<word>__r\d+__|[A-Za-z_\u0080-\uFFFF][A-Za-z0-9_$\u0080-\uFFFF]*)"
-    r"|(?P<punct>[(),.;*|=<>!+\-/])",
+    r"|(?P<punct>.)",
     flags=re.DOTALL,
 )
 
 
-def is_sentinel_word(text: str) -> bool:
-    return bool(re.fullmatch(r"__r\d+__", text))
-
-
 def tokenize_masked(masked_text: str) -> list[Token]:
-    tokens: list[Token] = []
-    pos = 0
-    for m in _TOKEN_RE.finditer(masked_text):
-        if m.start() != pos:
-            # single uncovered char (e.g. other punct like :)
-            ch = masked_text[pos : m.start()]
-            for k, c in enumerate(ch):
-                tokens.append(Token(kind="punct", text=c, start=pos + k, end=pos + k + 1))
-        kind = m.lastgroup or "punct"
-        tokens.append(Token(kind=kind, text=m.group(), start=m.start(), end=m.end()))
-        pos = m.end()
-    if pos < len(masked_text):
-        for k, c in enumerate(masked_text[pos:]):
-            tokens.append(Token(kind="punct", text=c, start=pos + k, end=pos + k + 1))
-    return tokens
+    # Every char matches some group, so the tokens tile the text.
+    return [
+        Token(kind=m.lastgroup or "punct", text=m.group(), start=m.start(), end=m.end())
+        for m in _TOKEN_RE.finditer(masked_text)
+    ]
 
 
 def _significant(tokens: list[Token]) -> list[Token]:
     return [t for t in tokens if t.kind not in ("space", "comment")]
 
 
-_SENTINEL_GUARD = True
+def _is_word(tokens: list[Token], idx: int, upper: str) -> bool:
+    return 0 <= idx < len(tokens) and tokens[idx].kind == "word" and tokens[idx].text.upper() == upper
+
+
+def _is_punct(tokens: list[Token], idx: int, text: str) -> bool:
+    return 0 <= idx < len(tokens) and tokens[idx].kind == "punct" and tokens[idx].text == text
+
+
+def _identity_for_token(token: Token | None, fold_unquoted: FoldRule) -> str | None:
+    """Identity of a bare or double-quoted identifier token; None for anything else."""
+    if token is None or not (token.kind == "word" or token.text.startswith('"')):
+        return None
+    return make_identifier(token.text, token.kind == "string", fold_unquoted).identity.value
 
 
 # ---------------------------------------------------------------- CTE splitter
@@ -445,20 +334,7 @@ class ParsedSourceModel:
     fold_unquoted: FoldRule = "lower"
 
 
-def _char_to_byte(decoded: DecodedSource, ch: int) -> int:
-    return decoded.char_to_byte[ch]
-
-
-def _span_chars(decoded: DecodedSource, s: int, e: int) -> SourceSpan:
-    return SourceSpan(start_byte=_char_to_byte(decoded, s), end_byte=_char_to_byte(decoded, e))
-
-
-def _strip_quotes_ident(tok_text: str) -> tuple[str, bool]:
-    if len(tok_text) >= 2 and tok_text[0] == '"' and tok_text[-1] == '"':
-        return tok_text, True
-    if len(tok_text) >= 2 and tok_text[0] == "`" and tok_text[-1] == "`":
-        return tok_text, True
-    return tok_text, False
+_MAIN_QUERY_KEYWORDS = frozenset({"SELECT", "INSERT", "UPDATE", "DELETE", "MERGE", "TABLE", "VALUES"})
 
 
 def parse_source_model(data: bytes, *, fold_unquoted: FoldRule = "lower") -> ParsedSourceModel:
@@ -466,172 +342,66 @@ def parse_source_model(data: bytes, *, fold_unquoted: FoldRule = "lower") -> Par
     masked = mask_jinja(decoded)
     tokens = tokenize_masked(masked.masked_text)
     sig = _significant(tokens)
-    # O(1) token lookups: the splitter resolves each CTE's parens by position.
-    token_index = {(t.start, t.end): i for i, t in enumerate(tokens)}
-    sig_index = {(t.start, t.end): i for i, t in enumerate(sig)}
-    # find top-level WITH (skip leading config spans: allow word tokens like config? simply find first WITH)
-    with_idx: int | None = None
-    for idx, tok in enumerate(sig):
-        if tok.kind in ("word",) and tok.text.upper() == "WITH":
-            # check RECURSIVE
-            nxt = sig[idx + 1] if idx + 1 < len(sig) else None
-            if nxt is not None and nxt.kind == "word" and nxt.text.upper() == "RECURSIVE":
-                raise SourceParseError(ReasonCode.UNSUPPORTED_IMPORT_SHAPE, "WITH RECURSIVE unsupported")
-            with_idx = idx
-            break
-        # if we hit SELECT without WITH -> no CTEs
-        if tok.kind == "word" and tok.text.upper() == "SELECT":
-            break
+    # The CTE list follows the first WITH, unless a SELECT comes first.
+    with_idx = next(
+        (idx for idx, tok in enumerate(sig) if tok.kind == "word" and tok.text.upper() in ("WITH", "SELECT")),
+        None,
+    )
     ctes: list[SourceCTE] = []
-    downstream: list[DownstreamRef] = []
-    if with_idx is None:
-        return ParsedSourceModel(
-            decoded=decoded,
-            masked=masked,
-            tokens=tokens,
-            ctes=(),
-            downstream_refs=(),
-            fold_unquoted=fold_unquoted,
-        )
-    # iterate CTEs from with_idx+1
-    pos = with_idx + 1
-    ordinal = 0
-    # map char index -> token for paren matching: operate on masked text directly with depth tracking
-    # We resolve spans via token char offsets.
     seen_identities: set[str] = set()
-    while pos < len(sig):
-        tok = sig[pos]
-        if tok.kind == "word" and tok.text.upper() in (
-            "SELECT",
-            "INSERT",
-            "UPDATE",
-            "DELETE",
-            "MERGE",
-            "TABLE",
-            "VALUES",
-        ):
-            break  # main query
-        # expect CTE name
-        if tok.kind == "string" and tok.text.startswith('"'):
-            raw_name, quoted = tok.text, True
-        elif tok.kind == "word":
-            if tok.text.upper() in ("RECURSIVE",):
-                raise SourceParseError(ReasonCode.UNSUPPORTED_IMPORT_SHAPE, "WITH RECURSIVE unsupported")
-            raw_name, quoted = tok.text, False
-        else:
-            raise SourceParseError(ReasonCode.UNSUPPORTED_IMPORT_SHAPE, f"unexpected token in CTE list: {tok.text!r}")
-        ident = make_identifier(raw_name, quoted, fold_unquoted)
+    pos = len(sig) if with_idx is None or not _is_word(sig, with_idx, "WITH") else with_idx + 1
+    # A main-query keyword (or the end) right after WITH or a comma ends the list: the CTEs in
+    # between, if any, come from masked Jinja.
+    while pos < len(sig) and not (sig[pos].kind == "word" and sig[pos].text.upper() in _MAIN_QUERY_KEYWORDS):
+        name = sig[pos]
+        if _is_word(sig, pos, "RECURSIVE"):
+            raise SourceParseError(ReasonCode.UNSUPPORTED_IMPORT_SHAPE, "WITH RECURSIVE unsupported")
+        if _identity_for_token(name, fold_unquoted) is None:
+            raise SourceParseError(ReasonCode.UNSUPPORTED_IMPORT_SHAPE, f"unexpected token in CTE list: {name.text!r}")
+        ident = make_identifier(name.text, name.kind == "string", fold_unquoted)
         if ident.identity.value in seen_identities:
             raise SourceParseError(ReasonCode.UNSUPPORTED_IMPORT_SHAPE, "duplicate CTE name")
         seen_identities.add(ident.identity.value)
-        pos += 1
-        # reject column list
-        if pos < len(sig) and sig[pos].kind == "punct" and sig[pos].text == "(":
-            # Could be AS ( vs column list. Peek: column list appears BEFORE AS.
-            # If next significant after name is '(' and token after that is identifier then check for AS following.
-            # Simplest: if sig[pos] is '(' then this is a column list -> reject (AS ( comes after AS keyword)
-            raise SourceParseError(ReasonCode.UNSUPPORTED_IMPORT_SHAPE, "CTE column list unsupported")
-        # expect AS
-        if pos >= len(sig) or not (sig[pos].kind == "word" and sig[pos].text.upper() == "AS"):
-            raise SourceParseError(ReasonCode.UNSUPPORTED_IMPORT_SHAPE, "expected AS in CTE")
-        pos += 1
-        # optional materialization hint NOT MATERIALIZED -> reject
-        if pos < len(sig) and sig[pos].kind == "word" and sig[pos].text.upper() == "NOT":
-            raise SourceParseError(ReasonCode.UNSUPPORTED_IMPORT_SHAPE, "materialization hint unsupported")
-        if pos < len(sig) and sig[pos].kind == "word" and sig[pos].text.upper() == "MATERIALIZED":
-            raise SourceParseError(ReasonCode.UNSUPPORTED_IMPORT_SHAPE, "materialization hint unsupported")
-        if pos >= len(sig) or not (sig[pos].kind == "punct" and sig[pos].text == "("):
-            raise SourceParseError(ReasonCode.UNSUPPORTED_IMPORT_SHAPE, "expected AS ( in CTE")
-        open_tok = sig[pos]
-        try:
-            open_full = token_index[(open_tok.start, open_tok.end)]
-        except KeyError:
-            raise SourceParseError(ReasonCode.INTERNAL_ERROR, "CTE open paren not found") from None
-        d = 0
-        close_full = -1
-        for fi in range(open_full, len(tokens)):
-            t = tokens[fi]
-            if t.kind == "string" or t.kind == "comment":
-                continue
-            if t.kind == "punct" and t.text == "(":
-                d += 1
-            elif t.kind == "punct" and t.text == ")":
-                d -= 1
-                if d == 0:
-                    close_full = fi
-                    break
-        if close_full == -1:
+        if not (_is_word(sig, pos + 1, "AS") and _is_punct(sig, pos + 2, "(")):
+            raise SourceParseError(
+                ReasonCode.UNSUPPORTED_IMPORT_SHAPE,
+                "expected `name AS (`; CTE column lists and materialization hints are unsupported",
+            )
+        depth = 0
+        for close_idx in range(pos + 2, len(sig)):
+            paren = sig[close_idx].text if sig[close_idx].kind == "punct" else ""
+            depth += (paren == "(") - (paren == ")")
+            if depth == 0:
+                break
+        else:
             raise SourceParseError(ReasonCode.UNSUPPORTED_IMPORT_SHAPE, "unbalanced CTE parens")
-        close_tok = tokens[close_full]
-        body_start_char = open_tok.end
-        body_end_char = close_tok.start
-        # separator: comma right after close (significant)
-        # find next significant token after close
-        try:
-            close_sig = sig_index[(close_tok.start, close_tok.end)]
-        except KeyError:
-            raise SourceParseError(ReasonCode.INTERNAL_ERROR, "CTE close paren not found") from None
-        sep_span: SourceSpan | None = None
-        is_last = True
-        if close_sig + 1 < len(sig) and sig[close_sig + 1].kind == "punct" and sig[close_sig + 1].text == ",":
-            comma = sig[close_sig + 1]
-            sep_span = _span_chars(decoded, comma.start, comma.end)
-            is_last = False
-        # CTE span: from name start to close end
-        cte_span = _span_chars(decoded, tok.start, close_tok.end)
-        # parse body
-        cte = _parse_import_body(
-            decoded=decoded,
-            masked=masked,
-            tokens=tokens,
-            ident=ident,
-            ordinal=ordinal,
-            cte_span=cte_span,
-            body_char_range=(body_start_char, body_end_char),
-            separator_span=sep_span,
-            fold_unquoted=fold_unquoted,
+        separator = sig[close_idx + 1] if _is_punct(sig, close_idx + 1, ",") else None
+        ctes.append(
+            _parse_import_body(
+                decoded=decoded,
+                masked=masked,
+                tokens=tokens,
+                ident=ident,
+                ordinal=len(ctes),
+                cte_span=byte_span_of(decoded, name.start, sig[close_idx].end),
+                body_char_range=(sig[pos + 2].end, sig[close_idx].start),
+                separator_span=byte_span_of(decoded, separator.start, separator.end) if separator else None,
+                fold_unquoted=fold_unquoted,
+            )
         )
-        ctes.append(cte)
-        ordinal += 1
-        pos = close_sig + (2 if not is_last else 1)
-        if is_last:
+        if separator is None:
             break
-    model = ParsedSourceModel(
+        pos = close_idx + 2
+    downstream, nested = _find_downstream_refs(decoded, sig, tuple(ctes), fold_unquoted) if ctes else ((), frozenset())
+    return ParsedSourceModel(
         decoded=decoded,
         masked=masked,
         tokens=tokens,
         ctes=tuple(ctes),
-        downstream_refs=(),
-        fold_unquoted=fold_unquoted,
-    )
-    # downstream refs + nested-CTE shadowing names, each in one pass
-    downstream, nested = _find_downstream_refs(model, fold_unquoted)
-    model = ParsedSourceModel(
-        decoded=decoded,
-        masked=masked,
-        tokens=tokens,
-        ctes=tuple(ctes),
-        downstream_refs=tuple(downstream),
+        downstream_refs=downstream,
         nested_names=nested,
         fold_unquoted=fold_unquoted,
     )
-    return model
-
-
-def _split_depth_zero(body_tokens: list[Token]) -> list[list[Token]]:
-    parts: list[list[Token]] = [[]]
-    depth = 0
-    for t in body_tokens:
-        if t.kind not in ("string", "comment"):
-            if t.kind == "punct" and t.text == "(":
-                depth += 1
-            elif t.kind == "punct" and t.text == ")":
-                depth -= 1
-            elif t.kind == "punct" and t.text == "," and depth == 0:
-                parts.append([])
-                continue
-        parts[-1].append(t)
-    return parts
 
 
 # Clauses that can follow a WHERE predicate in some supported dialect. A predicate has no end
@@ -660,6 +430,9 @@ _CLAUSES_AFTER_WHERE: tuple[tuple[str, ...], ...] = (
     ("USING", "SAMPLE"),
 )
 
+# Column shapes by which tokens are the keyword AS: `col`, `col alias`, `col AS alias`.
+_COLUMN_SHAPES = ([False], [False, False], [False, True, False])
+
 
 def _parse_import_body(
     *,
@@ -673,12 +446,12 @@ def _parse_import_body(
     separator_span: SourceSpan | None,
     fold_unquoted: FoldRule,
 ) -> SourceCTE:
+    """Parse `SELECT columns FROM <literal ref> [WHERE predicate]`; anything else has ref_call None."""
     body_start, body_end = body_char_range
-    body_span = _span_chars(decoded, body_start, body_end)
-    # body tokens (significant + positions) within range
-    in_range = [t for t in tokens if t.start >= body_start and t.end <= body_end]
-    sig = _significant(in_range)
-    empty = SourceCTE(
+    body_span = byte_span_of(decoded, body_start, body_end)
+    in_body = [t for t in tokens if body_start <= t.start and t.end <= body_end]
+    sig = _significant(in_body)
+    not_an_import = SourceCTE(
         identifier=ident,
         ordinal=ordinal,
         cte_span=cte_span,
@@ -689,218 +462,121 @@ def _parse_import_body(
         projections=(),
         predicate_source_span=None,
     )
-    if not sig:
-        return empty
-    # require SELECT at depth 0 first
-    if not (sig[0].kind == "word" and sig[0].text.upper() == "SELECT"):
-        return empty  # not an import shape; qualification will reject
-    # locate FROM at depth 0
-    depth = 0
-    from_idx: int | None = None
-    where_idx: int | None = None
-    for idx, t in enumerate(sig):
-        if t.kind not in ("string",):
-            if t.kind == "punct" and t.text == "(":
-                depth += 1
-            elif t.kind == "punct" and t.text == ")":
-                depth -= 1
-        if depth == 0 and t.kind == "word":
-            up = t.text.upper()
-            if up == "FROM" and from_idx is None:
-                from_idx = idx
-            elif up == "WHERE" and from_idx is not None and where_idx is None:
-                where_idx = idx
-    if from_idx is None:
-        return empty
-    select_sig = sig[1:from_idx]
-    if not select_sig:
-        return empty
-    # reject DISTINCT at select start
-    if select_sig and select_sig[0].kind == "word" and select_sig[0].text.upper() in ("DISTINCT", "ALL"):
-        return empty
-    # select list span: from first select token start to last select token end
-    select_list_span = _span_chars(decoded, select_sig[0].start, select_sig[-1].end)
-    # FROM item: tokens between FROM and WHERE/end at depth 0 — must be exactly one sentinel word
-    from_end = where_idx if where_idx is not None else len(sig)
-    from_sig = sig[from_idx + 1 : from_end]
-    # NOTE: any parens in from_sig naturally fail the single-sentinel shape below.
-    ref_call: RefCall | None = None
-    if len(from_sig) == 1 and from_sig[0].kind == "word" and is_sentinel_word(from_sig[0].text):
-        ref_call = masked.ref_calls.get(from_sig[0].text)
-    elif len(from_sig) == 2 and from_sig[0].kind == "word" and is_sentinel_word(from_sig[0].text):
-        # FROM sentinel alias without AS? e.g. FROM rel alias — but import FROM must be sole relation;
-        # allow trailing alias only if... v0.1 import CTEs have no alias on FROM; treat as non-import
-        ref_call = None
-    else:
-        # check for other clauses after from_end (GROUP BY etc.) -> non-import; still record no ref
-        pass
-    # check trailing clause after WHERE: only WHERE allowed; any GROUP/ORDER/LIMIT/etc -> non-import
-    if where_idx is not None:
-        # predicate span: from WHERE token start... to end of sig? but must reject other clauses
-        rest = [t.text.upper() if t.kind == "word" else "" for t in sig[where_idx + 1 :]]
-        for k in range(len(rest)):
-            if any(tuple(rest[k : k + len(clause)]) == clause for clause in _CLAUSES_AFTER_WHERE):
-                # Same outcome as the clause without WHERE: not an import.
-                return SourceCTE(
-                    identifier=ident,
-                    ordinal=ordinal,
-                    cte_span=cte_span,
-                    body_span=body_span,
-                    select_list_span=select_list_span,
-                    separator_span=separator_span,
-                    ref_call=None,
-                    projections=(),
-                    predicate_source_span=None,
-                )
-    # projections: split select_sig on depth-zero commas (need depth relative to select list)
-    # rebuild with paren depth
-    proj_parts: list[list[Token]] = [[]]
-    depth2 = 0
-    for t in select_sig:
-        if t.kind == "punct" and t.text == "(":
-            depth2 += 1
-        elif t.kind == "punct" and t.text == ")":
-            depth2 -= 1
-        if t.kind == "punct" and t.text == "," and depth2 == 0:
-            proj_parts.append([])
-            continue
-        proj_parts[-1].append(t)
-    projections: list[Projection] = []
-    valid = ref_call is not None
-    for part_idx, part in enumerate(proj_parts):
-        psig = _significant(part)
-        if not psig:
-            if part_idx == len(proj_parts) - 1 and select_sig[-1].kind == "punct" and select_sig[-1].text == ",":
-                continue
-            valid = False
-            break
-        # reject star
-        if any(t.kind == "punct" and t.text == "*" for t in psig):
-            valid = False
-            break
-        # reject qualified (dot), function (paren), literals
-        if any(t.kind == "punct" and t.text in (".", "(", ")") for t in psig):
-            valid = False
-            break
-        if any(t.kind == "string" and not t.text.startswith('"') for t in psig):
-            valid = False
-            break
-        # shapes: [col] | [col AS alias] | [col alias]; any other token makes it an expression
-        if any(t.kind not in ("word", "string") for t in psig) or [
-            t.kind == "word" and t.text.upper() == "AS" for t in psig
-        ] not in ([False], [False, False], [False, True, False]):
-            valid = False
-            break
-        words = [t for t in psig if t.kind in ("word", "string")]
-        if len(words) == 1:
-            col_tok = words[0]
-            out_tok = words[0]
-        elif len(words) == 3 and words[1].kind == "word" and words[1].text.upper() == "AS":
-            col_tok, out_tok = words[0], words[2]
-        elif len(words) == 2 and words[1].kind in ("word", "string"):
-            # implicit alias; ensure no AS missing confusion: first must be plain col
-            if words[0].kind != "word" and not (words[0].kind == "string" and words[0].text.startswith('"')):
-                valid = False
-                break
-            col_tok, out_tok = words[0], words[1]
+    # The first FROM at any depth: one inside parens implies a paren in the column list, which no
+    # column shape allows, so it never needs to be told apart from the top-level FROM.
+    from_idx = next((idx for idx, t in enumerate(sig) if t.kind == "word" and t.text.upper() == "FROM"), 0)
+    columns = sig[1:from_idx]
+    ref_call = masked.ref_calls.get(sig[from_idx + 1].text) if from_idx and from_idx + 1 < len(sig) else None
+    predicate_words = [t.text.upper() if t.kind == "word" else "" for t in sig[from_idx + 3 :]]
+    if (
+        ref_call is None
+        or not _is_word(sig, 0, "SELECT")
+        or _is_word(columns, 0, "DISTINCT")
+        or _is_word(columns, 0, "ALL")
+        or (from_idx + 2 < len(sig) and not _is_word(sig, from_idx + 2, "WHERE"))
+        or any(
+            tuple(predicate_words[k : k + len(clause)]) == clause
+            for k in range(len(predicate_words))
+            for clause in _CLAUSES_AFTER_WHERE
+        )
+    ):
+        return not_an_import
+    parts: list[list[Token]] = [[]]
+    for t in columns:
+        if t.kind == "punct" and t.text == ",":
+            parts.append([])
         else:
-            valid = False
-            break
-        # col must be bare identifier (word or quoted), alias likewise
-        for candidate in (col_tok, out_tok):
-            if candidate.kind == "word":
-                # The tokenizer has already validated the complete Unicode-aware
-                # identifier shape. Reapplying an ASCII-only regex here would
-                # silently hide valid imports such as ``café_id`` from grouping.
-                pass
-            elif candidate.kind == "string" and candidate.text.startswith('"'):
-                pass
-            else:
-                valid = False
-                break
-        if not valid:
-            break
-        c_raw, c_quoted = (col_tok.text, col_tok.kind == "string")
-        o_raw, o_quoted = (out_tok.text, out_tok.kind == "string")
-        span = _span_chars(decoded, psig[0].start, psig[-1].end)
+            parts[-1].append(t)
+    if len(parts) > 1 and not parts[-1]:
+        parts.pop()  # trailing comma before FROM (BigQuery style)
+    comments = [
+        t for t in in_body if t.kind == "comment" and columns and columns[0].start <= t.start <= columns[-1].end
+    ]
+    projections: list[Projection] = []
+    for part in parts:
+        if (
+            any(_identity_for_token(t, fold_unquoted) is None for t in part)
+            or [_is_word(part, k, "AS") for k in range(len(part))] not in _COLUMN_SHAPES
+        ):
+            return not_an_import
+        column, output = part[0], part[-1]
         projections.append(
             Projection(
-                upstream_identifier=make_identifier(c_raw, c_quoted, fold_unquoted),
-                output_identifier=make_identifier(o_raw, o_quoted, fold_unquoted),
-                span=span,
-                attached_comment_spans=(),
+                upstream_identifier=make_identifier(column.text, column.kind == "string", fold_unquoted),
+                output_identifier=make_identifier(output.text, output.kind == "string", fold_unquoted),
+                span=byte_span_of(decoded, part[0].start, part[-1].end),
+                attached_comment_spans=tuple(
+                    byte_span_of(decoded, c.start, c.end) for c in comments if part[0].start <= c.start <= part[-1].end
+                ),
             )
         )
-    # attached comments: any SQL comment tokens inside select list range -> attach to enclosing projection span
-    # gather comment tokens in range
-    comments = [
-        t
-        for t in in_range
-        if t.kind == "comment" and select_sig and select_sig[0].start <= t.start <= select_sig[-1].end
-    ]
-    if comments and projections:
-        # attach all as belonging to nearest projection; simplest: attach to projection whose span contains them
-        new_projs: list[Projection] = []
-        for p in projections:
-            attached = tuple(
-                _span_chars(decoded, c.start, c.end)
-                for c in comments
-                if p.span.start_byte <= _char_to_byte(decoded, c.start) <= p.span.end_byte
-            )
-            new_projs.append(
-                Projection(
-                    upstream_identifier=p.upstream_identifier,
-                    output_identifier=p.output_identifier,
-                    span=p.span,
-                    attached_comment_spans=attached,
-                )
-            )
-        projections = new_projs
-        # comments outside every projection span mark relocation unsupported
-        for c in comments:
-            cb = _char_to_byte(decoded, c.start)
-            if not any(p.span.start_byte <= cb <= p.span.end_byte for p in projections):
-                valid = False
-                break
-    predicate_span: SourceSpan | None = None
-    if where_idx is not None:
-        predicate_span = _span_chars(decoded, sig[where_idx].start, sig[-1].end)
-    if not valid:
-        # return with ref_call=None to mark unsupported shape (caller distinguishes)
-        return SourceCTE(
-            identifier=ident,
-            ordinal=ordinal,
-            cte_span=cte_span,
-            body_span=body_span,
-            select_list_span=select_list_span,
-            separator_span=separator_span,
-            ref_call=None,
-            projections=tuple(projections),
-            predicate_source_span=predicate_span,
-        )
-    # duplicate output names within one CTE -> keep but qualification rejects
+    if sum(len(p.attached_comment_spans) for p in projections) != len(comments):
+        return not_an_import  # a comment between columns cannot move with either one
     return SourceCTE(
         identifier=ident,
         ordinal=ordinal,
         cte_span=cte_span,
         body_span=body_span,
-        select_list_span=select_list_span,
+        select_list_span=byte_span_of(decoded, columns[0].start, columns[-1].end),
         separator_span=separator_span,
         ref_call=ref_call,
         projections=tuple(projections),
-        predicate_source_span=predicate_span,
+        predicate_source_span=(
+            byte_span_of(decoded, sig[from_idx + 2].start, sig[-1].end) if from_idx + 2 < len(sig) else None
+        ),
     )
 
 
-def _is_word(tokens: list[Token], idx: int, upper: str) -> bool:
-    return 0 <= idx < len(tokens) and tokens[idx].kind == "word" and tokens[idx].text.upper() == upper
+_ALIAS_STOPPERS = frozenset(
+    {
+        "LEFT",
+        "RIGHT",
+        "FULL",
+        "INNER",
+        "OUTER",
+        "CROSS",
+        "NATURAL",
+        "JOIN",
+        "ON",
+        "USING",
+        "WHERE",
+        "GROUP",
+        "ORDER",
+        "LIMIT",
+        "HAVING",
+        "WINDOW",
+        "QUALIFY",
+        "FETCH",
+        "OFFSET",
+        "UNION",
+        "INTERSECT",
+        "EXCEPT",
+        "SELECT",
+        "WITH",
+    }
+)
+
+_FROM_CLAUSE_ENDERS = frozenset(
+    {
+        "WHERE",
+        "GROUP",
+        "ORDER",
+        "LIMIT",
+        "HAVING",
+        "WINDOW",
+        "QUALIFY",
+        "FETCH",
+        "OFFSET",
+        "UNION",
+        "INTERSECT",
+        "EXCEPT",
+    }
+)
 
 
-def _is_punct(tokens: list[Token], idx: int, text: str) -> bool:
-    return 0 <= idx < len(tokens) and tokens[idx].kind == "punct" and tokens[idx].text == text
-
-
-def _nested_cte_names(sig: list[Token], model: ParsedSourceModel, fold_unquoted: FoldRule) -> frozenset[str]:
+def _nested_cte_names(
+    decoded: DecodedSource, sig: list[Token], ctes: tuple[SourceCTE, ...], fold_unquoted: FoldRule
+) -> frozenset[str]:
     """Identities of CTEs declared anywhere except the top-level WITH list.
 
     A nested CTE can shadow a top-level one, and neither the rewriter nor the compiled delta gate
@@ -909,7 +585,7 @@ def _nested_cte_names(sig: list[Token], model: ParsedSourceModel, fold_unquoted:
     every CTE of a nested list, and nested WITHs in the main query. A declaration whose name is
     not visible (masked Jinja) is refused, since it could shadow anything.
     """
-    top_level_starts = {cte.cte_span.start_byte for cte in model.ctes}
+    top_level_starts = {cte.cte_span.start_byte for cte in ctes}
     opener: dict[int, int] = {}
     stack: list[int] = []
     for idx in range(len(sig)):
@@ -918,274 +594,125 @@ def _nested_cte_names(sig: list[Token], model: ParsedSourceModel, fold_unquoted:
         elif _is_punct(sig, idx, ")"):
             opener[idx] = stack.pop() if stack else -1
     names: set[str] = set()
-    for idx in range(len(sig)):
-        body = idx + 1
+    for as_idx in range(len(sig)):
+        if not _is_word(sig, as_idx, "AS"):
+            continue
+        body = as_idx + 1
         while _is_word(sig, body, "NOT") or _is_word(sig, body, "MATERIALIZED"):
             body += 1
-        if not (_is_word(sig, idx, "AS") and _is_punct(sig, body, "(")):
+        if not _is_punct(sig, body, "("):
             continue
-        name_idx = opener.get(idx - 1, idx) - 1  # step over a column list
+        name_idx = opener.get(as_idx - 1, as_idx) - 1  # step back over a column list
         name = sig[name_idx] if name_idx >= 0 else None
-        if name is not None and model.decoded.char_to_byte[name.start] in top_level_starts:
+        if name is not None and decoded.char_to_byte[name.start] in top_level_starts:
             continue
-        identity = _identity_for_token(name, fold_unquoted) if name is not None else None
-        if identity is None or name is None or name.text.upper() in ("WITH", "RECURSIVE"):
+        identity = _identity_for_token(name, fold_unquoted)
+        if name is None or identity is None or name.text.upper() in ("WITH", "RECURSIVE"):
             raise SourceParseError(ReasonCode.UNSUPPORTED_IMPORT_SHAPE, "nested CTE name is not visible")
         names.add(identity)
     return frozenset(names)
 
 
-def _identity_for_token(token: Token, fold_unquoted: FoldRule) -> str | None:
-    if token.kind == "word":
-        return make_identifier(token.text, False, fold_unquoted).identity.value
-    if token.kind == "string" and token.text.startswith('"'):
-        return make_identifier(token.text, True, fold_unquoted).identity.value
-    return None
+def _comma_relation_indexes(tokens: list[Token]) -> frozenset[int]:
+    """Indexes of commas that separate FROM items, tracked per parenthesis depth."""
+    indexes: set[int] = set()
+    depth = 0
+    in_from: dict[int, bool] = {}
+    for idx, token in enumerate(tokens):
+        keyword = token.text.upper() if token.kind == "word" else ""
+        if _is_punct(tokens, idx, "("):
+            depth += 1
+        elif _is_punct(tokens, idx, ")"):
+            in_from.pop(depth, None)
+            depth = max(depth - 1, 0)
+        elif keyword in ("SELECT", "FROM") or keyword in _FROM_CLAUSE_ENDERS:
+            in_from[depth] = keyword == "FROM"
+        elif _is_punct(tokens, idx, ",") and in_from.get(depth, False):
+            indexes.add(idx)
+    return frozenset(indexes)
+
+
+def _alias_details(tokens: list[Token], name_idx: int, fold_unquoted: FoldRule) -> tuple[bool, str | None]:
+    """(has_alias, identity the relation at name_idx is referred to by; None if unreadable)."""
+    after = tokens[name_idx + 1 : name_idx + 3]
+    if _is_word(after, 0, "AS"):
+        return True, _identity_for_token(after[1] if len(after) > 1 else None, fold_unquoted)
+    if after and after[0].kind in ("word", "string") and after[0].text.upper() not in _ALIAS_STOPPERS:
+        return True, _identity_for_token(after[0], fold_unquoted)
+    return False, _identity_for_token(tokens[name_idx], fold_unquoted)
+
+
+def _qualified_star(tokens: list[Token], alias_identity: str | None, fold_unquoted: FoldRule) -> bool:
+    """Whether the scope selects `alias.*`; an alias or qualifier that cannot be read counts."""
+    return any(
+        _is_punct(tokens, idx + 1, ".")
+        and _is_punct(tokens, idx + 2, "*")
+        and (alias_identity is None or _identity_for_token(tokens[idx], fold_unquoted) in (alias_identity, None))
+        for idx in range(len(tokens))
+    )
 
 
 def _find_downstream_refs(
-    model: ParsedSourceModel, fold_unquoted: FoldRule
-) -> tuple[list[DownstreamRef], frozenset[str]]:
-    cte_idents = {c.identifier.identity.value: c.identifier for c in model.ctes}
-    # body char ranges to exclude (import bodies already parsed) — but downstream refs live outside import SELECT-FROM?
-    # Simplest robust approach: scan significant tokens for FROM/JOIN <name> patterns across whole masked text,
-    # excluding tokens inside import CTE FROM clause (the sentinel) and inside import select lists.
-    # Build exclusion set of char offsets: for each CTE, exclude its select_list+from sentinel? Instead exclude
-    # tokens whose char range lies within any CTE body_span AND the CTE is an import (ref_call not None) and
-    # token is the sentinel itself. Other tokens inside import bodies (e.g. WHERE cols) are not table refs.
-    import_body_ranges = [(c.body_span.start_byte, c.body_span.end_byte) for c in model.ctes if c.ref_call is not None]
-    decoded = model.decoded
-    sig = _significant(model.tokens)
-    refs: list[DownstreamRef] = []
-    nested_names = _nested_cte_names(sig, model, fold_unquoted)
-
-    alias_stoppers = frozenset(
-        {
-            "LEFT",
-            "RIGHT",
-            "FULL",
-            "INNER",
-            "OUTER",
-            "CROSS",
-            "NATURAL",
-            "JOIN",
-            "ON",
-            "USING",
-            "WHERE",
-            "GROUP",
-            "ORDER",
-            "LIMIT",
-            "HAVING",
-            "WINDOW",
-            "QUALIFY",
-            "FETCH",
-            "OFFSET",
-            "UNION",
-            "INTERSECT",
-            "EXCEPT",
-            "SELECT",
-            "WITH",
-        }
-    )
-
-    def _identity_for_token(token: Token) -> str | None:
-        if token.kind == "word":
-            return make_identifier(token.text, False, fold_unquoted).identity.value
-        if token.kind == "string" and token.text.startswith('"'):
-            return make_identifier(token.text, True, fold_unquoted).identity.value
-        return None
-
-    main_start = max((c.cte_span.end_byte for c in model.ctes), default=0)
-    contexts: dict[str | None, list[Token]] = {}
-    for cte in model.ctes:
-        contexts[cte.identifier.source_text] = [
-            token
-            for token in sig
-            if cte.body_span.start_byte <= decoded.char_to_byte[token.start] < cte.body_span.end_byte
+    decoded: DecodedSource, sig: list[Token], ctes: tuple[SourceCTE, ...], fold_unquoted: FoldRule
+) -> tuple[tuple[DownstreamRef, ...], frozenset[str]]:
+    """References to top-level CTEs from other CTE bodies and the main query, plus nested CTE names."""
+    cte_identities = {cte.identifier.identity.value for cte in ctes}
+    # Scopes: each non-import CTE body, then the main query. An import's only relation is its ref, so
+    # a FROM in its body (e.g. `extract(year from x)`) names no relation.
+    scopes: dict[str | None, list[Token]] = {
+        cte.identifier.source_text: [
+            t for t in sig if cte.body_span.start_byte <= decoded.char_to_byte[t.start] < cte.body_span.end_byte
         ]
-    contexts[None] = [token for token in sig if decoded.char_to_byte[token.start] >= main_start]
-
-    def _comma_relation_indexes(context_tokens: list[Token]) -> list[int]:
-        indexes: list[int] = []
-        depth = 0
-        in_from: dict[int, bool] = {}
-        clause_enders = frozenset(
-            {
-                "WHERE",
-                "GROUP",
-                "ORDER",
-                "LIMIT",
-                "HAVING",
-                "WINDOW",
-                "QUALIFY",
-                "FETCH",
-                "OFFSET",
-                "UNION",
-                "INTERSECT",
-                "EXCEPT",
-            }
-        )
-        for idx, token in enumerate(context_tokens):
-            if token.kind == "punct" and token.text == "(":
-                depth += 1
-                continue
-            if token.kind == "punct" and token.text == ")":
-                in_from.pop(depth, None)
-                depth = max(depth - 1, 0)
-                continue
-            if token.kind == "word":
-                keyword = token.text.upper()
-                if keyword == "SELECT":
-                    in_from[depth] = False
-                elif keyword == "FROM":
-                    in_from[depth] = True
-                elif keyword in clause_enders:
-                    in_from[depth] = False
-            elif token.kind == "punct" and token.text == "," and in_from.get(depth, False):
-                indexes.append(idx)
-        return indexes
-
-    context_features: dict[str | None, tuple[bool, bool, frozenset[str], bool, list[int]]] = {}
-    for context, context_tokens in contexts.items():
-        comma_indexes = _comma_relation_indexes(context_tokens)
-        has_natural = any(t.kind == "word" and t.text.upper() == "NATURAL" for t in context_tokens)
-        multi_relation = bool(comma_indexes) or any(
-            t.kind == "word" and t.text.upper() == "JOIN" for t in context_tokens
-        )
+        for cte in ctes
+        if cte.ref_call is None
+    }
+    main_start = ctes[-1].cte_span.end_byte
+    scopes[None] = [t for t in sig if decoded.char_to_byte[t.start] >= main_start]
+    features: dict[str | None, tuple[bool, bool, frozenset[str], bool, frozenset[int]]] = {}
+    for scope, tokens in scopes.items():
+        comma_indexes = _comma_relation_indexes(tokens)
         unqualified: set[str] = set()
-        bare_star = False
-        for token_idx, token in enumerate(context_tokens):
-            if token.kind == "punct" and token.text == "*":
-                prev = context_tokens[token_idx - 1] if token_idx else None
-                if prev is not None and prev.kind == "word" and prev.text.upper() == "SELECT":
-                    bare_star = True
-                continue
-            identity = _identity_for_token(token)
-            if identity is None:
-                continue
-            prev = context_tokens[token_idx - 1] if token_idx else None
-            nxt = context_tokens[token_idx + 1] if token_idx + 1 < len(context_tokens) else None
-            if (prev is not None and prev.kind == "punct" and prev.text == ".") or (
-                nxt is not None and nxt.kind == "punct" and nxt.text == "."
-            ):
-                continue
-            unqualified.add(identity)
-        context_features[context] = (
-            has_natural,
-            multi_relation,
+        for idx, token in enumerate(tokens):
+            identity = _identity_for_token(token, fold_unquoted)
+            if identity is not None and not (_is_punct(tokens, idx - 1, ".") or _is_punct(tokens, idx + 1, ".")):
+                unqualified.add(identity)
+        features[scope] = (
+            any(_is_word(tokens, idx, "NATURAL") for idx in range(len(tokens))),
+            bool(comma_indexes) or any(_is_word(tokens, idx, "JOIN") for idx in range(len(tokens))),
             frozenset(unqualified),
-            bare_star,
+            any(_is_punct(tokens, idx, "*") and _is_word(tokens, idx - 1, "SELECT") for idx in range(len(tokens))),
             comma_indexes,
         )
-
-    def _context_for_byte(byte_offset: int) -> str | None:
-        for cte in model.ctes:
-            if cte.body_span.start_byte <= byte_offset < cte.body_span.end_byte:
-                return cte.identifier.source_text
-        return None
-
-    def _alias_details(tokens_in_scope: list[Token], name_idx: int) -> tuple[bool, str | None]:
-        name_token = tokens_in_scope[name_idx]
-        relation_identity = _identity_for_token(name_token)
-        if name_idx + 1 >= len(tokens_in_scope):
-            return False, relation_identity
-        nxt = tokens_in_scope[name_idx + 1]
-        if nxt.kind == "word" and nxt.text.upper() == "AS":
-            alias_token = tokens_in_scope[name_idx + 2] if name_idx + 2 < len(tokens_in_scope) else None
-            return True, _identity_for_token(alias_token) if alias_token is not None else None
-        if nxt.kind in ("word", "string") and nxt.text.upper() not in alias_stoppers:
-            return True, _identity_for_token(nxt)
-        return False, relation_identity
-
-    def _qualified_star(context_tokens: list[Token], alias_identity: str | None) -> bool:
-        # An alias or qualifier the frontend cannot read may be the same name: count it.
-        for token_idx in range(len(context_tokens) - 2):
-            first, dot, star = context_tokens[token_idx : token_idx + 3]
-            if dot.kind != "punct" or dot.text != "." or star.kind != "punct" or star.text != "*":
-                continue
-            if alias_identity is None or _identity_for_token(first) in (alias_identity, None):
-                return True
-        return False
-
-    for idx, t in enumerate(sig):
-        if t.kind == "word" and t.text.upper() in ("FROM", "JOIN"):
-            if idx + 1 >= len(sig):
-                continue
-            name_tok = sig[idx + 1]
-            if name_tok.kind not in ("word", "string"):
-                continue
-            if is_sentinel_word(name_tok.text):
-                continue
-            q = name_tok.kind == "string"
-            ident = make_identifier(name_tok.text, q, fold_unquoted)
-            if ident.identity.value not in cte_idents:
-                continue
-            # skip if this token is inside an import body (e.g. self?) — check byte range
-            tb = decoded.char_to_byte[name_tok.start]
-            if any(s <= tb < e for s, e in import_body_ranges):
-                # Could still be a genuine downstream ref inside another CTE body (non-import CTE).
-                # Only skip when inside an import CTE body.
-                pass
-                # determine enclosing CTE: find cte whose body contains tb and is import
-                enclosing_import = any(
-                    c.body_span.start_byte <= tb < c.body_span.end_byte and c.ref_call is not None for c in model.ctes
+    refs: list[DownstreamRef] = []
+    # FROM/JOIN-bound references first, then comma-bound ones. A comma-bound relation has no FROM or
+    # JOIN before it; it is recorded as an ambiguous binding so qualification refuses rather than
+    # deleting a donor and leaving a dangling or externally rebound name.
+    for comma_bound in (False, True):
+        for scope, tokens in scopes.items():
+            has_natural, multi_relation, unqualified_identities, bare_star, comma_indexes = features[scope]
+            for idx in range(1, len(tokens)):
+                bound = (
+                    idx - 1 in comma_indexes
+                    if comma_bound
+                    else _is_word(tokens, idx - 1, "FROM") or _is_word(tokens, idx - 1, "JOIN")
                 )
-                if enclosing_import:
+                identity = _identity_for_token(tokens[idx], fold_unquoted)
+                if not bound or identity is None or identity not in cte_identities:
                     continue
-            # enclosing CTE context
-            context = _context_for_byte(tb)
-            context_tokens = contexts[context]
-            try:
-                context_name_idx = context_tokens.index(name_tok)
-            except ValueError:
-                continue
-            has_alias, alias_identity = _alias_details(context_tokens, context_name_idx)
-            has_natural, multi_relation, context_unqualified, bare_star, _ = context_features[context]
-            refs.append(
-                DownstreamRef(
-                    cte_identity=ident.identity,
-                    span=_span_chars(decoded, name_tok.start, name_tok.end),
-                    has_alias=has_alias,
-                    context_cte=context,
-                    binding_ambiguous=has_natural,
-                    star_expansion=bare_star or _qualified_star(context_tokens, alias_identity),
-                    multi_relation=multi_relation,
-                    unqualified_identities=context_unqualified,
+                has_alias, alias_identity = _alias_details(tokens, idx, fold_unquoted)
+                refs.append(
+                    DownstreamRef(
+                        cte_identity=IdentifierIdentity(identity),
+                        span=byte_span_of(decoded, tokens[idx].start, tokens[idx].end),
+                        has_alias=has_alias,
+                        context_cte=scope,
+                        binding_ambiguous=has_natural or comma_bound,
+                        star_expansion=bare_star or _qualified_star(tokens, alias_identity, fold_unquoted),
+                        multi_relation=multi_relation,
+                        unqualified_identities=unqualified_identities,
+                    )
                 )
-            )
-
-    # Comma-separated FROM items have no FROM/JOIN token immediately before
-    # them. Record them as ambiguous bindings so qualification refuses rather
-    # than deleting a donor and leaving a dangling or externally rebound name.
-    existing_spans = {(ref.span.start_byte, ref.span.end_byte) for ref in refs}
-    for context, context_tokens in contexts.items():
-        has_natural, _multi_relation, context_unqualified, bare_star, comma_indexes = context_features[context]
-        for comma_idx in comma_indexes:
-            name_idx = comma_idx + 1
-            if name_idx >= len(context_tokens):
-                continue
-            name_tok = context_tokens[name_idx]
-            identity = _identity_for_token(name_tok)
-            if identity is None or identity not in cte_idents:
-                continue
-            span = _span_chars(decoded, name_tok.start, name_tok.end)
-            if (span.start_byte, span.end_byte) in existing_spans:
-                continue
-            has_alias, alias_identity = _alias_details(context_tokens, name_idx)
-            refs.append(
-                DownstreamRef(
-                    cte_identity=IdentifierIdentity(identity),
-                    span=span,
-                    has_alias=has_alias,
-                    context_cte=context,
-                    binding_ambiguous=True,
-                    star_expansion=bare_star or _qualified_star(context_tokens, alias_identity),
-                    multi_relation=True,
-                    unqualified_identities=context_unqualified,
-                )
-            )
-            existing_spans.add((span.start_byte, span.end_byte))
-    return refs, frozenset(nested_names)
+    return tuple(refs), _nested_cte_names(decoded, sig, ctes, fold_unquoted)
 
 
 def source_sha256(data: bytes) -> str:
@@ -1203,18 +730,16 @@ def has_unsupported_duplicate_candidates(model: ParsedSourceModel) -> bool:
     grouped: dict[tuple[object, ...], list[bool]] = {}
     literal_calls = tuple(model.masked.ref_calls.values())
     for cte in model.ctes:
-        call = cte.ref_call
-        supported = call is not None
+        contained = [
+            candidate
+            for candidate in literal_calls
+            if cte.body_span.start_byte <= candidate.span.start_byte
+            and candidate.span.end_byte <= cte.body_span.end_byte
+        ]
+        # An unsupported CTE counts only when exactly one literal call could be its input.
+        call = cte.ref_call or (contained[0] if len(contained) == 1 else None)
         if call is None:
-            contained = [
-                candidate
-                for candidate in literal_calls
-                if cte.body_span.start_byte <= candidate.span.start_byte
-                and candidate.span.end_byte <= cte.body_span.end_byte
-            ]
-            if len(contained) != 1:
-                continue
-            call = contained[0]
+            continue
         key = (call.kind, call.package, call.name, call.source_name, call.version)
-        grouped.setdefault(key, []).append(supported)
+        grouped.setdefault(key, []).append(cte.ref_call is not None)
     return any(len(support_flags) >= 2 and not all(support_flags) for support_flags in grouped.values())

@@ -2,7 +2,8 @@
 
 import pytest
 
-from dbt_refmerge.domain import RefCall, SourceSpan
+from dbt_refmerge.domain import ReasonCode, RefCall, SourceSpan
+from dbt_refmerge.errors import SourceParseError
 from dbt_refmerge.source import decode_source, mask_jinja, parse_source_model
 
 
@@ -47,6 +48,97 @@ def test_whitespace_control_markers_keep_literal_calls(call, expected):
 def test_invalid_whitespace_control_is_dynamic(call):
     # Jinja rejects each of these, so none is a literal call.
     assert _calls(call) == []
+
+
+@pytest.mark.parametrize(
+    "src",
+    [
+        b"select \xff from t",
+        b"select {% raw %} x",
+        b"select {{ x",
+        b"select {% if x",
+        b"select {# note",
+        b"select {% raw %}{% endraw",
+    ],
+    ids=["invalid-utf8", "raw", "expression", "statement", "comment", "raw-end"],
+)
+def test_mask_jinja_refuses_unterminated_or_undecodable(src):
+    with pytest.raises(SourceParseError) as exc_info:
+        parse_source_model(src)
+    assert exc_info.value.reason_code is ReasonCode.INTERNAL_ERROR
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        "{{ ref('m' }}",
+        "{{ this }}",
+        "{{ foo.ref('m') }}",
+        "{{ other('m') }}",
+        "{{ ref('m') | upper }}",
+        "{{ ref(none) }}",
+        "{{ ref(1.5) }}",
+        "{{ ref(model_name) }}",
+        "{{ ref('m', version=var) }}",
+        "{{ ref('m', version=none) }}",
+        "{{ ref(1) }}",
+        "{{ ref('p', 2) }}",
+        "{{ ref('') }}",
+        "{{ ref() }}",
+        "{{ ref('a', 'b', 'c') }}",
+        "{{ source('s') }}",
+        "{{ source('s', 't', 'u') }}",
+        '{{ source("s", 1) }}',
+    ],
+)
+def test_non_literal_jinja_calls_are_not_sentinels(call):
+    assert _calls(call) == []
+
+
+@pytest.mark.parametrize(
+    ("call", "expected"),
+    [
+        ("{{ ref('m', version=1) }}", RefCall("ref", None, "m", None, 1, SourceSpan(0, 25))),
+        ("{{ ref('m', v='2') }}", RefCall("ref", None, "m", None, "2", SourceSpan(0, 21))),
+        ("{{ ref('p', 'm') }}", RefCall("ref", "p", "m", None, None, SourceSpan(0, 19))),
+        ('{{ ref("p", "m", v=3) }}', RefCall("ref", "p", "m", None, 3, SourceSpan(0, 24))),
+        ("{{ ref(\n  'm'\n) }}", RefCall("ref", None, "m", None, None, SourceSpan(0, 18))),
+        ('{{ source("s", "t") }}', RefCall("source", None, "t", "s", None, SourceSpan(0, 22))),
+    ],
+    ids=["version", "v", "package", "package-ast", "multiline", "source-ast"],
+)
+def test_literal_ref_variants_capture_package_and_version(call, expected):
+    assert _calls(call) == [expected]
+
+
+def test_masking_preserves_newlines_in_every_jinja_kind():
+    src = (
+        "select {{ ref(\n'm') }}, {{ x\r\n }}, {% if\nx %}{# é\nb #}"
+        "{% raw %}\n{{ y }}{% endraw %} from {{ source('s', 't') }}"
+    ).encode()
+    masked = mask_jinja(decode_source(src))
+    assert masked.masked_text == (
+        "select "
+        + ("__r0__" + " " + "\n" + " " * 7)  # {{ ref(\n'm') }}: sentinel over the first six chars
+        + ", "
+        + (" " * 4 + "\r\n" + " " * 3)  # {{ x\r\n }}
+        + ", "
+        + (" " * 5 + "\n" + " " * 4)  # {% if\nx %}
+        + (" " * 4 + "\n" + " " * 4)  # {# é\nb #}: one blank per char, not per byte
+        + (" " * 9 + "\n" + " " * 19)  # {% raw %}\n{{ y }}{% endraw %}
+        + " from "
+        + ("__r1__" + " " * 16)  # {{ source('s', 't') }}
+    )
+    assert [(span.kind, span.span, span.text) for span in masked.jinja_spans] == [
+        ("expression", SourceSpan(7, 22), b"{{ ref(\n'm') }}"),
+        ("expression", SourceSpan(24, 33), b"{{ x\r\n }}"),
+        ("statement", SourceSpan(35, 45), b"{% if\nx %}"),
+        ("comment", SourceSpan(45, 55), "{# é\nb #}".encode()),
+        ("raw", SourceSpan(55, 84), b"{% raw %}\n{{ y }}{% endraw %}"),
+        ("expression", SourceSpan(90, 112), b"{{ source('s', 't') }}"),
+    ]
+    assert list(masked.ref_calls) == ["__r0__", "__r1__"]
+    assert masked.masked_bytes == masked.masked_text.encode()
 
 
 def test_literal_ref_masked_with_sentinel():

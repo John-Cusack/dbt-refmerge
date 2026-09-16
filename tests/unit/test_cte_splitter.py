@@ -158,3 +158,159 @@ def test_downstream_alias_tracking():
     for r in m.downstream_refs:
         by_ident.setdefault(r.cte_identity.value, []).append(r.has_alias)
     assert "a" in by_ident and "b" in by_ident
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "",
+        "select 1",
+        "values (1)",
+        "{{ config(materialized='table') }}",
+        "select * from (with a as (select 1) select * from a) s",
+    ],
+    ids=["empty", "select", "values", "jinja-only", "with-after-select"],
+)
+def test_source_without_with_has_no_ctes(sql):
+    model = parse_source_model(_src(sql))
+    assert (model.ctes, model.downstream_refs, model.nested_names) == ((), (), frozenset())
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "with recursive a as (select 1) select 1",
+        "with a as (select 1), recursive b as (select 1) select 1",
+        "with a as (select 1), A as (select 1) select 1",
+        'with "a" as (select 1), a as (select 1) select 1',
+        "with a x as (select 1) select 1",
+        "with a (x) as (select 1) select 1",
+        "with a as not materialized (select 1) select 1",
+        "with a as materialized (select 1) select 1",
+        "with a as select 1",
+        "with a",
+        "with a as (select (1) select 1",
+        "with a as (select 1), , b as (select 1) select 1",
+        "with 'a' as (select 1) select 1",
+        "with `a` as (select 1) select 1",
+    ],
+    ids=[
+        "recursive",
+        "recursive-after-comma",
+        "duplicate-folded",
+        "duplicate-quoted",
+        "name-then-word",
+        "column-list",
+        "not-materialized",
+        "materialized",
+        "missing-parens",
+        "name-at-end",
+        "unbalanced",
+        "empty-list-item",
+        "single-quoted-name",
+        "backtick-name",
+    ],
+)
+def test_cte_list_syntax_refusals(sql):
+    with pytest.raises(SourceParseError) as exc_info:
+        parse_source_model(_src(sql))
+    assert exc_info.value.reason_code is ReasonCode.UNSUPPORTED_IMPORT_SHAPE
+
+
+@pytest.mark.parametrize(
+    ("sql", "expected"),
+    [
+        ("with {{ all_ctes() }} select 1", []),
+        ("with a as (select 1), {{ more_ctes() }} select 1", [("a", ",")]),
+        ("with a as (select 1), {{ more_ctes_and_query() }}", [("a", ",")]),
+        ('with a as (select 1),\n"B" as (select 2)\nselect 1', [("a", ","), ('"B"', None)]),
+    ],
+    ids=["whole-list", "rest-of-list", "rest-of-model", "no-jinja"],
+)
+def test_cte_list_ends_at_main_query_or_end_of_source(sql, expected):
+    # CTEs rendered by masked Jinja are invisible, so the parsed list simply stops there.
+    raw = _src(sql)
+    model = parse_source_model(raw)
+    assert [
+        (
+            cte.identifier.source_text,
+            None
+            if cte.separator_span is None
+            else raw[cte.separator_span.start_byte : cte.separator_span.end_byte].decode(),
+        )
+        for cte in model.ctes
+    ] == expected
+
+
+_REF = "{{ ref('m') }}"
+
+
+@pytest.mark.parametrize(
+    ("body", "expected"),
+    [
+        # Supported: (projections as (upstream, output, attached comments), select list, predicate).
+        (f"select id from {_REF}", ([("id", "id", [])], "id", None)),
+        (
+            f'select id as ident, "Amount" amt, "x""y" from {_REF}',
+            (
+                [("id", "ident", []), ('"Amount"', "amt", []), ('"x""y"', '"x""y"', [])],
+                'id as ident, "Amount" amt, "x""y"',
+                None,
+            ),
+        ),
+        (
+            f"select\n  id,\n  amount,\nfrom {_REF}",
+            ([("id", "id", []), ("amount", "amount", [])], "id,\n  amount,", None),
+        ),
+        (
+            f"select amount /* euros */ as amt from {_REF} where id > 0 and start = 1",
+            ([("amount", "amt", ["/* euros */"])], "amount /* euros */ as amt", "where id > 0 and start = 1"),
+        ),
+        (f"select id -- trailing\nfrom {_REF}\nwhere", ([("id", "id", [])], "id", "where")),
+        # Not an import: ref_call None, no projections, the whole body as the select list.
+        ("", None),
+        ("values (1)", None),
+        ("select 1", None),
+        ("select id from", None),
+        (f"select from {_REF}", None),
+        (f"select distinct id from {_REF}", None),
+        (f"select all id from {_REF}", None),
+        ("select id from tbl", None),
+        ("select id from {{ var('relation') }}", None),
+        (f"select id from {_REF} as t", None),
+        (f"select id from {_REF} t where id > 0", None),
+        (f"select * from {_REF}", None),
+        (f"select t.id from {_REF}", None),
+        (f"select lower(id) from {_REF}", None),
+        (f"select 'x' as id from {_REF}", None),
+        (f"select `id` from {_REF}", None),
+        (f"select id,, amount from {_REF}", None),
+        (f"select , id from {_REF}", None),
+        (f"select id /* key */, amount from {_REF}", None),
+        (f"select (select 1 from t) as id from {_REF}", None),
+    ],
+)
+def test_import_body_shapes(body, expected):
+    raw = _src(f"with a as ({body}) select 1")
+    (cte,) = parse_source_model(raw).ctes
+
+    def text(span):
+        return None if span is None else raw[span.start_byte : span.end_byte].decode()
+
+    actual = (
+        [
+            (
+                p.upstream_identifier.source_text,
+                p.output_identifier.source_text,
+                [text(c) for c in p.attached_comment_spans],
+            )
+            for p in cte.projections
+        ],
+        text(cte.select_list_span),
+        text(cte.predicate_source_span),
+    )
+    if expected is None:
+        assert (cte.ref_call, actual) == (None, ([], body, None))
+    else:
+        assert cte.ref_call is not None
+        assert actual == expected
