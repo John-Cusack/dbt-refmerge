@@ -112,7 +112,7 @@ def check_report_json(
         models.append(
             {
                 "model_unique_id": receipt.model_unique_id,
-                "source_path": str(receipt.source_path),
+                "source_path": receipt.source_path.as_posix(),
                 "status": receipt.status.value,
                 "reason_codes": [c.value for c in receipt.reason_codes],
                 "warning_codes": list(receipt.warning_codes),
@@ -176,7 +176,7 @@ def render_human_check(report: CheckReport) -> str:
     lines: list[str] = []
     for result in sorted(report.results, key=lambda r: r.model_unique_id):
         receipt = result.receipt
-        lines.append(f"model {receipt.model_unique_id} ({receipt.source_path})")
+        lines.append(f"model {receipt.model_unique_id} ({receipt.source_path.as_posix()})")
         lines.append(f"  status: {receipt.status.value} fixable={is_fixable(receipt)}")
         lines.append(f"  reasons: {', '.join(c.value for c in receipt.reason_codes)}")
         lines.append(

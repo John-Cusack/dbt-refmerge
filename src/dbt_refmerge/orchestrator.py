@@ -462,7 +462,7 @@ class RefmergeService:
                 spec=spec,
             )
         )
-        diff = _unified_diff(raw, candidate_bytes, str(rel))
+        diff = _unified_diff(raw, candidate_bytes, rel.as_posix())  # a/ b/ headers use forward slashes everywhere
         return ModelResult(node.unique_id, src_path, receipt, diff), candidate_bytes
 
     def _validate_delta(

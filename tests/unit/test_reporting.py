@@ -187,7 +187,7 @@ def test_check_report_json_counts_each_status():
     ]
     assert doc["models"][0] == {
         "model_unique_id": "model.p.a",
-        "source_path": str(Path("models/a.sql")),
+        "source_path": "models/a.sql",
         "status": "snapshot_equivalent",
         "reason_codes": ["OK"],
         "warning_codes": ["W1"],
