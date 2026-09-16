@@ -13,6 +13,7 @@ Behaviour switches (``FAKE_DBT_MODE``, comma separated, ``key`` or ``key=value``
 - ``ignore_target_path``: write the manifest to ``<project>/target`` instead
 - ``adapter_type=<name>``: manifest ``metadata.adapter_type`` (default ``postgres``)
 - ``candidate_drop_node``: candidate manifest omits the selected model
+- ``candidate_bad_manifest``: candidate manifest is not valid JSON
 - ``candidate_drift``: candidate compiled SQL gains ``limit 1``
 - ``sleep=<seconds>``, ``ignore_sigterm``, ``sigint_parent=<delay>``: process-control tests
 - ``big_logs=<chars>`` (with ``big_logs_char=<c>``): write that many characters to stdout and stderr
@@ -91,10 +92,10 @@ ALIAS_RE = re.compile(r"""alias\s*=\s*['"]([A-Za-z0-9_]+)['"]""")
 HARNESS_NAME_RE = re.compile(r"'(dbt_refmerge_(?:baseline|candidate)_[a-z0-9_]+)'")
 
 
-def _selected(selector: str | None, name: str) -> bool:
+def _selected(selector: str | None, name: str, path: str = "") -> bool:
     if selector in (None, "fqn:*", "*"):
         return True
-    return selector in (name, f"fqn:{name}")
+    return selector in (name, f"fqn:{name}", f"path:{path}")
 
 
 def _compile(args: list[str], modes: dict[str, str], *, parse_only: bool = False) -> int:
@@ -118,7 +119,11 @@ def _compile(args: list[str], modes: dict[str, str], *, parse_only: bool = False
     for path in sorted((project / "models").rglob("*.sql")):
         name = path.stem
         uid = f"model.{package}.{name}"
-        if is_candidate and "candidate_drop_node" in modes and _selected(selector, name):
+        if (
+            is_candidate
+            and "candidate_drop_node" in modes
+            and _selected(selector, name, path.relative_to(project).as_posix())
+        ):
             continue
         raw = path.read_text(encoding="utf-8")
         config_match = CONFIG_RE.search(raw)
@@ -151,7 +156,11 @@ def _compile(args: list[str], modes: dict[str, str], *, parse_only: bool = False
         compiled = CONFIG_RE.sub("", raw)
         compiled = REF_RE.sub(lambda m: f'"db"."sch"."{m.group(1)}"', compiled)
         compiled = SOURCE_RE.sub(lambda m: f'"db"."{m.group(1)}"."{m.group(2)}"', compiled)
-        if is_candidate and "candidate_drift" in modes and _selected(selector, name):
+        if (
+            is_candidate
+            and "candidate_drift" in modes
+            and _selected(selector, name, path.relative_to(project).as_posix())
+        ):
             compiled = compiled.rstrip() + " limit 1\n"
         nodes[uid] = {
             "unique_id": uid,
@@ -165,7 +174,9 @@ def _compile(args: list[str], modes: dict[str, str], *, parse_only: bool = False
             "alias": alias,
             "relation_name": f'"db"."{schema}"."{alias}"',
             "raw_code": raw,
-            "compiled_code": compiled if _selected(selector, name) and not parse_only else None,
+            "compiled_code": compiled
+            if _selected(selector, name, path.relative_to(project).as_posix()) and not parse_only
+            else None,
             "depends_on": {
                 "macros": [],
                 "nodes": sorted(
@@ -196,6 +207,9 @@ def _compile(args: list[str], modes: dict[str, str], *, parse_only: bool = False
         "nodes": nodes,
         "sources": sources,
     }
+    if is_candidate and "candidate_bad_manifest" in modes:
+        (target / "manifest.json").write_text("{not json", encoding="utf-8")
+        return 0
     (target / "manifest.json").write_text(json.dumps(manifest, indent=1), encoding="utf-8")
     return 0
 

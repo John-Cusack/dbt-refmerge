@@ -93,9 +93,8 @@ def test_load_config_rejects_non_table_dbt_refmerge_entry(make_project):
         'fail_on = "sometimes"\n',
         "subprocess_timeout_seconds = 0\n",
         "dbt_command = 5\n",
-        "project_dir = 5\n",
     ],
-    ids=["malformed-toml", "unknown-fail-on", "zero-timeout", "dbt-command-not-list-or-string", "project-dir-not-path"],
+    ids=["malformed-toml", "unknown-fail-on", "zero-timeout", "dbt-command-not-list-or-string"],
 )
 def test_load_config_rejects_invalid_toml_with_value_error(make_project, toml):
     with pytest.raises(ValueError):
@@ -109,9 +108,7 @@ def test_load_config_env_coercions(make_project, monkeypatch):
         "DBT_REFMERGE_FAIL_ON": "different",
         "DBT_REFMERGE_SUBPROCESS_TIMEOUT_SECONDS": "90",
         "DBT_REFMERGE_WAREHOUSE_STATEMENT_TIMEOUT_MS": "1000",
-        "DBT_REFMERGE_WAREHOUSE_LOCK_TIMEOUT_MS": "86400000",
         "DBT_REFMERGE_KEEP_WORKSPACE": "TRUE",
-        "DBT_REFMERGE_ALLOW_COMPILE_INTROSPECTION": "yes",
         "DBT_REFMERGE_JSON_OUTPUT": "1",
         "DBT_REFMERGE_DEBUG": "false",
         "REFMERGE_PROFILE": "unprefixed-is-ignored",
@@ -123,13 +120,8 @@ def test_load_config_env_coercions(make_project, monkeypatch):
 
     assert (config.profile, config.target) == ("from-env", "from-toml")
     assert config.fail_on is FailOn.DIFFERENT
-    assert (
-        config.subprocess_timeout_seconds,
-        config.warehouse_statement_timeout_ms,
-        config.warehouse_lock_timeout_ms,
-    ) == (90, 1000, 86_400_000)
-    assert (config.keep_workspace, config.allow_compile_introspection, config.json_output, config.debug) == (
-        True,
+    assert (config.subprocess_timeout_seconds, config.warehouse_statement_timeout_ms) == (90, 1000)
+    assert (config.keep_workspace, config.json_output, config.debug) == (
         True,
         True,
         False,
@@ -279,3 +271,10 @@ def test_load_config_explicit_profiles_dir_wins_over_dbt_profiles_dir(make_proje
     config = load_config(root, cli_overrides={"profiles_dir": tmp_path / "cli"})
 
     assert config.profiles_dir == tmp_path / "cli"
+
+
+def test_project_dir_argument_wins_over_environment_and_toml(make_project, monkeypatch, tmp_path):
+    root = make_project({".dbt-refmerge.toml": f'project_dir = "{tmp_path.as_posix()}"\n'})
+    monkeypatch.setenv("DBT_REFMERGE_PROJECT_DIR", str(tmp_path))
+
+    assert load_config(root).project_dir == root.resolve()

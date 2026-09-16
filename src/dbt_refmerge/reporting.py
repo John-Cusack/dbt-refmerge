@@ -85,6 +85,7 @@ def check_report_json(
     dbt_version: str = "",
     adapter_type: str = "postgres",
     manifest_schema_version: str = "",
+    workspace: Path | None = None,
 ) -> dict[str, Any]:
     models: list[dict[str, Any]] = []
     counts = {
@@ -146,6 +147,7 @@ def check_report_json(
         },
         "summary": counts,
         "models": models,
+        "workspace": None if workspace is None else str(workspace),
         "cleanup": {"complete": all(r.receipt.cleanup_complete for r in report.results), "objects": []},
     }
 

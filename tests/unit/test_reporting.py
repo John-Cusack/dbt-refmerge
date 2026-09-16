@@ -175,6 +175,7 @@ def test_check_report_json_counts_each_status():
         "dbt": {"version": "1.9.0", "adapter_type": "postgres", "manifest_schema_version": "v12"},
         "summary": {"models_scanned": 6, "findings": 2, "fixable": 1, "different": 1, "unverifiable": 1, "errors": 1},
         "cleanup": {"complete": False, "objects": []},
+        "workspace": None,
     }
     assert [(m["model_unique_id"], m["status"], m["reason_codes"], m["fixable"]) for m in doc["models"]] == [
         ("model.p.a", "snapshot_equivalent", ["OK"], True),

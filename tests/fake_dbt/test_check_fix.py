@@ -109,3 +109,13 @@ def test_check_report_survives_local_workspace_cleanup_failure(make_project, fak
     report = RefmergeService().check(CheckRequest(config=_config(root, fake_dbt, tmp_path)))
 
     assert {r.model_unique_id for r in report.results} == {"model.p.orders", "model.p.stg_orders"}
+
+
+def test_unreadable_candidate_manifest_refuses_that_model_only(make_project, fake_dbt, tmp_path):
+    fake_dbt.set_mode("candidate_bad_manifest")
+    root = make_project({"models/stg_orders.sql": STG, "models/orders.sql": README_MODEL})
+
+    report = RefmergeService().check(CheckRequest(config=_config(root, fake_dbt, tmp_path)))
+
+    receipt = _results(report)["model.p.orders"].receipt
+    assert (receipt.status, receipt.reason_codes) == (VerificationStatus.UNVERIFIABLE, (ReasonCode.INTERNAL_ERROR,))
