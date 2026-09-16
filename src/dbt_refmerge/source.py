@@ -61,9 +61,9 @@ def decode_source(data: bytes) -> DecodedSource:
         raise SourceParseError(ReasonCode.INTERNAL_ERROR, f"invalid UTF-8 source: {exc}") from exc
     # newline detection
     has_crlf = "\r\n" in text
-    stripped = text.replace("\r\n", "\n")
-    has_lf = "\n" in stripped
-    has_cr = "\r" in stripped
+    without_crlf = text.replace("\r\n", "")
+    has_lf = "\n" in without_crlf
+    has_cr = "\r" in without_crlf
     if has_crlf and (has_lf or has_cr):
         style = "mixed"
     elif has_crlf:
@@ -408,6 +408,10 @@ class DownstreamRef:
     span: SourceSpan
     has_alias: bool
     context_cte: str | None  # enclosing CTE name if inside another CTE body
+    binding_ambiguous: bool = False
+    star_expansion: bool = False
+    multi_relation: bool = False
+    unqualified_identities: frozenset[str] = frozenset()
 
 
 @dataclass
@@ -419,6 +423,7 @@ class ParsedSourceModel:
     downstream_refs: tuple[DownstreamRef, ...]
     nested_names: frozenset[str] = frozenset()
     sentinel_to_span: dict[str, SourceSpan] = field(default_factory=dict)
+    fold_unquoted: FoldRule = "lower"
 
 
 def _char_to_byte(decoded: DecodedSource, ch: int) -> int:
@@ -461,7 +466,14 @@ def parse_source_model(data: bytes, *, fold_unquoted: FoldRule = "lower") -> Par
     ctes: list[SourceCTE] = []
     downstream: list[DownstreamRef] = []
     if with_idx is None:
-        return ParsedSourceModel(decoded=decoded, masked=masked, tokens=tokens, ctes=(), downstream_refs=())
+        return ParsedSourceModel(
+            decoded=decoded,
+            masked=masked,
+            tokens=tokens,
+            ctes=(),
+            downstream_refs=(),
+            fold_unquoted=fold_unquoted,
+        )
     # iterate CTEs from with_idx+1
     pos = with_idx + 1
     ordinal = 0
@@ -565,7 +577,14 @@ def parse_source_model(data: bytes, *, fold_unquoted: FoldRule = "lower") -> Par
         pos = close_sig + (2 if not is_last else 1)
         if is_last:
             break
-    model = ParsedSourceModel(decoded=decoded, masked=masked, tokens=tokens, ctes=tuple(ctes), downstream_refs=())
+    model = ParsedSourceModel(
+        decoded=decoded,
+        masked=masked,
+        tokens=tokens,
+        ctes=tuple(ctes),
+        downstream_refs=(),
+        fold_unquoted=fold_unquoted,
+    )
     # downstream refs + nested-CTE shadowing names, each in one pass
     downstream, nested = _find_downstream_refs(model, fold_unquoted)
     model = ParsedSourceModel(
@@ -575,6 +594,7 @@ def parse_source_model(data: bytes, *, fold_unquoted: FoldRule = "lower") -> Par
         ctes=tuple(ctes),
         downstream_refs=tuple(downstream),
         nested_names=nested,
+        fold_unquoted=fold_unquoted,
     )
     return model
 
@@ -714,9 +734,11 @@ def _parse_import_body(
         proj_parts[-1].append(t)
     projections: list[Projection] = []
     valid = ref_call is not None
-    for part in proj_parts:
+    for part_idx, part in enumerate(proj_parts):
         psig = _significant(part)
         if not psig:
+            if part_idx == len(proj_parts) - 1 and select_sig[-1].kind == "punct" and select_sig[-1].text == ",":
+                continue
             valid = False
             break
         # reject star
@@ -749,9 +771,10 @@ def _parse_import_body(
         # col must be bare identifier (word or quoted), alias likewise
         for candidate in (col_tok, out_tok):
             if candidate.kind == "word":
-                if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_$]*|__DBT_REFMERGE_REL_\d+__", candidate.text):
-                    valid = False
-                    break
+                # The tokenizer has already validated the complete Unicode-aware
+                # identifier shape. Reapplying an ASCII-only regex here would
+                # silently hide valid imports such as ``café_id`` from grouping.
+                pass
             elif candidate.kind == "string" and candidate.text.startswith('"'):
                 pass
             else:
@@ -859,6 +882,156 @@ def _find_downstream_refs(
             nm = sig[idx + 1].text
             q = sig[idx + 1].kind == "string"
             nested_names.add(make_identifier(nm, q, fold_unquoted).identity.value)
+
+    alias_stoppers = frozenset(
+        {
+            "LEFT",
+            "RIGHT",
+            "FULL",
+            "INNER",
+            "OUTER",
+            "CROSS",
+            "NATURAL",
+            "JOIN",
+            "ON",
+            "USING",
+            "WHERE",
+            "GROUP",
+            "ORDER",
+            "LIMIT",
+            "HAVING",
+            "WINDOW",
+            "QUALIFY",
+            "FETCH",
+            "OFFSET",
+            "UNION",
+            "INTERSECT",
+            "EXCEPT",
+            "SELECT",
+            "WITH",
+        }
+    )
+
+    def _identity_for_token(token: Token) -> str | None:
+        if token.kind == "word":
+            return make_identifier(token.text, False, fold_unquoted).identity.value
+        if token.kind == "string" and token.text.startswith('"'):
+            return make_identifier(token.text, True, fold_unquoted).identity.value
+        return None
+
+    main_start = max((c.cte_span.end_byte for c in model.ctes), default=0)
+    contexts: dict[str | None, list[Token]] = {}
+    for cte in model.ctes:
+        contexts[cte.identifier.source_text] = [
+            token
+            for token in sig
+            if cte.body_span.start_byte <= decoded.char_to_byte[token.start] < cte.body_span.end_byte
+        ]
+    contexts[None] = [token for token in sig if decoded.char_to_byte[token.start] >= main_start]
+
+    def _comma_relation_indexes(context_tokens: list[Token]) -> list[int]:
+        indexes: list[int] = []
+        depth = 0
+        in_from: dict[int, bool] = {}
+        clause_enders = frozenset(
+            {
+                "WHERE",
+                "GROUP",
+                "ORDER",
+                "LIMIT",
+                "HAVING",
+                "WINDOW",
+                "QUALIFY",
+                "FETCH",
+                "OFFSET",
+                "UNION",
+                "INTERSECT",
+                "EXCEPT",
+            }
+        )
+        for idx, token in enumerate(context_tokens):
+            if token.kind == "punct" and token.text == "(":
+                depth += 1
+                continue
+            if token.kind == "punct" and token.text == ")":
+                in_from.pop(depth, None)
+                depth = max(depth - 1, 0)
+                continue
+            if token.kind == "word":
+                keyword = token.text.upper()
+                if keyword == "SELECT":
+                    in_from[depth] = False
+                elif keyword == "FROM":
+                    in_from[depth] = True
+                elif keyword in clause_enders:
+                    in_from[depth] = False
+            elif token.kind == "punct" and token.text == "," and in_from.get(depth, False):
+                indexes.append(idx)
+        return indexes
+
+    context_features: dict[str | None, tuple[bool, bool, frozenset[str], bool, list[int]]] = {}
+    for context, context_tokens in contexts.items():
+        comma_indexes = _comma_relation_indexes(context_tokens)
+        has_natural = any(t.kind == "word" and t.text.upper() == "NATURAL" for t in context_tokens)
+        multi_relation = bool(comma_indexes) or any(
+            t.kind == "word" and t.text.upper() == "JOIN" for t in context_tokens
+        )
+        unqualified: set[str] = set()
+        bare_star = False
+        for token_idx, token in enumerate(context_tokens):
+            if token.kind == "punct" and token.text == "*":
+                prev = context_tokens[token_idx - 1] if token_idx else None
+                if prev is not None and prev.kind == "word" and prev.text.upper() == "SELECT":
+                    bare_star = True
+                continue
+            identity = _identity_for_token(token)
+            if identity is None:
+                continue
+            prev = context_tokens[token_idx - 1] if token_idx else None
+            nxt = context_tokens[token_idx + 1] if token_idx + 1 < len(context_tokens) else None
+            if (prev is not None and prev.kind == "punct" and prev.text == ".") or (
+                nxt is not None and nxt.kind == "punct" and nxt.text == "."
+            ):
+                continue
+            unqualified.add(identity)
+        context_features[context] = (
+            has_natural,
+            multi_relation,
+            frozenset(unqualified),
+            bare_star,
+            comma_indexes,
+        )
+
+    def _context_for_byte(byte_offset: int) -> str | None:
+        for cte in model.ctes:
+            if cte.body_span.start_byte <= byte_offset < cte.body_span.end_byte:
+                return cte.identifier.source_text
+        return None
+
+    def _alias_details(tokens_in_scope: list[Token], name_idx: int) -> tuple[bool, str | None]:
+        name_token = tokens_in_scope[name_idx]
+        relation_identity = _identity_for_token(name_token)
+        if name_idx + 1 >= len(tokens_in_scope):
+            return False, relation_identity
+        nxt = tokens_in_scope[name_idx + 1]
+        if nxt.kind == "word" and nxt.text.upper() == "AS":
+            alias_token = tokens_in_scope[name_idx + 2] if name_idx + 2 < len(tokens_in_scope) else None
+            return True, _identity_for_token(alias_token) if alias_token is not None else None
+        if nxt.kind in ("word", "string") and nxt.text.upper() not in alias_stoppers:
+            return True, _identity_for_token(nxt)
+        return False, relation_identity
+
+    def _qualified_star(context_tokens: list[Token], alias_identity: str | None) -> bool:
+        if alias_identity is None:
+            return False
+        for token_idx in range(len(context_tokens) - 2):
+            first, dot, star = context_tokens[token_idx : token_idx + 3]
+            if dot.kind != "punct" or dot.text != "." or star.kind != "punct" or star.text != "*":
+                continue
+            if _identity_for_token(first) == alias_identity:
+                return True
+        return False
+
     for idx, t in enumerate(sig):
         if t.kind == "word" and t.text.upper() in ("FROM", "JOIN"):
             if idx + 1 >= len(sig):
@@ -884,50 +1057,89 @@ def _find_downstream_refs(
                 )
                 if enclosing_import:
                     continue
-            # alias detection
-            has_alias = False
-            if idx + 2 < len(sig):
-                nxt = sig[idx + 2]
-                if nxt.kind == "word" and nxt.text.upper() == "AS":
-                    has_alias = True
-                elif nxt.kind in ("word", "string") and nxt.text.upper() not in (
-                    "LEFT",
-                    "RIGHT",
-                    "FULL",
-                    "INNER",
-                    "OUTER",
-                    "JOIN",
-                    "ON",
-                    "USING",
-                    "WHERE",
-                    "GROUP",
-                    "ORDER",
-                    "LIMIT",
-                    "HAVING",
-                    "UNION",
-                    "INTERSECT",
-                    "EXCEPT",
-                    "SELECT",
-                    "WITH",
-                ):
-                    # implicit alias — but must not be a keyword; check next is on new clause
-                    has_alias = True
             # enclosing CTE context
-            context = None
-            for c in model.ctes:
-                if c.body_span.start_byte <= tb < c.body_span.end_byte:
-                    context = c.identifier.source_text
-                    break
+            context = _context_for_byte(tb)
+            context_tokens = contexts[context]
+            try:
+                context_name_idx = context_tokens.index(name_tok)
+            except ValueError:
+                continue
+            has_alias, alias_identity = _alias_details(context_tokens, context_name_idx)
+            has_natural, multi_relation, context_unqualified, bare_star, _ = context_features[context]
             refs.append(
                 DownstreamRef(
                     cte_identity=ident.identity,
                     span=_span_chars(decoded, name_tok.start, name_tok.end),
                     has_alias=has_alias,
                     context_cte=context,
+                    binding_ambiguous=has_natural,
+                    star_expansion=bare_star or _qualified_star(context_tokens, alias_identity),
+                    multi_relation=multi_relation,
+                    unqualified_identities=context_unqualified,
                 )
             )
+
+    # Comma-separated FROM items have no FROM/JOIN token immediately before
+    # them. Record them as ambiguous bindings so qualification refuses rather
+    # than deleting a donor and leaving a dangling or externally rebound name.
+    existing_spans = {(ref.span.start_byte, ref.span.end_byte) for ref in refs}
+    for context, context_tokens in contexts.items():
+        has_natural, _multi_relation, context_unqualified, bare_star, comma_indexes = context_features[context]
+        for comma_idx in comma_indexes:
+            name_idx = comma_idx + 1
+            if name_idx >= len(context_tokens):
+                continue
+            name_tok = context_tokens[name_idx]
+            identity = _identity_for_token(name_tok)
+            if identity is None or identity not in cte_idents:
+                continue
+            span = _span_chars(decoded, name_tok.start, name_tok.end)
+            if (span.start_byte, span.end_byte) in existing_spans:
+                continue
+            has_alias, alias_identity = _alias_details(context_tokens, name_idx)
+            refs.append(
+                DownstreamRef(
+                    cte_identity=IdentifierIdentity(identity),
+                    span=span,
+                    has_alias=has_alias,
+                    context_cte=context,
+                    binding_ambiguous=True,
+                    star_expansion=bare_star or _qualified_star(context_tokens, alias_identity),
+                    multi_relation=True,
+                    unqualified_identities=context_unqualified,
+                )
+            )
+            existing_spans.add((span.start_byte, span.end_byte))
     return refs, frozenset(nested_names)
 
 
 def source_sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def has_unsupported_duplicate_candidates(model: ParsedSourceModel) -> bool:
+    """Return whether a duplicate literal-ref group contains an unsupported CTE.
+
+    Unsupported projection syntax deliberately clears ``SourceCTE.ref_call``.
+    Without this second look, two obvious literal imports could be reported as
+    NO_DUPLICATE_IMPORT, which is a fail-open diagnostic even though no rewrite
+    occurs. Dynamic Jinja is not treated as evidence.
+    """
+    grouped: dict[tuple[object, ...], list[bool]] = {}
+    literal_calls = tuple(model.masked.ref_calls.values())
+    for cte in model.ctes:
+        call = cte.ref_call
+        supported = call is not None
+        if call is None:
+            contained = [
+                candidate
+                for candidate in literal_calls
+                if cte.body_span.start_byte <= candidate.span.start_byte
+                and candidate.span.end_byte <= cte.body_span.end_byte
+            ]
+            if len(contained) != 1:
+                continue
+            call = contained[0]
+        key = (call.kind, call.package, call.name, call.source_name, call.version)
+        grouped.setdefault(key, []).append(supported)
+    return any(len(support_flags) >= 2 and not all(support_flags) for support_flags in grouped.values())

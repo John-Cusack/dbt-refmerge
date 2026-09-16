@@ -65,6 +65,54 @@ def build_plan(
     edits: list[TextEdit] = []
     canonical_overall: Identifier | None = None
     removed_all: list[Identifier] = []
+    all_donor_identities = {
+        member.source_cte.identifier.identity.value
+        for qualified in groups
+        for member in sorted(qualified.group.imports, key=lambda item: item.source_cte.ordinal)[1:]
+    }
+    terminal_donor_start = len(model.ctes)
+    while (
+        terminal_donor_start > 0
+        and model.ctes[terminal_donor_start - 1].identifier.identity.value in all_donor_identities
+    ):
+        terminal_donor_start -= 1
+    terminal_donors = model.ctes[terminal_donor_start:]
+    terminal_donor_identities = {cte.identifier.identity.value for cte in terminal_donors}
+    terminal_deletion_start: int | None = None
+    terminal_deletion_owner: str | None = None
+    terminal_ref_spans: tuple[SourceSpan, ...] = ()
+    if terminal_donors:
+        if terminal_donor_start == 0:
+            raise RewriteError(ReasonCode.UNSUPPORTED_IMPORT_SHAPE, "terminal donor separator is unavailable")
+        retained_predecessor = model.ctes[terminal_donor_start - 1]
+        predecessor_separator = retained_predecessor.separator_span
+        if predecessor_separator is None:
+            raise RewriteError(ReasonCode.UNSUPPORTED_IMPORT_SHAPE, "terminal donor separator is unavailable")
+        terminal_deletion_start = predecessor_separator.start_byte
+        terminal_deletion_owner = terminal_donors[0].identifier.identity.value
+        terminal_ref_spans = tuple(cte.ref_call.span for cte in terminal_donors if cte.ref_call is not None)
+
+    def _has_sql_comment(start: int, end: int) -> bool:
+        decoded = model.decoded
+        return any(
+            token.kind == "comment"
+            and decoded.char_to_byte[token.start] < end
+            and decoded.char_to_byte[token.end] > start
+            for token in model.tokens
+        )
+
+    def _has_non_ref_jinja(
+        start: int,
+        end: int,
+        allowed_ref_spans: tuple[SourceSpan, ...] = (),
+    ) -> bool:
+        for jinja in model.masked.jinja_spans:
+            if jinja.span.end_byte <= start or jinja.span.start_byte >= end:
+                continue
+            if jinja.span in allowed_ref_spans:
+                continue
+            return True
+        return False
 
     for qg in groups:
         members = sorted(qg.group.imports, key=lambda m: m.source_cte.ordinal)
@@ -91,6 +139,17 @@ def build_plan(
         # --- projection insertion edit ---
         if missing:
             canon_cte = cte_by_ident[canonical.identity.value]
+            canonical_tail_end = (
+                canon_cte.ref_call.span.start_byte if canon_cte.ref_call is not None else canon_cte.body_span.end_byte
+            )
+            if _has_sql_comment(canon_cte.select_list_span.end_byte, canonical_tail_end) or _has_non_ref_jinja(
+                canon_cte.select_list_span.end_byte,
+                canonical_tail_end,
+            ):
+                raise RewriteError(
+                    ReasonCode.COMMENT_RELOCATION_UNSUPPORTED,
+                    f"comment or Jinja after canonical projection {canonical.source_text}",
+                )
             select_bytes = source[canon_cte.select_list_span.start_byte : canon_cte.select_list_span.end_byte]
             nl, indent, multiline = _detect_newline_indent(select_bytes)
             if not multiline:
@@ -121,64 +180,70 @@ def build_plan(
         # --- donor deletion edits ---
         for donor in donors:
             donor_cte = cte_by_ident[donor.identity.value]
-            # comment guard: any comment inside deletion span not attached to a moved projection -> reject
-            # simplified: if donor has attached comments outside moved projections, reject.
-            # attached comments move with their projection fragment only if that projection was already
-            # in canonical (deduplicated) — missing ones move via fragment copy, comments stay? v0.1: reject
-            # donor deletion when donor select list contains SQL comments.
-            select_region = source[donor_cte.select_list_span.start_byte : donor_cte.select_list_span.end_byte]
-            if b"--" in select_region or b"/*" in select_region:
-                # check whether comment bytes are inside a projection span that is being deduplicated
-                # conservative: reject
-                raise RewriteError(
-                    ReasonCode.COMMENT_RELOCATION_UNSUPPORTED,
-                    f"comment in donor {donor.source_text}",
-                )
+            removed_all.append(donor)
+            if donor.identity.value in terminal_donor_identities and donor.identity.value != terminal_deletion_owner:
+                continue
             # deletion span: cte_span extended to consume separator comma ownership
             # Representation: leading trivia | CTE | trailing trivia | optional comma.
             # We delete cte_span; plus separator comma span if present; plus one adjacent newline run
             # without consuming neighbor trivia: extend to include separator span only.
             start = donor_cte.cte_span.start_byte
             end = donor_cte.cte_span.end_byte
+            allowed_ref_spans: tuple[SourceSpan, ...] = (
+                (donor_cte.ref_call.span,) if donor_cte.ref_call is not None else ()
+            )
             # include separator comma
-            if donor_cte.separator_span is not None:
+            if donor.identity.value == terminal_deletion_owner:
+                if terminal_deletion_start is None:
+                    raise RewriteError(ReasonCode.UNSUPPORTED_IMPORT_SHAPE, "terminal donor separator is unavailable")
+                start = terminal_deletion_start
+                end = terminal_donors[-1].cte_span.end_byte
+                allowed_ref_spans = terminal_ref_spans
+                terminal_tail_end = min(
+                    (
+                        model.decoded.char_to_byte[token.start]
+                        for token in model.tokens
+                        if token.kind not in ("space", "comment") and model.decoded.char_to_byte[token.start] >= end
+                    ),
+                    default=len(source),
+                )
+                if _has_sql_comment(end, terminal_tail_end) or _has_non_ref_jinja(end, terminal_tail_end):
+                    raise RewriteError(
+                        ReasonCode.COMMENT_RELOCATION_UNSUPPORTED,
+                        f"comment or Jinja after terminal donor {donor.source_text}",
+                    )
+            elif donor_cte.separator_span is not None:
                 end = max(end, donor_cte.separator_span.end_byte)
             else:
-                # last CTE: need to consume the comma of the previous sibling? Instead previous CTE
-                # owns its trailing comma; deleting last CTE leaves dangling comma -> must remove it.
-                # Find previous CTE's separator and extend deletion backwards to cover it? That would
-                # consume retained CTE trivia. v0.1 approach: delete donor span + preceding comma run.
-                # Search backwards for the nearest comma in source between previous CTE end and donor start.
-                prev_end = 0
-                for c in model.ctes:
-                    if c.cte_span.end_byte <= start and c.cte_span.end_byte > prev_end:
-                        prev_end = c.cte_span.end_byte
-                between = source[prev_end:start]
-                comma_idx = between.rfind(b",")
-                if comma_idx != -1:
-                    start = prev_end + comma_idx
-            # also strip one trailing newline to avoid blank pile-up (only whitespace)
-            while end < len(source) and source[end : end + 1] in (b" ", b"\t"):
-                end += 1
-            if source[end : end + 2] == b"\r\n":
-                end += 2
-            elif source[end : end + 1] == b"\n":
-                end += 1
-            # collapse exactly one extra blank line left by the removed block,
-            # but never consume comment- or Jinja-bearing trivia.
-            probe = end
-            while probe < len(source) and source[probe : probe + 1] in (b" ", b"\t"):
-                probe += 1
-            if source[probe : probe + 2] == b"\r\n":
-                newline_len = 2
-            elif source[probe : probe + 1] == b"\n":
-                newline_len = 1
-            else:
-                newline_len = 0
-            if newline_len:
-                consumed = source[end : probe + newline_len]
-                if not any(marker in consumed for marker in (b"--", b"/*", b"{{", b"{%", b"{#")):
-                    end = probe + newline_len
+                raise RewriteError(ReasonCode.UNSUPPORTED_IMPORT_SHAPE, "donor separator is unavailable")
+            if _has_sql_comment(start, end) or _has_non_ref_jinja(start, end, allowed_ref_spans):
+                raise RewriteError(
+                    ReasonCode.COMMENT_RELOCATION_UNSUPPORTED,
+                    f"comment or Jinja in donor deletion span {donor.source_text}",
+                )
+            if donor.identity.value != terminal_deletion_owner:
+                # Also strip one trailing newline to avoid blank pile-up (only whitespace).
+                while end < len(source) and source[end : end + 1] in (b" ", b"\t"):
+                    end += 1
+                if source[end : end + 2] == b"\r\n":
+                    end += 2
+                elif source[end : end + 1] == b"\n":
+                    end += 1
+                # Collapse exactly one extra blank line left by the removed block,
+                # but never consume comment- or Jinja-bearing trivia.
+                probe = end
+                while probe < len(source) and source[probe : probe + 1] in (b" ", b"\t"):
+                    probe += 1
+                if source[probe : probe + 2] == b"\r\n":
+                    newline_len = 2
+                elif source[probe : probe + 1] == b"\n":
+                    newline_len = 1
+                else:
+                    newline_len = 0
+                if newline_len:
+                    consumed = source[end : probe + newline_len]
+                    if not any(marker in consumed for marker in (b"--", b"/*", b"{{", b"{%", b"{#")):
+                        end = probe + newline_len
             # strip leading blank line similarly if at start
             edits.append(
                 TextEdit(
@@ -187,7 +252,6 @@ def build_plan(
                     reason_code=ReasonCode.OK,
                 )
             )
-            removed_all.append(donor)
         # --- reference redirection ---
         for donor in donors:
             for ref in downstream_by_ident.get(donor.identity.value, []):
@@ -207,7 +271,7 @@ def build_plan(
     from dbt_refmerge.source import parse_source_model as _parse
 
     try:
-        reparsed = _parse(candidate)
+        reparsed = _parse(candidate, fold_unquoted=model.fold_unquoted)
         names = [c.identifier.identity.value for c in reparsed.ctes if c.ref_call is not None]
         for qg in groups:
             remaining = [n for n in names if n in {m.source_cte.identifier.identity.value for m in qg.group.imports}]

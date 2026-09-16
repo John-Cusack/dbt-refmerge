@@ -136,6 +136,17 @@ def detect_source_duplicates(
             status=FindingStatus.NEEDS_COMPILED_ANALYSIS,
             reason_codes=(ReasonCode.UNSUPPORTED_IMPORT_SHAPE,),
         )
+    from dbt_refmerge.source import has_unsupported_duplicate_candidates
+
+    if has_unsupported_duplicate_candidates(model):
+        return Finding(
+            model_unique_id=model_uid,
+            source_path=source_path,
+            upstream_unique_id="",
+            cte_names=(),
+            status=FindingStatus.NEEDS_COMPILED_ANALYSIS,
+            reason_codes=(ReasonCode.UNSUPPORTED_IMPORT_SHAPE,),
+        )
     import_ctes = [c for c in model.ctes if c.ref_call is not None]
     if len(import_ctes) < 2:
         return None
@@ -316,6 +327,11 @@ class RefmergeService:
             src_path = ws.source_snapshot / Path(node.original_file_path).name
         raw = src_path.read_bytes() if src_path.is_file() else node.raw_code.encode("utf-8")
         parsed_src = _parse_src(raw, fold_unquoted=spec.fold_unquoted)
+        from dbt_refmerge.source import has_unsupported_duplicate_candidates
+
+        if has_unsupported_duplicate_candidates(parsed_src):
+            receipt = _unverifiable_receipt(ws, context, view, node, (ReasonCode.UNSUPPORTED_IMPORT_SHAPE,))
+            return ModelResult(node.unique_id, src_path, receipt, ""), b""
         try:
             matched = match_source_ctes(
                 tuple(c for c in parsed_src.ctes if c.ref_call is not None),
@@ -416,7 +432,11 @@ class RefmergeService:
             expected_tree = build_expected_transform(bparsed, canon_ident, donor_idents, {canon_ident: additions})
             from dbt_refmerge.semantics import validate_compiled_delta
 
-            validate_compiled_delta(bparsed, cparsed, semantic_fingerprint(expected_tree))
+            validate_compiled_delta(
+                bparsed,
+                cparsed,
+                semantic_fingerprint(expected_tree, fold=spec.fold_unquoted),
+            )
 
     # -- fix --
     def fix(self, request: FixRequest) -> FixReport:

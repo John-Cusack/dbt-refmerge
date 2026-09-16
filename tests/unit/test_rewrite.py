@@ -96,15 +96,24 @@ def test_plan_deterministic_hash():
     assert p1.candidate_source_sha256 == p2.candidate_source_sha256
 
 
-def _run_case(raw_str: str, compiled_str: str, view_owner=None):
+def _run_case(
+    raw_str: str | bytes,
+    compiled_str: str,
+    view_owner=None,
+    *,
+    dialect: str = "postgres",
+    fold_unquoted=None,
+):
+    from dbt_refmerge.adapters import spec_for_dialect
     from dbt_refmerge.errors import ReasonCode  # noqa: F401 -- re-export guard
 
-    raw = raw_str.encode()
+    raw = raw_str.encode() if isinstance(raw_str, str) else raw_str
     view, owner = view_owner or _manifest_for_refs()
-    src = parse_source_model(raw)
+    fold = fold_unquoted or spec_for_dialect(dialect).fold_unquoted
+    src = parse_source_model(raw, fold_unquoted=fold)
     matched = match_source_ctes(
         tuple(c for c in src.ctes if c.ref_call is not None),
-        parse_model(compiled_str, "postgres"),
+        parse_model(compiled_str, dialect),
         view,
         owner,
     )
