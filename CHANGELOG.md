@@ -1,4 +1,4 @@
-# 0.1.0 (unreleased)
+# 0.1.0 (2026-09-16)
 - `scan` lists duplicate import CTEs from source; `check` proves each merge on PostgreSQL (two scratch views,
   exact column types, one-statement multiset comparison, views dropped afterwards); `fix` re-proves and
   applies one model atomically; `cleanup --run-id` drops what an interrupted check left behind.
