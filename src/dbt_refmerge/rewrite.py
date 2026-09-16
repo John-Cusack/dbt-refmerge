@@ -6,7 +6,7 @@ import hashlib
 from pathlib import Path
 
 from dbt_refmerge.analyze import QualifiedDuplicateGroup
-from dbt_refmerge.domain import Identifier, ReasonCode, RewritePlan, SourceCTE, SourceSpan, TextEdit
+from dbt_refmerge.domain import Identifier, ReasonCode, RewritePlan, SourceSpan, TextEdit
 from dbt_refmerge.errors import InternalInvariantError, RewriteError
 from dbt_refmerge.source import DownstreamRef, ParsedSourceModel
 
@@ -70,6 +70,27 @@ def build_plan(
         for qualified in groups
         for member in sorted(qualified.group.imports, key=lambda item: item.source_cte.ordinal)[1:]
     }
+    terminal_donor_start = len(model.ctes)
+    while (
+        terminal_donor_start > 0
+        and model.ctes[terminal_donor_start - 1].identifier.identity.value in all_donor_identities
+    ):
+        terminal_donor_start -= 1
+    terminal_donors = model.ctes[terminal_donor_start:]
+    terminal_donor_identities = {cte.identifier.identity.value for cte in terminal_donors}
+    terminal_deletion_start: int | None = None
+    terminal_deletion_owner: str | None = None
+    terminal_ref_spans: tuple[SourceSpan, ...] = ()
+    if terminal_donors:
+        if terminal_donor_start == 0:
+            raise RewriteError(ReasonCode.UNSUPPORTED_IMPORT_SHAPE, "terminal donor separator is unavailable")
+        retained_predecessor = model.ctes[terminal_donor_start - 1]
+        predecessor_separator = retained_predecessor.separator_span
+        if predecessor_separator is None:
+            raise RewriteError(ReasonCode.UNSUPPORTED_IMPORT_SHAPE, "terminal donor separator is unavailable")
+        terminal_deletion_start = predecessor_separator.start_byte
+        terminal_deletion_owner = terminal_donors[0].identifier.identity.value
+        terminal_ref_spans = tuple(cte.ref_call.span for cte in terminal_donors if cte.ref_call is not None)
 
     def _has_sql_comment(start: int, end: int) -> bool:
         decoded = model.decoded
@@ -80,11 +101,15 @@ def build_plan(
             for token in model.tokens
         )
 
-    def _has_non_ref_jinja(start: int, end: int, allowed_ref_span: SourceSpan | None = None) -> bool:
+    def _has_non_ref_jinja(
+        start: int,
+        end: int,
+        allowed_ref_spans: tuple[SourceSpan, ...] = (),
+    ) -> bool:
         for jinja in model.masked.jinja_spans:
             if jinja.span.end_byte <= start or jinja.span.start_byte >= end:
                 continue
-            if allowed_ref_span is not None and jinja.span == allowed_ref_span:
+            if jinja.span in allowed_ref_spans:
                 continue
             return True
         return False
@@ -155,58 +180,57 @@ def build_plan(
         # --- donor deletion edits ---
         for donor in donors:
             donor_cte = cte_by_ident[donor.identity.value]
+            removed_all.append(donor)
+            if donor.identity.value in terminal_donor_identities and donor.identity.value != terminal_deletion_owner:
+                continue
             # deletion span: cte_span extended to consume separator comma ownership
             # Representation: leading trivia | CTE | trailing trivia | optional comma.
             # We delete cte_span; plus separator comma span if present; plus one adjacent newline run
             # without consuming neighbor trivia: extend to include separator span only.
             start = donor_cte.cte_span.start_byte
             end = donor_cte.cte_span.end_byte
+            allowed_ref_spans: tuple[SourceSpan, ...] = (
+                (donor_cte.ref_call.span,) if donor_cte.ref_call is not None else ()
+            )
             # include separator comma
-            if donor_cte.separator_span is not None:
+            if donor.identity.value == terminal_deletion_owner:
+                if terminal_deletion_start is None:
+                    raise RewriteError(ReasonCode.UNSUPPORTED_IMPORT_SHAPE, "terminal donor separator is unavailable")
+                start = terminal_deletion_start
+                end = terminal_donors[-1].cte_span.end_byte
+                allowed_ref_spans = terminal_ref_spans
+            elif donor_cte.separator_span is not None:
                 end = max(end, donor_cte.separator_span.end_byte)
             else:
-                # A last donor consumes a retained previous sibling's separator. If that sibling is
-                # also a donor, its own forward deletion already owns the separator, so starting this
-                # edit at the final donor avoids overlapping deletion spans.
-                previous_cte: SourceCTE | None = None
-                for c in model.ctes:
-                    if c.cte_span.end_byte <= start and (
-                        previous_cte is None or c.cte_span.end_byte > previous_cte.cte_span.end_byte
-                    ):
-                        previous_cte = c
-                if previous_cte is not None and previous_cte.identifier.identity.value not in all_donor_identities:
-                    between = source[previous_cte.cte_span.end_byte : start]
-                    comma_idx = between.rfind(b",")
-                    if comma_idx != -1:
-                        start = previous_cte.cte_span.end_byte + comma_idx
-            allowed_ref_span = donor_cte.ref_call.span if donor_cte.ref_call is not None else None
-            if _has_sql_comment(start, end) or _has_non_ref_jinja(start, end, allowed_ref_span):
+                raise RewriteError(ReasonCode.UNSUPPORTED_IMPORT_SHAPE, "donor separator is unavailable")
+            if _has_sql_comment(start, end) or _has_non_ref_jinja(start, end, allowed_ref_spans):
                 raise RewriteError(
                     ReasonCode.COMMENT_RELOCATION_UNSUPPORTED,
                     f"comment or Jinja in donor deletion span {donor.source_text}",
                 )
-            # also strip one trailing newline to avoid blank pile-up (only whitespace)
-            while end < len(source) and source[end : end + 1] in (b" ", b"\t"):
-                end += 1
-            if source[end : end + 2] == b"\r\n":
-                end += 2
-            elif source[end : end + 1] == b"\n":
-                end += 1
-            # collapse exactly one extra blank line left by the removed block,
-            # but never consume comment- or Jinja-bearing trivia.
-            probe = end
-            while probe < len(source) and source[probe : probe + 1] in (b" ", b"\t"):
-                probe += 1
-            if source[probe : probe + 2] == b"\r\n":
-                newline_len = 2
-            elif source[probe : probe + 1] == b"\n":
-                newline_len = 1
-            else:
-                newline_len = 0
-            if newline_len:
-                consumed = source[end : probe + newline_len]
-                if not any(marker in consumed for marker in (b"--", b"/*", b"{{", b"{%", b"{#")):
-                    end = probe + newline_len
+            if donor.identity.value != terminal_deletion_owner:
+                # Also strip one trailing newline to avoid blank pile-up (only whitespace).
+                while end < len(source) and source[end : end + 1] in (b" ", b"\t"):
+                    end += 1
+                if source[end : end + 2] == b"\r\n":
+                    end += 2
+                elif source[end : end + 1] == b"\n":
+                    end += 1
+                # Collapse exactly one extra blank line left by the removed block,
+                # but never consume comment- or Jinja-bearing trivia.
+                probe = end
+                while probe < len(source) and source[probe : probe + 1] in (b" ", b"\t"):
+                    probe += 1
+                if source[probe : probe + 2] == b"\r\n":
+                    newline_len = 2
+                elif source[probe : probe + 1] == b"\n":
+                    newline_len = 1
+                else:
+                    newline_len = 0
+                if newline_len:
+                    consumed = source[end : probe + newline_len]
+                    if not any(marker in consumed for marker in (b"--", b"/*", b"{{", b"{%", b"{#")):
+                        end = probe + newline_len
             # strip leading blank line similarly if at start
             edits.append(
                 TextEdit(
@@ -215,7 +239,6 @@ def build_plan(
                     reason_code=ReasonCode.OK,
                 )
             )
-            removed_all.append(donor)
         # --- reference redirection ---
         for donor in donors:
             for ref in downstream_by_ident.get(donor.identity.value, []):

@@ -524,6 +524,8 @@ def test_consecutive_donors_with_last_donor_do_not_overlap_edits():
     assert "c as (" not in candidate
     assert "base_value,\n        amount,\n        customer_id" in candidate
     assert "from a as b join a as c using (id)" in candidate
+    assert "),\nselect" not in candidate
+    assert ")\nselect b.amount" in candidate
     assert len(parse_source_model(candidate.encode()).ctes) == 1
 
 

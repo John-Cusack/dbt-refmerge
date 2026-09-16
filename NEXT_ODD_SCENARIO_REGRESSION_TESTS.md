@@ -807,7 +807,7 @@ Put a SQL block comment containing a comma between the preceding CTE separator a
 
 ### 45. `test_consecutive_donors_with_last_donor_do_not_overlap_edits`
 
-Use a three-member group where the two donors are consecutive and the second donor is the final CTE. Assert both donors are removed, projections and downstream bindings are merged, the candidate reparses, and no edits overlap. The preceding donor owns its separator; the last donor begins deletion at its own CTE span.
+Use a three-member group where the two donors are consecutive and the second donor is the final CTE. Assert both donors are removed, projections and downstream bindings are merged, no dangling comma remains, the candidate reparses, and no edits overlap. One combined deletion starts at the retained predecessor's separator and ends after the final donor.
 
 ## Opus proposals deliberately rejected or corrected
 
