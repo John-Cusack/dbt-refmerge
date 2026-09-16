@@ -11,7 +11,7 @@ import sys
 import tempfile
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -53,6 +53,26 @@ def _read_project_file(project_dir: Path, path: Path) -> bytes:
     if not source.is_file():
         raise RefmergeError(ReasonCode.INTERNAL_ERROR, f"special file rejected: {path}")
     return source.read_bytes()
+
+
+def _walk_tree(
+    root: Path, *, root_excludes: frozenset[str], linked_ok: Path | None
+) -> Iterator[tuple[Path, list[str]]]:
+    """Directories under ``root`` with their file names, pruning excludes and refusing linked directories,
+    except directly inside ``linked_ok`` (the caller copies those)."""
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        here = Path(dirpath)
+        excluded = (root_excludes | EXCLUDES_AT_ANY_DEPTH) if here == root else EXCLUDES_AT_ANY_DEPTH
+        dirnames[:] = [d for d in dirnames if d not in excluded]
+        for d in list(dirnames):
+            if not _is_linked_dir(here / d):
+                continue
+            if here != linked_ok:
+                raise RefmergeError(
+                    ReasonCode.INTERNAL_ERROR, f"linked directory in project is not supported: {here / d}"
+                )
+            dirnames.remove(d)
+        yield here, filenames
 
 
 @dataclass
@@ -98,29 +118,21 @@ class RunWorkspace:
         """Copy the project into ``source_snapshot`` and ``candidate_project``, then re-read it to prove stability.
 
         Linked directories (symlinks, junctions) are refused rather than followed: skipping them silently drops
-        models and following them needs containment and cycle checks. File symlinks are read through when their
-        target is a regular file inside the project.
+        models and following them needs containment and cycle checks. The exception is a directory directly in
+        ``dbt_packages``, which is how ``dbt deps`` installs a ``local:`` package: its tree is copied, with the
+        same refusals applied inside the package. File symlinks are read through when their target is a regular
+        file inside the project (or package).
         """
         project_dir = project_dir.resolve()
         self.source_snapshot.mkdir(parents=True, exist_ok=True)
         digests: list[tuple[str, bytes]] = []
-        for dirpath, dirnames, filenames in os.walk(project_dir, followlinks=False):
-            here = Path(dirpath)
-            excluded = (ROOT_EXCLUDES | EXCLUDES_AT_ANY_DEPTH) if here == project_dir else EXCLUDES_AT_ANY_DEPTH
-            dirnames[:] = [d for d in dirnames if d not in excluded]
-            for d in dirnames:
-                if _is_linked_dir(here / d):
-                    raise RefmergeError(
-                        ReasonCode.INTERNAL_ERROR, f"linked directory in project is not supported: {here / d}"
-                    )
+        packages_dir = project_dir / "dbt_packages"
+        for here, filenames in _walk_tree(project_dir, root_excludes=ROOT_EXCLUDES, linked_ok=packages_dir):
             for fn in filenames:
-                full = here / fn
-                data = _read_project_file(project_dir, full)
-                rel = full.relative_to(project_dir).as_posix()
-                dest = self.source_snapshot / rel
-                dest.parent.mkdir(parents=True, exist_ok=True)
-                dest.write_bytes(data)
-                digests.append((rel, hashlib.sha256(data).digest()))
+                self._copy_into_snapshot(project_dir, here / fn, project_dir, digests)
+        for link in sorted(packages_dir.iterdir()) if packages_dir.is_dir() else []:
+            if _is_linked_dir(link):
+                self._copy_linked_package(project_dir, link, digests)
         digests.sort()
         # Stability: every source file must still hold the bytes that were copied.
         for rel, digest in digests:
@@ -139,6 +151,32 @@ class RunWorkspace:
         tree_hash = hashlib.sha256(b"".join(rel.encode() + digest for rel, digest in digests)).hexdigest()
         shutil.copytree(self.source_snapshot, self.candidate_project, dirs_exist_ok=True)
         return SnapshotResult(root=self.source_snapshot, file_count=len(digests), tree_hash=tree_hash)
+
+    def _copy_into_snapshot(
+        self, containment: Path, path: Path, project_dir: Path, digests: list[tuple[str, bytes]]
+    ) -> None:
+        data = _read_project_file(containment, path)
+        rel = path.relative_to(project_dir).as_posix()
+        dest = self.source_snapshot / rel
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(data)
+        digests.append((rel, hashlib.sha256(data).digest()))
+
+    def _copy_linked_package(self, project_dir: Path, link: Path, digests: list[tuple[str, bytes]]) -> None:
+        try:
+            package_root = Path(os.path.realpath(link, strict=True))
+        except OSError as exc:
+            raise RefmergeError(ReasonCode.INTERNAL_ERROR, f"unsafe package link: {link}") from exc
+        if project_dir.is_relative_to(package_root):
+            raise RefmergeError(ReasonCode.INTERNAL_ERROR, f"package link contains the project: {link}")
+        # A local package's own target/, logs/ and installed packages are never inputs of this project.
+        for here, filenames in _walk_tree(package_root, root_excludes=ROOT_EXCLUDES | {"dbt_packages"}, linked_ok=None):
+            for fn in filenames:
+                # Read through the link: file symlinks are contained by the package, and the stability re-read
+                # uses the same project-relative path.
+                self._copy_into_snapshot(
+                    package_root, link / (here / fn).relative_to(package_root), project_dir, digests
+                )
 
     def package_state_digest(self, root: Path) -> str:
         h = hashlib.sha256()
