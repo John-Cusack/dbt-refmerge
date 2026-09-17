@@ -160,7 +160,8 @@ def test_every_model_is_refused_with_reasons_or_merged_into_one_import_that_keep
     candidate, codes = _merge(raw)
 
     if candidate is None:
-        assert codes and ReasonCode.OK not in codes
+        # The generator varies only predicates and aliases; any other refusal is a regression.
+        assert codes and set(codes) <= {ReasonCode.DIFFERENT_PREDICATE, ReasonCode.PROJECTION_COLLISION}
         return
     survivor = _surviving_import(candidate)
     merged = {p.output_identifier.identity.value: p.upstream_identifier.identity.value for p in survivor.projections}
@@ -181,4 +182,5 @@ def test_plain_imports_with_the_same_predicate_always_merge(members, unrelated_a
     candidate, codes = _merge(raw)
 
     assert codes == (ReasonCode.OK,), raw
-    assert candidate is not None and candidate.count("{{ ref('stg') }}") == 1
+    assert candidate is not None
+    assert _surviving_import(candidate).identifier.source_text == members[0].name  # exactly one import of stg
