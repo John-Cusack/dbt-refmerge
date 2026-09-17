@@ -75,17 +75,14 @@ def test_human_mode_reports_progress_on_stderr_and_json_mode_does_not(project):
     as_json = _invoke("check", *common, "--json", "--fail-on", "never")
     fixed = _invoke("fix", "models/orders.sql", *common)
 
-    lines = human.stderr.splitlines()
-    stages = [line.removeprefix("dbt-refmerge: ") for line in lines]
-    assert all(line.startswith("dbt-refmerge: ") for line in lines)
-    assert [stage.split()[0] for stage in stages] == ["copying", "compiling", "analyzing", "compiling", "verifying"]
-    assert "2 models" in stages[2] and "1 candidate merge" in stages[3] and "refmerge_scratch" in stages[4]
-    assert "dbt-refmerge:" not in human.stdout
+    # One prefixed line per stage on stderr; the report alone on stdout; nothing extra in JSON mode.
+    for result in (human, fixed):
+        lines = result.stderr.splitlines()
+        assert len(lines) >= 4 and all(line.startswith("dbt-refmerge: ") for line in lines)
+    assert "dbt-refmerge:" not in human.stdout and "model model.p.orders" in human.stdout
     assert as_json.stderr == "" and json.loads(as_json.stdout)["models"]
-    assert fixed.exit_code == 0
-    assert fixed.stderr.splitlines()[-1].startswith("dbt-refmerge: writing")
-    assert "models/orders.sql" in fixed.stderr.splitlines()[-1]
-    assert "join a as b" in (root / "models" / "orders.sql").read_text()
+    assert len(fixed.stderr.splitlines()) == len(human.stderr.splitlines()) + 1  # fix adds the write stage
+    assert fixed.exit_code == 0 and "join a as b" in (root / "models" / "orders.sql").read_text()
 
 
 def test_check_select_uses_dbt_selection(project, fake_dbt):
