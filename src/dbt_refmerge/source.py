@@ -235,8 +235,12 @@ def _find_tag_close(text: str, tag: str, pos: int) -> int:
     return -1
 
 
-def mask_jinja(decoded: DecodedSource) -> MaskedSource:
-    """Blank every Jinja tag, keeping newlines, and write a sentinel over each literal ref()/source()."""
+def mask_jinja(decoded: DecodedSource, *, reject_sentinel_names: bool = True) -> MaskedSource:
+    """Blank every Jinja tag, keeping newlines, and write a sentinel over each literal ref()/source().
+
+    ``reject_sentinel_names=False`` skips the refusal of SQL that spells a sentinel, for callers that only
+    count the literal calls and never parse the masked SQL.
+    """
     text = decoded.text
     masked_chars = list(text)
     jinja_spans: list[JinjaSpan] = []
@@ -277,7 +281,7 @@ def mask_jinja(decoded: DecodedSource) -> MaskedSource:
     # Refuse SQL that already spells a sentinel: it could be read as another CTE's ref(). Only text outside
     # Jinja tags counts (masked chars differ from the original there, or are blanks written over tags).
     sql_only = "".join(" " if span_char else char for char, span_char in zip(text, in_tag, strict=True))
-    if _SENTINEL_LIKE.search(sql_only):
+    if reject_sentinel_names and _SENTINEL_LIKE.search(sql_only):
         raise SourceParseError(ReasonCode.UNSUPPORTED_IMPORT_SHAPE, "SQL contains a name reserved for ref sentinels")
     masked_text = "".join(masked_chars)
     return MaskedSource(

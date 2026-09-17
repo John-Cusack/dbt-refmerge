@@ -10,6 +10,10 @@
   literal `ref()`/`source()` calls, so `--fail-on finding` doesn't fail on unrelated models.
 - A pre-commit hook (`dbt-refmerge-scan`) and a composite GitHub Action (`uses: John-Cusack/dbt-refmerge@…`).
 - `python -m dbt_refmerge` runs the CLI.
+- `check` no longer marks a model `unverifiable` for being incremental, ephemeral or unparseable unless it may import a
+  relation twice; such models are `not_run` with `NO_DUPLICATE_IMPORT`, so they don't fail `--fail-on`.
+- User documentation in `docs/`: CLI reference and exit codes, configuration, verification, every reason code,
+  JSON output and integrations, kept in sync with the code by tests.
 
 # 0.1.0 (2026-09-16)
 - `scan` lists duplicate import CTEs from source; `check` proves each merge on PostgreSQL (two scratch views,
