@@ -1,4 +1,4 @@
-# Unreleased
+# 0.3.0 (2026-09-17)
 - `scan`, `check` and `fix` narrow direct `ref()`/`source()` import wildcards and remove unused plain
   import columns when the final query names its outputs. Requirements include joins, filters,
   calculations and every consumer, and are traced through single-source wildcard CTEs. Single imports
