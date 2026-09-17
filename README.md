@@ -77,19 +77,19 @@ for the commands available on each adapter.
 ## Keep new duplicates out
 
 `scan` needs no dbt run and no warehouse, so it works as a commit hook or a
-pull request check (both need 0.2.0 or later):
+pull request check (both need 0.2.0 or later; column pruning needs 0.3.0 or later):
 
 ```yaml
 # .pre-commit-config.yaml
 - repo: https://github.com/John-Cusack/dbt-refmerge
-  rev: v0.2.0
+  rev: v0.3.0
   hooks:
     - id: dbt-refmerge-scan
 ```
 
 ```yaml
-# a GitHub Actions step: annotates pull requests at each duplicate
-- uses: John-Cusack/dbt-refmerge@v0.2.0
+# a GitHub Actions step: annotates duplicate imports and column-pruning leads
+- uses: John-Cusack/dbt-refmerge@v0.3.0
   with:
     adapter: snowflake
 ```
