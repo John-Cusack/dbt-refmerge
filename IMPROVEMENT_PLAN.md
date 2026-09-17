@@ -45,7 +45,7 @@ Found and fixed along the way:
 
 **A1. Branch protection on `main`.**
 - **Why:** CI is only a guarantee if a red check blocks the merge (Scorecard *Branch-Protection*).
-- **What:** require these checks: the six `gates` jobs, `lowest-deps` and `coverage`. Block force pushes and branch deletion.
+- **What:** require these checks, for admins too: the six `gates` jobs, `lowest-deps`, `coverage`, and `action` (added once C3 landed on `main`). Block force pushes and branch deletion.
 - **No required reviews:** there is one maintainer, and required reviews would block every merge. Revisit once a second maintainer joins.
 - **Done when:** the branch protection API shows the rule on `main`.
 
