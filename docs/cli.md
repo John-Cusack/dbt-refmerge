@@ -14,7 +14,7 @@ python -m dbt_refmerge COMMAND [OPTIONS]
 | [`fix`](#fix) | Re-proves one model's merge and writes it only if the proof passes | yes | yes | one model file |
 | [`cleanup`](#cleanup) | Drops scratch views an interrupted `check` left behind | yes | yes | no |
 
-Every option can also come from `.dbt-refmerge.toml` or a `DBT_REFMERGE_*` environment variable; see [configuration](configuration.md). A flag you don't pass never overrides those.
+`--profiles-dir`, `--profile`, `--target`, `--adapter`, `--dbt-command-part`, `--scratch-schema`, `--json`, `--fail-on`, `--keep-workspace` and `--debug` can also be set in `.dbt-refmerge.toml` or a `DBT_REFMERGE_*` environment variable; see [configuration](configuration.md). A flag you don't pass never overrides those. `--project-dir`, `--format`, `--select`, `--dry-run`, `--run-id` and the model path come only from the command line.
 
 ## Options shared by several commands
 

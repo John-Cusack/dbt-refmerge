@@ -171,12 +171,17 @@ def _first_duplicate_calls(calls: Iterable[RefCall]) -> list[RefCall] | None:
     return min(duplicates, key=lambda group: group[0].span.start_byte) if duplicates else None
 
 
+def _literal_calls(source: bytes) -> tuple[RefCall, ...]:
+    """Every literal ref()/source() call in the model, even when its SQL spells a reserved sentinel name."""
+    try:
+        return tuple(mask_jinja(decode_source(source), reject_sentinel_names=False).ref_calls.values())
+    except RefmergeError:
+        return ()  # not UTF-8 or unterminated Jinja: there is no import to merge
+
+
 def _may_import_twice(source: bytes) -> bool:
     """Whether two literal ref()/source() calls in the model may name the same relation."""
-    try:
-        return _first_duplicate_calls(mask_jinja(decode_source(source)).ref_calls.values()) is not None
-    except RefmergeError:
-        return False  # not UTF-8 or unterminated Jinja: there is no import to merge
+    return _first_duplicate_calls(_literal_calls(source)) is not None
 
 
 def detect_source_duplicates(
@@ -201,11 +206,8 @@ def detect_source_duplicates(
         model = parse_source_model(source, fold_unquoted=fold_unquoted)
     except RefmergeError:
         # A model the CTE parser cannot read is a lead only if it may name one relation in two literal calls.
-        if not _may_import_twice(source):
-            return None
-        duplicate_calls = _first_duplicate_calls(mask_jinja(decode_source(source)).ref_calls.values())
-        assert duplicate_calls is not None
-        return unsupported(duplicate_calls)
+        duplicate_calls = _first_duplicate_calls(_literal_calls(source))
+        return unsupported(duplicate_calls) if duplicate_calls else None
     from dbt_refmerge.source import has_unsupported_duplicate_candidates
 
     if has_unsupported_duplicate_candidates(model):

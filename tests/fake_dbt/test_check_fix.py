@@ -194,6 +194,13 @@ def _model(
             VerificationStatus.UNVERIFIABLE,
             (ReasonCode.SOURCE_MAPPING_AMBIGUOUS,),
         ),
+        (
+            # SQL spelling a ref sentinel is refused, and the duplicate imports still make that a finding.
+            _model("select a.customer_id as __r0__, b.amount from a join b using (id)"),
+            None,
+            VerificationStatus.UNVERIFIABLE,
+            (ReasonCode.UNSUPPORTED_IMPORT_SHAPE,),
+        ),
     ],
     ids=[
         "incremental",
@@ -205,6 +212,7 @@ def _model(
         "candidate-node-missing",
         "candidate-drift",
         "source-file-not-in-snapshot",
+        "sentinel-name-in-sql",
     ],
 )
 def test_check_refuses_models_it_cannot_prove(make_project, fake_dbt, tmp_path, model, mode, status, codes):
