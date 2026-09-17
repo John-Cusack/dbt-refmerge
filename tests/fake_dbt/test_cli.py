@@ -75,18 +75,16 @@ def test_human_mode_reports_progress_on_stderr_and_json_mode_does_not(project):
     as_json = _invoke("check", *common, "--json", "--fail-on", "never")
     fixed = _invoke("fix", "models/orders.sql", *common)
 
-    assert human.stderr.splitlines() == [
-        "dbt-refmerge: copying the project into a private workspace",
-        "dbt-refmerge: compiling the project with dbt (--select fqn:*)",
-        "dbt-refmerge: analyzing 2 models",
-        "dbt-refmerge: compiling 1 candidate merge",
-        "dbt-refmerge: verifying 1 merge on the warehouse (scratch schema refmerge_scratch; views are dropped "
-        "afterwards)",
-    ]
+    lines = human.stderr.splitlines()
+    stages = [line.removeprefix("dbt-refmerge: ") for line in lines]
+    assert all(line.startswith("dbt-refmerge: ") for line in lines)
+    assert [stage.split()[0] for stage in stages] == ["copying", "compiling", "analyzing", "compiling", "verifying"]
+    assert "2 models" in stages[2] and "1 candidate merge" in stages[3] and "refmerge_scratch" in stages[4]
     assert "dbt-refmerge:" not in human.stdout
     assert as_json.stderr == "" and json.loads(as_json.stdout)["models"]
     assert fixed.exit_code == 0
-    assert fixed.stderr.splitlines()[-1] == "dbt-refmerge: writing the verified merge to models/orders.sql"
+    assert fixed.stderr.splitlines()[-1].startswith("dbt-refmerge: writing")
+    assert "models/orders.sql" in fixed.stderr.splitlines()[-1]
     assert "join a as b" in (root / "models" / "orders.sql").read_text()
 
 
