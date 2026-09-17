@@ -182,7 +182,10 @@ def scan_report_json(report: ScanReport, *, project_dir: Path) -> dict[str, Any]
 
 def finding_message(finding: Finding) -> str:
     if ReasonCode.UNUSED_IMPORT_COLUMNS in finding.reason_codes:
-        return f"CTEs {', '.join(finding.cte_names)} can select only needed columns; run dbt-refmerge check to verify"
+        return (
+            f"CTEs {', '.join(finding.cte_names)} can select only needed columns; "
+            "verification is available on PostgreSQL only"
+        )
     if finding.cte_names:
         target = finding.upstream_unique_id or "the same relation"
         return f"CTEs {', '.join(finding.cte_names)} import {target}; run dbt-refmerge check to prove a merge"

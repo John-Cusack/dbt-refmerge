@@ -155,7 +155,7 @@ def check(
     keep_workspace: bool | None = typer.Option(None, "--keep-workspace", show_default=False),
     debug: bool | None = typer.Option(None, "--debug", show_default=False),
 ) -> None:
-    """Verify import merges and column pruning on the warehouse. Never edits files."""
+    """Verify import merges and column pruning on PostgreSQL only. Never edits files."""
     config = _load(
         project_dir,
         profiles_dir=profiles_dir,

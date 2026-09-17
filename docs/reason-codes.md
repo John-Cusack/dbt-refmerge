@@ -21,7 +21,7 @@ Codes are never renamed within a JSON `schema_version`.
 
 ### UNUSED_IMPORT_COLUMNS
 **Seen in:** `scan` findings. A direct import can select only the columns its consumers need, replacing a wildcard or removing unused explicit columns.
-**What to do:** run `check` to verify the [column pruning](column-pruning.md), then `fix` to apply it.
+**What to do:** on PostgreSQL, run `check` to verify the [column pruning](column-pruning.md), then `fix` to apply it. Other dialects support source-only `scan`.
 
 ### NEEDS_COMPILED_ANALYSIS
 **Seen in:** `scan` findings. The source has duplicate imports, but whether they can be merged depends on the compiled SQL.

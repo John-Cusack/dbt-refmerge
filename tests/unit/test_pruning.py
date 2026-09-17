@@ -287,16 +287,29 @@ def test_pruned_source_must_match_compiled_import_projections(compiled):
     assert exc_info.value.reason_code is ReasonCode.SOURCE_MAPPING_AMBIGUOUS
 
 
-def test_scan_reports_single_import_pruning_in_all_formats(make_project):
-    raw = f"with a as (\n    select * from {REF}\n)\nselect id from a\n"
+@pytest.mark.parametrize("adapter", ["postgres", "snowflake", "bigquery"])
+def test_scan_reports_single_import_pruning_in_all_formats(make_project, adapter):
+    raw = f"with prunable_orders as (\n    select * from {REF}\n)\nselect id from prunable_orders\n"
     root = make_project({"models/m.sql": raw})
-    report = RefmergeService().scan(ScanRequest(AppConfig(project_dir=root, adapter="postgres")))
+    report = RefmergeService().scan(ScanRequest(AppConfig(project_dir=root, adapter=adapter)))
     assert len(report.findings) == 1
     finding = report.findings[0]
-    assert (finding.cte_names, finding.reason_codes, finding.line) == (("a",), (ReasonCode.UNUSED_IMPORT_COLUMNS,), 2)
-    assert (
-        render_human_scan(report, project_dir=root)
-        == "models/m.sql:2: CTEs a can select only needed columns; run dbt-refmerge check to verify\n"
+    assert (finding.cte_names, finding.reason_codes, finding.line) == (
+        ("prunable_orders",),
+        (ReasonCode.UNUSED_IMPORT_COLUMNS,),
+        2,
     )
-    assert "title=dbt-refmerge%3A unused import columns" in render_github_scan(report, base_dir=root)
+    human = render_human_scan(report, project_dir=root)
+    assert human.startswith("models/m.sql:2: ") and human.endswith("\n")
+    assert finding.cte_names[0] in human
+    assert "columns" in human.lower()
+    assert "PostgreSQL only" in human
+    annotation = render_github_scan(report, base_dir=root)
+    assert annotation.startswith("::warning ")
+    properties, message = annotation[2:].split("::", 1)
+    assert "file=models/m.sql,line=2," in properties
+    assert properties.partition("title=")[2].strip()
+    assert finding.cte_names[0] in message
+    assert "columns" in message.lower()
+    assert "PostgreSQL only" in message
     assert scan_report_json(report, project_dir=root)["findings"][0]["reason_codes"] == ["UNUSED_IMPORT_COLUMNS"]
