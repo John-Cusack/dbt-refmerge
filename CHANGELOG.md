@@ -1,3 +1,15 @@
+# Unreleased
+- `scan`, `check` and `fix` narrow direct `ref()`/`source()` import wildcards and remove unused plain
+  import columns when the final query names its outputs. Requirements include joins, filters,
+  calculations and every consumer, and are traced through single-source wildcard CTEs. Single imports
+  are supported; narrowed duplicate imports can merge in the same rewrite, including single-line
+  projection lists. Ambiguous and schema-dependent SQL is left alone. `scan` reports
+  `UNUSED_IMPORT_COLUMNS`; compiled-delta and PostgreSQL equality checks also guard pruning.
+- Text-only Snowflake and BigQuery pruning covers import `EXCLUDE`/`EXCEPT`, quoted identifiers,
+  qualified nested fields and `UNNEST`/lateral `FLATTEN` inputs. BigQuery quoted column/query aliases
+  bind case-insensitively. Dialect fixtures run without warehouse connections; `check`/`fix` remain
+  PostgreSQL-only.
+
 # 0.2.0 (2026-09-17)
 - `check` verifies every model in one batch: a fixed number of dbt invocations (one candidate compile,
   one harness parse and run, one catalog query, one comparison call, one drop) however many models are

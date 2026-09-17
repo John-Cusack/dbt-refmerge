@@ -11,6 +11,27 @@ columns from the same `{{ ref(...) }}` — proves the merged version returns
 identical rows on your warehouse, and rewrites the file. Anything it can't
 prove, it leaves alone.
 
+It also narrows `select *` imports to the columns their consumers need when the final query names its outputs. Join keys, filter inputs and calculation inputs are retained. This works for a single `ref()`/`source()` import, and can enable duplicate wildcard imports to merge. See [column pruning and performance expectations](https://github.com/John-Cusack/dbt-refmerge/blob/main/docs/column-pruning.md).
+
+## Dialect support
+
+**SQL parsing and `scan` run locally from text. No warehouse connection, dbt adapter installation or credentials are needed when you pass `--adapter`.** Snowflake and BigQuery parsing includes column pruning through import wildcard exclusions and qualified row expansion; see [column pruning support and limits](https://github.com/John-Cusack/dbt-refmerge/blob/main/docs/column-pruning.md#snowflake-and-bigquery).
+
+**PostgreSQL is the only dialect with warehouse verification and automatic fixes.** All other configured dialects have limited support:
+
+| Dialects | Available commands |
+|---|---|
+| PostgreSQL (`postgres`, also `postgresql` and `pg`) | `scan`, `check`, `fix`, `cleanup` |
+| `snowflake`, `bigquery`, `duckdb`, `databricks`, `redshift`, `materialize`, `trino`, `presto`, `athena`, `spark`, `sqlite`, `tsql`, `oracle`, `exasol`, `clickhouse` | **Limited support: `scan` only** |
+
+Limited dialects can report duplicate-import and column-pruning opportunities. Warehouse verification and automatic rewriting are unavailable for these dialects. See [adapter configuration](https://github.com/John-Cusack/dbt-refmerge/blob/main/docs/configuration.md#adapters) for details.
+
+```sh
+# Run in a dbt project; these commands only read local files.
+dbt-refmerge scan --adapter snowflake
+dbt-refmerge scan --adapter bigquery
+```
+
 ## Use it
 
 ```sh
@@ -50,9 +71,8 @@ multisets in a single query, then drops both views. All models in a `check`
 share one batch of dbt calls, so a large project costs about as many dbt
 invocations as a small one, and a model that fails doesn't block the others.
 If a run is interrupted, `dbt-refmerge cleanup --run-id <id>` drops whatever
-it left (the id is in `check --json`). Verification supports PostgreSQL;
-`scan` parses 16 dialects (snowflake, bigquery, duckdb, databricks, redshift,
-trino, spark, sqlite, tsql, oracle, exasol, clickhouse, and more).
+it left (the id is in `check --json`). See [dialect support](#dialect-support)
+for the commands available on each adapter.
 
 ## Keep new duplicates out
 

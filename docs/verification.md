@@ -1,6 +1,6 @@
 # Verification
 
-`check` and `fix` never rely on the rewrite being correct. They prove that the merged model returns the same rows as the original on your warehouse, and they refuse whenever they can't.
+`check` and `fix` never rely on the rewrite being correct. They prove that the rewritten model returns the same rows as the original on your warehouse, and they refuse whenever they can't.
 
 ## What a `check` does
 
@@ -14,8 +14,10 @@
 
    dbt-refmerge also checks how later CTEs refer to the imports. The rewrite goes to a copy of the model inside the workspace.
 
-   Models that can't be analyzed are refused only when two literal `ref()`/`source()` calls in them may name the same relation. Otherwise they have nothing to merge (`NO_DUPLICATE_IMPORT`).
-4. **Candidate compile and delta gate.** Compiles every rewritten model in one `dbt compile`. The compiled SQL must differ from the baseline exactly as the merge predicts; anything else is `COMPILE_DRIFT`.
+   [Column pruning](column-pruning.md) can also narrow a single direct import, replacing `SELECT *` or removing unused plain columns. It retains inputs needed by every consumer and can make wildcard duplicate imports eligible for merging. The same materialization, volatility, compiled-delta and warehouse gates apply.
+
+   Models that can't be analyzed are refused when two literal `ref()`/`source()` calls in them may name the same relation, or when a planned column pruning cannot pass the verification gates. Otherwise they have no supported rewrite (`NO_DUPLICATE_IMPORT`).
+4. **Candidate compile and delta gate.** Compiles every rewritten model in one `dbt compile`. The compiled SQL must differ from the baseline exactly as pruning and merging predict; anything else is `COMPILE_DRIFT`.
 5. **Warehouse proof**, for all remaining models together:
    - writes a throwaway dbt project (the harness) holding, for each model, the baseline and candidate compiled SQL as two views;
    - runs `dbt parse` and checks the harness manifest before anything is created. It must contain exactly those views, with no hooks, all in the scratch schema;
@@ -34,7 +36,7 @@ The number of dbt invocations doesn't grow with the number of models. Failures s
 
 | Status | Meaning | Fixable |
 |---|---|---|
-| `not_run` | No duplicate imports to merge (`NO_DUPLICATE_IMPORT`) | no |
+| `not_run` | No supported import pruning or duplicate merge (`NO_DUPLICATE_IMPORT`) | no |
 | `snapshot_equivalent` | Same column names and types in the same order, and the same rows with the same multiplicities | yes, if the views were dropped |
 | `different` | The merge would change the model's output (`SCHEMA_MISMATCH` or `BAG_DIFFERENCE`) | no |
 | `unverifiable` | dbt-refmerge refused to prove it; the [reason code](reason-codes.md) says why | no |

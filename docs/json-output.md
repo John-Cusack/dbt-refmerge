@@ -33,10 +33,10 @@ Project-relative paths (`check` and `fix`) use forward slashes on every platform
 | `model_unique_id` | The dbt unique id, when `target/manifest.json` names the file. Otherwise `model.<file stem>`. |
 | `source_path` | Absolute path of the model file. |
 | `upstream_unique_id` | The imported model or source, when the manifest resolves it. Otherwise `""`. |
-| `cte_names` | The duplicate import CTEs, as spelled in the source. Empty for unsupported shapes. |
+| `cte_names` | Duplicate imports or imports that can be narrowed, as spelled in the source. Empty for unsupported shapes. |
 | `status` | `needs_compiled_analysis` for every lead `scan` reports. |
-| `reason_codes` | `NEEDS_COMPILED_ANALYSIS`, or `UNSUPPORTED_IMPORT_SHAPE` when the imports can't be merged as written. |
-| `line` | 1-based line of the first duplicated import. |
+| `reason_codes` | `NEEDS_COMPILED_ANALYSIS` for duplicate imports, `UNUSED_IMPORT_COLUMNS` for column pruning, or `UNSUPPORTED_IMPORT_SHAPE` when imports can't be merged as written. |
+| `line` | 1-based line of the first duplicated import or projection that can be narrowed. |
 
 ## check
 

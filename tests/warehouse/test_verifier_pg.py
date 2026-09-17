@@ -129,6 +129,33 @@ def test_check_proves_merge_and_leaves_scratch_schema_empty(proven):
     assert _relations_in(proven.dsn, proven.config.scratch_schema) == []
 
 
+def test_check_prunes_single_import_and_merges_wildcard_imports(warehouse_project, pg_dsn):
+    root, config = warehouse_project
+    (root / "models/orders.sql").write_text(
+        "with orders as (select * from {{ ref('stg_orders') }}),\n"
+        "order_financials as (select * from {{ ref('stg_orders') }})\n"
+        "select orders.order_id, order_financials.amount from orders\n"
+        "join order_financials on orders.order_id = order_financials.order_id\n"
+    )
+    (root / "models/standalone.sql").write_text(
+        "with imported as (select * from {{ ref('stg_orders') }}),\n"
+        "filtered as (select * from imported where amount > 0)\n"
+        "select order_id from filtered\n"
+    )
+    report = RefmergeService().check(CheckRequest(config, select="orders standalone"))
+    receipts = {result.model_unique_id: result.receipt for result in report.results}
+    assert all(is_fixable(receipt) for receipt in receipts.values())
+    assert receipts["model.it.orders"].equality == EqualityResult(True, 6, 6, 0, 0)
+    assert receipts["model.it.standalone"].equality == EqualityResult(True, 3, 3, 0, 0)
+    merged = report.candidate_bytes_map["model.it.orders"].decode()
+    narrowed = report.candidate_bytes_map["model.it.standalone"].decode()
+    assert "customer_id" not in merged and "customer_id" not in narrowed
+    assert "order_financials as (" not in merged
+    assert "select order_id, amount from" in merged
+    assert "select order_id, amount from" in narrowed
+    assert _relations_in(pg_dsn, config.scratch_schema) == []
+
+
 def test_fix_applies_the_proven_merge(warehouse_project):
     root, config = warehouse_project
 

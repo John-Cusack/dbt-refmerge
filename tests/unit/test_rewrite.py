@@ -100,6 +100,23 @@ def test_plan_deterministic_hash():
     assert p1.candidate_source_sha256 == p2.candidate_source_sha256
 
 
+def test_single_line_projection_insertion_preserves_a_trailing_comma():
+    raw_str = (
+        "with a as (select id, from {{ ref('stg') }}),\n"
+        "b as (select id, amount from {{ ref('stg') }})\n"
+        "select a.id, b.amount from a join b on a.id = b.id\n"
+    )
+    raw, source, owner, group = _run_case(
+        raw_str, raw_str.replace("{{ ref('stg') }}", "db.sch.stg"), dialect="bigquery"
+    )
+    qualified = qualify_group(group, downstream_refs=source.downstream_refs)
+    plan = build_plan(raw, owner.unique_id, Path("m.sql"), (qualified,), source)
+    assert apply_edits(raw, plan.edits) == (
+        b"with a as (select id, amount, from {{ ref('stg') }})\n"
+        b"select a.id, b.amount from a join a as b on a.id = b.id\n"
+    )
+
+
 def _run_case(
     raw_str: str | bytes,
     compiled_str: str,

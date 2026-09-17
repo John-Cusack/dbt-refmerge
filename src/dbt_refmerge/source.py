@@ -34,8 +34,9 @@ def _sentinel_name(counter: int) -> str:
 def make_identifier(source_text: str, quoted: bool, fold_unquoted: FoldRule = "lower") -> Identifier:
     # strip surrounding quotes for value but keep identity rules
     value = source_text
-    if quoted and len(source_text) >= 2 and source_text[0] == '"' and source_text[-1] == '"':
-        value = source_text[1:-1].replace('""', '"')
+    if quoted and len(source_text) >= 2 and source_text[0] in ('"', "`") and source_text[-1] == source_text[0]:
+        quote = source_text[0]
+        value = source_text[1:-1].replace(quote * 2, quote)
     return Identifier(
         source_text=source_text,
         value=value,
@@ -336,8 +337,8 @@ def _is_punct(tokens: list[Token], idx: int, text: str) -> bool:
 
 
 def _identity_for_token(token: Token | None, fold_unquoted: FoldRule) -> str | None:
-    """Identity of a bare or double-quoted identifier token; None for anything else."""
-    if token is None or not (token.kind == "word" or token.text.startswith('"')):
+    """Identity of a bare, double-quoted or backtick-quoted identifier token."""
+    if token is None or not (token.kind == "word" or token.text.startswith(('"', "`"))):
         return None
     return make_identifier(token.text, token.kind == "string", fold_unquoted).identity.value
 

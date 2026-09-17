@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+from difflib import SequenceMatcher
 from pathlib import Path
 
 from dbt_refmerge.analyze import FindingStatus, QualifiedDuplicateGroup
@@ -26,6 +27,39 @@ def apply_edits(source: bytes, edits: tuple[TextEdit, ...]) -> bytes:
     for edit in sorted(edits, key=lambda item: item.span.start_byte, reverse=True):
         result = result[: edit.span.start_byte] + edit.replacement + result[edit.span.end_byte :]
     return result
+
+
+def plan_source_changes(
+    source: bytes,
+    candidate: bytes,
+    model_unique_id: str,
+    source_path: Path,
+    canonical_cte: Identifier,
+    removed_ctes: tuple[Identifier, ...] = (),
+) -> RewritePlan:
+    """Combine staged pruning/merging into edits against the original bytes."""
+    original_lines = source.splitlines(keepends=True)
+    candidate_lines = candidate.splitlines(keepends=True)
+    offsets = [0]
+    for line in original_lines:
+        offsets.append(offsets[-1] + len(line))
+    edits = tuple(
+        TextEdit(SourceSpan(offsets[start], offsets[end]), b"".join(candidate_lines[new_start:new_end]), ReasonCode.OK)
+        for tag, start, end, new_start, new_end in SequenceMatcher(
+            a=original_lines, b=candidate_lines, autojunk=False
+        ).get_opcodes()
+        if tag != "equal"
+    )
+    validate_edits(edits, len(source))
+    return RewritePlan(
+        model_unique_id=model_unique_id,
+        source_path=source_path,
+        original_source_sha256=hashlib.sha256(source).hexdigest(),
+        canonical_cte=canonical_cte,
+        removed_ctes=removed_ctes,
+        edits=edits,
+        candidate_source_sha256=hashlib.sha256(candidate).hexdigest(),
+    )
 
 
 def _detect_newline_indent(select_list_bytes: bytes) -> tuple[bytes, bytes, bool]:
@@ -154,16 +188,19 @@ def build_plan(
                 )
             select_bytes = source[canon_cte.select_list_span.start_byte : canon_cte.select_list_span.end_byte]
             nl, indent, multiline = _detect_newline_indent(select_bytes)
-            if not multiline:
-                raise RewriteError(
-                    ReasonCode.UNSUPPORTED_IMPORT_SHAPE,
-                    "single-line select list insertion unsupported",
-                )
+            if not multiline and b"\r" in select_bytes:
+                raise RewriteError(ReasonCode.UNSUPPORTED_IMPORT_SHAPE, "CR-only projection formatting unsupported")
             # trailing comma style: does select list end with comma?
             trailing_comma = select_bytes.rstrip().endswith(b",")
             insertion = b""
             for frag, _out in missing:
                 frag = frag.strip()
+                if not multiline:
+                    if trailing_comma:
+                        insertion += b" " + frag + b","
+                    else:
+                        insertion += b", " + frag
+                    continue
                 if trailing_comma:
                     insertion += nl + indent + frag + b","
                 else:

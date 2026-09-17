@@ -9,9 +9,9 @@ python -m dbt_refmerge COMMAND [OPTIONS]
 
 | Command | What it does | Needs dbt | Needs a warehouse | Edits files |
 |---|---|---|---|---|
-| [`scan`](#scan) | Lists duplicate import CTEs, read from the model source files | no | no | no |
-| [`check`](#check) | Rewrites each model in a private copy and proves the merge on the warehouse | yes | yes | no |
-| [`fix`](#fix) | Re-proves one model's merge and writes it only if the proof passes | yes | yes | one model file |
+| [`scan`](#scan) | Lists duplicate imports and imports that can select fewer columns, read from source | no | no | no |
+| [`check`](#check) | Rewrites each model in a private copy and proves the rewrite on the warehouse | yes | yes | no |
+| [`fix`](#fix) | Re-proves one model's rewrite and writes it only if the proof passes | yes | yes | one model file |
 | [`cleanup`](#cleanup) | Drops scratch views an interrupted `check` left behind | yes | yes | no |
 
 `--profiles-dir`, `--profile`, `--target`, `--adapter`, `--dbt-command-part`, `--scratch-schema`, `--json`, `--fail-on`, `--keep-workspace` and `--debug` can also be set in `.dbt-refmerge.toml` or a `DBT_REFMERGE_*` environment variable; see [configuration](configuration.md). A flag you don't pass never overrides those. `--project-dir`, `--format`, `--select`, `--dry-run`, `--run-id` and the model path come only from the command line.
@@ -39,7 +39,7 @@ dbt-refmerge scan [--project-dir PATH] [--adapter NAME] [--format text|json|gith
                   [--profiles-dir PATH] [--profile NAME] [--target NAME] [--debug]
 ```
 
-Reads every `.sql` file under the project's `model-paths`. It reports a lead for each model where two or more CTEs import the same `ref()` or `source()`. No dbt command runs and nothing connects to a warehouse. If `target/manifest.json` exists, `scan` uses it to name the upstream model.
+Reads every `.sql` file under the project's `model-paths`. It reports a lead for each model where two or more CTEs import the same `ref()` or `source()`, or where a direct import can select fewer columns. No dbt command runs and nothing connects to a warehouse. If `target/manifest.json` exists, `scan` uses it to name the upstream model for duplicate imports. [Column pruning](column-pruning.md) describes supported SQL and conservative limits.
 
 A model whose CTE list `scan` can't parse (for example `WITH RECURSIVE`, or a CTE column list) is reported only when it names the same relation in two literal `ref()`/`source()` calls. It is reported with reason `UNSUPPORTED_IMPORT_SHAPE`.
 
@@ -60,8 +60,8 @@ dbt-refmerge check --scratch-schema NAME [--select SELECTOR] [--project-dir PATH
 ```
 
 1. Copies the project into a private workspace and compiles it with dbt.
-2. Rewrites each model that has duplicate imports, in the copy only.
-3. Compiles the rewritten models, and refuses any whose compiled SQL changed in a way the merge doesn't explain.
+2. Narrows import columns and merges eligible duplicate imports, in the copy only.
+3. Compiles the rewritten models, and refuses any whose compiled SQL changed in a way the rewrite doesn't explain.
 4. Proves the rest on the warehouse: it builds the original and the rewritten SQL as two views per model, compares their column types and their rows as multisets, then drops the views.
 
 All models share one batch of dbt calls. [Verification](verification.md) covers the details.

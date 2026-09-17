@@ -38,7 +38,7 @@ from dbt_refmerge.reporting import (
     scan_report_json,
 )
 
-app = typer.Typer(add_completion=False, help="Safe merge of duplicate direct-import CTEs.")
+app = typer.Typer(add_completion=False, help="Safely merge duplicate imports and select only needed columns.")
 # Plain text: paths such as models/[legacy]/m.sql are not markup, and lines must not wrap.
 console = Console(markup=False, highlight=False, soft_wrap=True)
 err_console = Console(stderr=True, markup=False, highlight=False, soft_wrap=True)
@@ -114,7 +114,7 @@ def scan(
     fail_on: FailOn | None = typer.Option(None, "--fail-on", help="finding: exit 2 when there are leads."),
     debug: bool | None = typer.Option(None, "--debug", show_default=False),
 ) -> None:
-    """List duplicate import CTEs from source files (no dbt run, no warehouse)."""
+    """List duplicate imports and column pruning opportunities from source files."""
     if json_ and format_ not in (None, OutputFormat.JSON):
         _fail("configuration error", ValueError(f"--json conflicts with --format {format_.value}"), debug=False)
     config = _load(
@@ -155,7 +155,7 @@ def check(
     keep_workspace: bool | None = typer.Option(None, "--keep-workspace", show_default=False),
     debug: bool | None = typer.Option(None, "--debug", show_default=False),
 ) -> None:
-    """Prove each duplicate-import merge on the warehouse. Never edits files."""
+    """Verify import merges and column pruning on PostgreSQL only. Never edits files."""
     config = _load(
         project_dir,
         profiles_dir=profiles_dir,
@@ -203,7 +203,7 @@ def fix(
     keep_workspace: bool | None = typer.Option(None, "--keep-workspace", show_default=False),
     debug: bool | None = typer.Option(None, "--debug", show_default=False),
 ) -> None:
-    """Re-prove one model's merge and write it only if the proof passes."""
+    """Re-prove one model's rewrite and write it only if the proof passes."""
     config = _load(
         project_dir,
         profiles_dir=profiles_dir,
