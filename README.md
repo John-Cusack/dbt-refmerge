@@ -24,7 +24,7 @@ That's it. The dialect is detected automatically from your
 needed). You'll get one line per opportunity:
 
 ```
-models/marts/orders.sql: order_items, order_items_summary -> ?
+models/marts/orders.sql:3: CTEs order_items, order_items_summary import model.shop.stg_order_items; run dbt-refmerge check to prove a merge
 ```
 
 Each line is a *lead*: two CTEs over the same upstream model that may merge
@@ -47,12 +47,43 @@ To prove a merge, `check` builds the original and the merged model as two
 views in the scratch schema (dbt creates it if needed; it must not be a schema
 your models build into), compares their column types and their rows as
 multisets in a single query, then drops both views. All models in a `check`
-share one harness run, so the number of dbt invocations stays the same however
-many models you check, and a model that fails doesn't block the others. If a run is interrupted,
-`dbt-refmerge cleanup --run-id <id>` drops whatever it left (the id is in
-`check --json`). Verification supports PostgreSQL in v0.1; `scan` parses 16
-dialects (snowflake, bigquery, duckdb, databricks, redshift, trino, spark,
-sqlite, tsql, oracle, exasol, clickhouse, and more).
+share one batch of dbt calls, so a large project costs about as many dbt
+invocations as a small one, and a model that fails doesn't block the others.
+If a run is interrupted, `dbt-refmerge cleanup --run-id <id>` drops whatever
+it left (the id is in `check --json`). Verification supports PostgreSQL;
+`scan` parses 16 dialects (snowflake, bigquery, duckdb, databricks, redshift,
+trino, spark, sqlite, tsql, oracle, exasol, clickhouse, and more).
+
+## Keep new duplicates out
+
+`scan` needs no dbt run and no warehouse, so it works as a commit hook or a
+pull request check:
+
+```yaml
+# .pre-commit-config.yaml
+- repo: https://github.com/John-Cusack/dbt-refmerge
+  rev: v0.2.0
+  hooks:
+    - id: dbt-refmerge-scan
+```
+
+```yaml
+# a GitHub Actions step: annotates pull requests at each duplicate
+- uses: John-Cusack/dbt-refmerge@v0.2.0
+  with:
+    adapter: snowflake
+```
+
+See [integrations](https://github.com/John-Cusack/dbt-refmerge/blob/main/docs/integrations.md) for options and other CI systems.
+
+## Documentation
+
+- [Command-line reference](https://github.com/John-Cusack/dbt-refmerge/blob/main/docs/cli.md), with exit codes
+- [Configuration](https://github.com/John-Cusack/dbt-refmerge/blob/main/docs/configuration.md): `.dbt-refmerge.toml`, environment variables and adapters
+- [Verification](https://github.com/John-Cusack/dbt-refmerge/blob/main/docs/verification.md): what `check` creates, the privileges it needs and its limits
+- [Reason codes](https://github.com/John-Cusack/dbt-refmerge/blob/main/docs/reason-codes.md): why a model was refused and what to do about it
+- [JSON output](https://github.com/John-Cusack/dbt-refmerge/blob/main/docs/json-output.md)
+- [Integrations](https://github.com/John-Cusack/dbt-refmerge/blob/main/docs/integrations.md): pre-commit, GitHub Actions and other CI
 
 ## Develop it
 
@@ -79,8 +110,8 @@ python3 -m pytest -q -m warehouse     # needs Postgres and dbt-postgres
 python3 -m pytest -q -m "" --cov      # every lane; enforces the coverage floor
 ```
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for conventions and the release process, and
-[SECURITY.md](SECURITY.md) to report a vulnerability. `IMPROVEMENT_PLAN.md` tracks what comes next.
+See [CONTRIBUTING.md](https://github.com/John-Cusack/dbt-refmerge/blob/main/CONTRIBUTING.md) for conventions and the release process, and
+[SECURITY.md](https://github.com/John-Cusack/dbt-refmerge/blob/main/SECURITY.md) to report a vulnerability. [IMPROVEMENT_PLAN.md](https://github.com/John-Cusack/dbt-refmerge/blob/main/IMPROVEMENT_PLAN.md) tracks what comes next.
 
 ## Support
 

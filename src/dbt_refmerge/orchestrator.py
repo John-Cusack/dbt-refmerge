@@ -160,12 +160,23 @@ def _line_of(source: bytes, byte_offset: int) -> int:
 
 
 def _first_duplicate_calls(calls: Iterable[RefCall]) -> list[RefCall] | None:
-    """The literal ref()/source() calls naming the relation that is imported first and more than once."""
+    """The literal ref()/source() calls that may name one relation, for the relation named first.
+
+    Calls are grouped by name alone: ``ref('stg')`` and ``ref('pkg', 'stg')`` can resolve to the same model.
+    """
     grouped: dict[tuple[Any, ...], list[RefCall]] = {}
     for call in calls:
-        grouped.setdefault((call.kind, call.package, call.name, call.source_name, call.version), []).append(call)
+        grouped.setdefault((call.kind, call.name, call.source_name), []).append(call)
     duplicates = [group for group in grouped.values() if len(group) >= 2]
     return min(duplicates, key=lambda group: group[0].span.start_byte) if duplicates else None
+
+
+def _may_import_twice(source: bytes) -> bool:
+    """Whether two literal ref()/source() calls in the model may name the same relation."""
+    try:
+        return _first_duplicate_calls(mask_jinja(decode_source(source)).ref_calls.values()) is not None
+    except RefmergeError:
+        return False  # not UTF-8 or unterminated Jinja: there is no import to merge
 
 
 def detect_source_duplicates(
@@ -189,13 +200,12 @@ def detect_source_duplicates(
     try:
         model = parse_source_model(source, fold_unquoted=fold_unquoted)
     except RefmergeError:
-        # A model the CTE parser cannot read is a lead only if it names one relation in two literal calls.
-        try:
-            calls = mask_jinja(decode_source(source)).ref_calls.values()
-        except RefmergeError:
-            return None  # not UTF-8 or unterminated Jinja: dbt cannot compile it either
-        duplicate_calls = _first_duplicate_calls(calls)
-        return unsupported(duplicate_calls) if duplicate_calls else None
+        # A model the CTE parser cannot read is a lead only if it may name one relation in two literal calls.
+        if not _may_import_twice(source):
+            return None
+        duplicate_calls = _first_duplicate_calls(mask_jinja(decode_source(source)).ref_calls.values())
+        assert duplicate_calls is not None
+        return unsupported(duplicate_calls)
     from dbt_refmerge.source import has_unsupported_duplicate_candidates
 
     if has_unsupported_duplicate_candidates(model):
@@ -411,16 +421,22 @@ class RefmergeService:
         """Static analysis and rewrite for one model: a final refusal, or a candidate written for compilation."""
         from dbt_refmerge.source import parse_source_model as _parse_src
 
+        src_path = ws.source_snapshot / node.original_file_path
+        # The rewrite edits this exact file; never substitute a same-named file or the manifest's raw_code.
+        raw = src_path.read_bytes() if src_path.is_file() else None
+
         def refuse(codes: tuple[ReasonCode, ...], path: Path) -> ModelResult:
+            # A model that cannot be analyzed is only worth reporting when it may import a relation twice;
+            # otherwise every incremental or unparseable model would fail `check`.
+            evidence = raw if raw is not None else node.raw_code.encode("utf-8")
+            if not _may_import_twice(evidence):
+                return ModelResult(node.unique_id, path, _ok_noop_receipt(ws, context, view, node, evidence), "")
             return ModelResult(node.unique_id, path, _unverifiable_receipt(ws, context, view, node, codes), "")
 
         if node.config.get("materialized", "view") not in ("table", "view"):
             return refuse((ReasonCode.UNSUPPORTED_MODEL_TYPE,), Path(node.original_file_path))
-        src_path = ws.source_snapshot / node.original_file_path
-        if not src_path.is_file():
-            # The rewrite edits this exact file; never substitute a same-named file or the manifest's raw_code.
+        if raw is None:
             return refuse((ReasonCode.SOURCE_MAPPING_AMBIGUOUS,), Path(node.original_file_path))
-        raw = src_path.read_bytes()
         try:
             parsed_src = _parse_src(raw, fold_unquoted=spec.fold_unquoted)
         except RefmergeError as exc:

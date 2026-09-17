@@ -4,11 +4,12 @@ from pathlib import Path
 
 import pytest
 
-from dbt_refmerge.config import AppConfig
+from dbt_refmerge.config import AppConfig, FailOn
 from dbt_refmerge.dbt_cli import DbtCli
 from dbt_refmerge.domain import ReasonCode, VerificationStatus, is_fixable
 from dbt_refmerge.errors import RefmergeError
 from dbt_refmerge.orchestrator import CheckRequest, FixRequest, RefmergeService
+from dbt_refmerge.reporting import ExitCode, evaluate_exit_code_for_check
 
 pytestmark = pytest.mark.fake_dbt
 
@@ -71,12 +72,9 @@ def test_check_readme_example_is_proven_equivalent(make_project, fake_dbt, tmp_p
 
 def test_check_continues_past_unparseable_model(make_project, fake_dbt, tmp_path):
     # B7: one model the source parser refuses must not abort the whole run.
+    recursive = "with recursive r as (select id from {{ ref('stg_orders') }}) select * from r join {{ ref('stg_orders') }} using (id)\n"
     root = make_project(
-        {
-            "models/stg_orders.sql": STG,
-            "models/orders.sql": README_MODEL,
-            "models/recursive.sql": "with recursive r as (select 1 as n) select * from r\n",
-        }
+        {"models/stg_orders.sql": STG, "models/orders.sql": README_MODEL, "models/recursive.sql": recursive}
     )
 
     report = RefmergeService().check(CheckRequest(config=_config(root, fake_dbt, tmp_path)))
@@ -85,6 +83,26 @@ def test_check_continues_past_unparseable_model(make_project, fake_dbt, tmp_path
     assert results["model.p.recursive"].receipt.status is VerificationStatus.UNVERIFIABLE
     assert results["model.p.recursive"].receipt.reason_codes == (ReasonCode.UNSUPPORTED_IMPORT_SHAPE,)
     assert results["model.p.orders"].receipt.reason_codes == (ReasonCode.OK,)
+
+
+@pytest.mark.parametrize(
+    "model",
+    [
+        "with recursive r as (select 1 as n) select * from r\n",
+        "{{ config(materialized='incremental') }}\nselect * from {{ ref('stg_orders') }}\n",
+        "{{ config(materialized='ephemeral') }}\nwith a as (select id from {{ ref('stg_orders') }}) select * from a\n",
+    ],
+    ids=["unparseable", "incremental", "ephemeral-single-import"],
+)
+def test_models_it_cannot_analyze_pass_when_they_import_nothing_twice(make_project, fake_dbt, tmp_path, model):
+    # Refusing them would make every project with an incremental or recursive model fail check.
+    root = make_project({"models/stg_orders.sql": STG, "models/other.sql": model})
+
+    report = RefmergeService().check(CheckRequest(config=_config(root, fake_dbt, tmp_path)))
+
+    receipt = _results(report)["model.p.other"].receipt
+    assert (receipt.status, receipt.reason_codes) == (VerificationStatus.NOT_RUN, (ReasonCode.NO_DUPLICATE_IMPORT,))
+    assert evaluate_exit_code_for_check(report, FailOn.FIXABLE) is ExitCode.OK
 
 
 def test_fix_applies_verified_candidate(make_project, fake_dbt, tmp_path):
