@@ -329,7 +329,9 @@ def test_render_github_scan_escapes_properties_and_messages(tmp_path):
     assert lines == [
         "::warning file=models/100%25%2C a%3Ab/m.sql,line=7,title=dbt-refmerge%3A duplicate import CTEs"
         '::CTEs "50%25 off", "x%0D%0Ay" import model.p.stg; run dbt-refmerge check to prove a merge',
-        f"::warning file={(tmp_path.parent / 'elsewhere.sql').as_posix()},line=1,title=dbt-refmerge%3A duplicate "
+        # A Windows drive letter's colon is escaped like any other.
+        f"::warning file={(tmp_path.parent / 'elsewhere.sql').as_posix().replace(':', '%3A')},line=1,"
+        "title=dbt-refmerge%3A duplicate "
         "import CTEs::several CTEs import the same relation in a shape dbt-refmerge cannot merge "
         "(UNSUPPORTED_IMPORT_SHAPE)",
     ]

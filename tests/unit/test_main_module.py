@@ -1,8 +1,10 @@
 """``python -m dbt_refmerge`` runs the same CLI as the console script."""
 
+import json
 import runpy
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -19,9 +21,14 @@ def test_python_dash_m_runs_the_cli(monkeypatch, capsys):
     assert capsys.readouterr().out == f"dbt-refmerge {__version__}\n"
 
 
-def test_python_dash_m_in_a_subprocess_names_the_command_in_usage():
+def test_python_dash_m_in_a_subprocess_scans_a_project():
+    sample = Path(__file__).resolve().parents[1] / "fixtures" / "sample_project"
+
     result = subprocess.run(
-        [sys.executable, "-m", "dbt_refmerge", "--help"], capture_output=True, text=True, check=True
+        [sys.executable, "-m", "dbt_refmerge", "scan", "--project-dir", str(sample), "--json"],
+        capture_output=True,
+        text=True,
+        check=True,
     )
 
-    assert "Usage: dbt-refmerge [OPTIONS] COMMAND [ARGS]..." in result.stdout
+    assert json.loads(result.stdout)["summary"] == {"findings": 1}
