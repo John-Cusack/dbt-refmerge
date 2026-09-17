@@ -1,6 +1,6 @@
 # Reason codes
 
-Every result and every refusal carries a stable reason code. They appear in three places:
+Every model result and every error carries a stable reason code. The one exception is `fix` for a path that isn't a model in the project: it prints `fix: model not found` and exits 1. Codes appear in three places:
 - `reason_codes` in `check --json` and `fix --json`;
 - `reason_codes` in `scan --json` findings;
 - the prefix of error messages, such as `check failed: [UNSUPPORTED_ADAPTER] …`, which exit 1.

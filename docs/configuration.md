@@ -37,7 +37,7 @@ warehouse_statement_timeout_ms = 300000
 **Value rules:**
 - **Booleans** in the environment are true when the value is `1`, `true` or `yes`, in any case.
 - **Timeouts** must be positive, and at most 86,400,000.
-- **Names** (`profile`, `target`, `scratch_schema`, `adapter`) may not contain control characters.
+- **Names** (`profile`, `target`, `scratch_schema`, `adapter`) may not contain control characters other than tab.
 - **Unknown keys** are ignored, so check the spelling of a setting that seems to have no effect.
 
 ## dbt settings dbt-refmerge honors
