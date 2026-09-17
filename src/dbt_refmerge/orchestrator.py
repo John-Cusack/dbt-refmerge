@@ -41,7 +41,8 @@ from dbt_refmerge.errors import (
     SemanticError,
     SourceChangedError,
 )
-from dbt_refmerge.rewrite import apply_edits, build_plan
+from dbt_refmerge.pruning import PrunedImport, apply_expected_pruning, plan_pruning
+from dbt_refmerge.rewrite import apply_edits, build_plan, plan_source_changes
 from dbt_refmerge.semantics import (
     analyze_volatility,
     build_expected_transform,
@@ -293,6 +294,26 @@ class RefmergeService:
             rel = path.relative_to(project_dir).as_posix()
             uid = nodes_by_path.get(rel, f"model.{path.stem}")
             finding = detect_source_duplicates(data, manifest, uid, path, spec.fold_unquoted)
+            try:
+                parsed_source = parse_source_model(data, fold_unquoted=spec.fold_unquoted)
+                prunings = plan_pruning(parsed_source, spec.sqlglot_dialect)
+            except RefmergeError:
+                prunings = ()
+            if prunings:
+                pruned_names = {pruning.cte_identity for pruning in prunings}
+                finding = Finding(
+                    model_unique_id=uid,
+                    source_path=path,
+                    upstream_unique_id="",
+                    cte_names=tuple(
+                        cte.identifier.source_text
+                        for cte in parsed_source.ctes
+                        if cte.identifier.identity.value in pruned_names
+                    ),
+                    status=FindingStatus.NEEDS_COMPILED_ANALYSIS,
+                    reason_codes=(ReasonCode.UNUSED_IMPORT_COLUMNS,),
+                    line=_line_of(data, prunings[0].edit.span.start_byte),
+                )
             if finding is not None:
                 findings.append(finding)
         findings.sort(key=lambda f: (str(f.source_path), f.model_unique_id, f.upstream_unique_id))
@@ -377,7 +398,7 @@ class RefmergeService:
             cand_map = dict.fromkeys(results, b"")
             if verifiable:
                 self._progress(
-                    f"verifying {len(verifiable)} merge{'s' if len(verifiable) != 1 else ''} on the warehouse "
+                    f"verifying {len(verifiable)} rewrite{'s' if len(verifiable) != 1 else ''} on the warehouse "
                     f"(scratch schema {config.scratch_schema}; views are dropped afterwards)"
                 )
                 requests = [
@@ -426,12 +447,13 @@ class RefmergeService:
         src_path = ws.source_snapshot / node.original_file_path
         # The rewrite edits this exact file; never substitute a same-named file or the manifest's raw_code.
         raw = src_path.read_bytes() if src_path.is_file() else None
+        prunings: tuple[PrunedImport, ...] = ()
 
         def refuse(codes: tuple[ReasonCode, ...], path: Path) -> ModelResult:
             # A model that cannot be analyzed is only worth reporting when it may import a relation twice;
             # otherwise every incremental or unparseable model would fail `check`.
             evidence = raw if raw is not None else node.raw_code.encode("utf-8")
-            if not _may_import_twice(evidence):
+            if not prunings and not _may_import_twice(evidence):
                 return ModelResult(node.unique_id, path, _ok_noop_receipt(ws, context, view, node, evidence), "")
             return ModelResult(node.unique_id, path, _unverifiable_receipt(ws, context, view, node, codes), "")
 
@@ -444,25 +466,32 @@ class RefmergeService:
         except RefmergeError as exc:
             # One model the source frontend refuses must not abort the rest of the run.
             return refuse((exc.reason_code,), src_path)
+        prunings = plan_pruning(parsed_src, spec.sqlglot_dialect)
+        analysis_source = apply_edits(raw, tuple(pruning.edit for pruning in prunings))
+        if prunings:
+            parsed_src = _parse_src(analysis_source, fold_unquoted=spec.fold_unquoted)
         from dbt_refmerge.source import has_unsupported_duplicate_candidates
 
         if has_unsupported_duplicate_candidates(parsed_src):
             return refuse((ReasonCode.UNSUPPORTED_IMPORT_SHAPE,), src_path)
         try:
+            parsed_compiled = parse_model(node.compiled_code or "", spec.sqlglot_dialect)
+            analysis_compiled = apply_expected_pruning(parsed_compiled, prunings) if prunings else parsed_compiled
             matched = match_source_ctes(
                 tuple(c for c in parsed_src.ctes if c.ref_call is not None),
-                parse_model(node.compiled_code or "", spec.sqlglot_dialect),
+                analysis_compiled,
                 view,
                 node,
             )
         except (SemanticError, ArtifactError) as exc:
             return refuse((exc.reason_code,), src_path)
         groups = group_imports(list(matched), node.unique_id)
-        if not groups:
+        if not groups and not prunings:
             return ModelResult(node.unique_id, src_path, _ok_noop_receipt(ws, context, view, node, raw), "")
         # volatility gate on whole model
-        parsed_compiled = parse_model(node.compiled_code or "", spec.sqlglot_dialect)
         whole_ok = analyze_volatility(parsed_compiled).ok
+        if not whole_ok:
+            return refuse((ReasonCode.NONDETERMINISTIC,), src_path)
         qualified = tuple(
             qualify_group(
                 g,
@@ -473,17 +502,33 @@ class RefmergeService:
             for g in groups
         )
         eligible = tuple(q for q in qualified if q.status == FindingStatus.MERGE_ELIGIBLE)
-        if not eligible:
+        if not eligible and not prunings:
             return refuse(qualified[0].reason_codes, src_path)
         try:
-            plan = build_plan(raw, node.unique_id, src_path, eligible, parsed_src)
+            if eligible:
+                plan = build_plan(analysis_source, node.unique_id, src_path, eligible, parsed_src)
+                candidate_bytes = apply_edits(analysis_source, plan.edits)
+            else:
+                candidate_bytes = analysis_source
+            if prunings:
+                canonical = (
+                    plan.canonical_cte
+                    if eligible
+                    else next(
+                        cte.identifier
+                        for cte in parsed_src.ctes
+                        if cte.identifier.identity.value == prunings[0].cte_identity
+                    )
+                )
+                plan = plan_source_changes(
+                    raw, candidate_bytes, node.unique_id, src_path, canonical, plan.removed_ctes if eligible else ()
+                )
         except RefmergeError as exc:
             return refuse((exc.reason_code,), src_path)
-        candidate_bytes = apply_edits(raw, plan.edits)
         rel = Path(node.original_file_path)
         (ws.candidate_project / rel).parent.mkdir(parents=True, exist_ok=True)
         (ws.candidate_project / rel).write_bytes(candidate_bytes)
-        return _PendingMerge(node, src_path, rel, raw, plan, candidate_bytes, eligible)
+        return _PendingMerge(node, src_path, rel, raw, plan, candidate_bytes, eligible, prunings)
 
     def _compile_candidates(
         self,
@@ -503,7 +548,7 @@ class RefmergeService:
         """
         if not pending:
             return []
-        self._progress(f"compiling {len(pending)} candidate merge{'s' if len(pending) != 1 else ''}")
+        self._progress(f"compiling {len(pending)} candidate rewrite{'s' if len(pending) != 1 else ''}")
         invocation = DbtInvocation(
             project_dir=ws.candidate_project,
             profiles_dir=config.profiles_dir,
@@ -532,7 +577,7 @@ class RefmergeService:
                 codes: tuple[ReasonCode, ...] = (candidate,)
             else:
                 try:
-                    self._validate_delta(merge.node, candidate, merge.eligible, spec)
+                    self._validate_delta(merge.node, candidate, merge.eligible, spec, merge.prunings)
                 except SemanticError as exc:
                     codes = (exc.reason_code,)
                 else:
@@ -548,13 +593,15 @@ class RefmergeService:
         candidate: ManifestNodeModel,
         eligible: tuple[QualifiedDuplicateGroup, ...],
         spec: AdapterSpec,
+        prunings: tuple[PrunedImport, ...] = (),
     ) -> None:
         from dbt_refmerge.semantics import ParsedModel, validate_compiled_delta
 
         bparsed = parse_model(baseline.compiled_code or "", spec.sqlglot_dialect)
         cparsed = parse_model(candidate.compiled_code or "", spec.sqlglot_dialect)
         # The candidate merges every eligible group at once, so apply all of them before comparing.
-        expected = bparsed
+        expected = apply_expected_pruning(bparsed, prunings) if prunings else bparsed
+        pruned_baseline = expected
         for qg in eligible:
             members = sorted(qg.group.imports, key=lambda m: m.source_cte.ordinal)
             canon_ident = members[0].semantic.cte_identity.value
@@ -564,7 +611,7 @@ class RefmergeService:
             have = {p.output_identity.value for p in members[0].semantic.projections}
             additions: list[str] = []
             for m in members[1:]:
-                donor_select = bparsed.ctes[m.semantic.cte_identity.value].args["this"]
+                donor_select = pruned_baseline.ctes[m.semantic.cte_identity.value].args["this"]
                 for projection, node in zip(m.semantic.projections, donor_select.expressions, strict=True):
                     if projection.output_identity.value not in have:
                         have.add(projection.output_identity.value)
@@ -588,7 +635,7 @@ class RefmergeService:
         if request.dry_run:
             return FixReport(applied=False, dry_run=True, result=target, reason="dry-run")
         live_path = request.config.project_dir / rel
-        self._progress(f"writing the verified merge to {rel.as_posix()}")
+        self._progress(f"writing the verified rewrite to {rel.as_posix()}")
         apply_verified_source(
             live_path,
             expected_original_sha256=target.receipt.original_source_sha256,
@@ -630,6 +677,7 @@ class _PendingMerge:
     plan: RewritePlan
     candidate_bytes: bytes
     eligible: tuple[QualifiedDuplicateGroup, ...]
+    prunings: tuple[PrunedImport, ...] = ()
 
 
 def _compiled_candidates(

@@ -192,7 +192,6 @@ def test_source_without_with_has_no_ctes(sql):
         "with a as (select (1) select 1",
         "with a as (select 1), , b as (select 1) select 1",
         "with 'a' as (select 1) select 1",
-        "with `a` as (select 1) select 1",
     ],
     ids=[
         "recursive",
@@ -208,7 +207,6 @@ def test_source_without_with_has_no_ctes(sql):
         "unbalanced",
         "empty-list-item",
         "single-quoted-name",
-        "backtick-name",
     ],
 )
 def test_cte_list_syntax_refusals(sql):
@@ -245,11 +243,23 @@ def test_cte_list_ends_at_main_query_or_end_of_source(sql, expected):
 _REF = "{{ ref('m') }}"
 
 
+def test_backtick_identifiers_preserve_source_and_decode_doubled_delimiters():
+    raw = _src(f"with `Order Imports` as (select `Order ID` as `x``y` from {_REF}) select `x``y` from `Order Imports`")
+    model = parse_source_model(raw)
+    (cte,) = model.ctes
+    assert (cte.identifier.source_text, cte.identifier.value) == ("`Order Imports`", "Order Imports")
+    assert cte.ref_call is not None
+    assert cte.projections[0].upstream_identifier.value == "Order ID"
+    assert cte.projections[0].output_identifier.value == "x`y"
+    assert model.downstream_refs[0].cte_identity == cte.identifier.identity
+
+
 @pytest.mark.parametrize(
     ("body", "expected"),
     [
         # Supported: (projections as (upstream, output, attached comments), select list, predicate).
         (f"select id from {_REF}", ([("id", "id", [])], "id", None)),
+        (f"select `id` from {_REF}", ([("`id`", "`id`", [])], "`id`", None)),
         (
             f'select id as ident, "Amount" amt, "x""y" from {_REF}',
             (
@@ -283,7 +293,6 @@ _REF = "{{ ref('m') }}"
         (f"select t.id from {_REF}", None),
         (f"select lower(id) from {_REF}", None),
         (f"select 'x' as id from {_REF}", None),
-        (f"select `id` from {_REF}", None),
         (f"select id,, amount from {_REF}", None),
         (f"select , id from {_REF}", None),
         (f"select id /* key */, amount from {_REF}", None),

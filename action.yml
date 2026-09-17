@@ -1,5 +1,5 @@
 name: dbt-refmerge scan
-description: Annotate pull requests where a dbt model imports the same ref() or source() in more than one CTE.
+description: Annotate pull requests where dbt models have duplicate imports or can select fewer import columns.
 author: John Cusack
 branding:
   icon: git-merge

@@ -477,7 +477,7 @@ def test_decode_source_pure_crlf_is_not_mixed():
     assert decoded.newline_style == "crlf"
 
 
-def test_single_line_canonical_needs_insertion_refuses():
+def test_single_line_canonical_needs_insertion_merges():
     raw = (
         "with a as (\n    select id from {{ ref('stg') }}\n),\n"
         "b as (\n    select id, amount from {{ ref('stg') }}\n)\n"
@@ -486,9 +486,8 @@ def test_single_line_canonical_needs_insertion_refuses():
     compiled = "with a as (select id from db.sch.stg), b as (select id, amount from db.sch.stg) select b.id from b"
     raw_bytes, source, owner, _group, qualified = _qualified(raw, compiled)
     assert qualified.status is FindingStatus.MERGE_ELIGIBLE
-    with pytest.raises(RewriteError) as exc_info:
-        build_plan(raw_bytes, owner.unique_id, Path("m.sql"), (qualified,), source)
-    assert exc_info.value.reason_code is ReasonCode.UNSUPPORTED_IMPORT_SHAPE
+    plan = build_plan(raw_bytes, owner.unique_id, Path("m.sql"), (qualified,), source)
+    assert "select id, amount from" in apply_edits(raw_bytes, plan.edits).decode()
 
 
 def test_single_line_canonical_redundant_donor_merges():
@@ -622,14 +621,8 @@ def test_duplicate_output_within_single_cte_refuses():
     assert qualified.reason_codes == (ReasonCode.PROJECTION_COLLISION,)
 
 
-@pytest.mark.parametrize(
-    "source",
-    [
-        b"with `a` as (select x from {{ ref('stg') }}) select x from `a`",
-        b"with [a] as (select x from {{ ref('stg') }}) select x from [a]",
-    ],
-)
-def test_unsupported_cte_delimiters_refuse_cleanly(source):
+def test_unsupported_bracket_cte_delimiters_refuse_cleanly():
+    source = b"with [a] as (select x from {{ ref('stg') }}) select x from [a]"
     with pytest.raises(SourceParseError) as exc_info:
         parse_source_model(source)
     assert exc_info.value.reason_code is ReasonCode.UNSUPPORTED_IMPORT_SHAPE
@@ -819,14 +812,15 @@ def test_unicode_prefix_and_quoted_identifier_spans_are_byte_exact():
     assert candidate == expected
 
 
-def test_backtick_projection_duplicates_report_unsupported_shape():
+def test_backtick_projection_duplicates_are_recognized_as_imports():
     raw = (
         b"with a as (select `order id` from {{ ref('stg') }}), b as (select `order id` from {{ ref('stg') }}) select 1"
     )
     finding = detect_source_duplicates(raw, None, "model.p.m", Path("m.sql"))
     assert finding is not None
     assert finding.status is FindingStatus.NEEDS_COMPILED_ANALYSIS
-    assert finding.reason_codes == (ReasonCode.UNSUPPORTED_IMPORT_SHAPE,)
+    assert finding.reason_codes == (ReasonCode.NEEDS_COMPILED_ANALYSIS,)
+    assert finding.cte_names == ("a", "b")
 
 
 def test_donors_separated_by_unrelated_cte_preserve_middle_block():

@@ -14,10 +14,14 @@ Codes are never renamed within a JSON `schema_version`.
 ## Results
 
 ### OK
-**Status:** `snapshot_equivalent`. The merge was proven. `fix` can apply it, provided cleanup completed.
+**Status:** `snapshot_equivalent`. The rewrite was proven. `fix` can apply it, provided cleanup completed.
 
 ### NO_DUPLICATE_IMPORT
-**Status:** `not_run`. There is nothing to merge: no two literal `ref()`/`source()` calls in the model may name the same relation. `--fail-on` never counts it.
+**Status:** `not_run`. No supported duplicate merge or import column pruning was found. The historical code name is retained for compatibility. `--fail-on` never counts it.
+
+### UNUSED_IMPORT_COLUMNS
+**Seen in:** `scan` findings. A direct import can select only the columns its consumers need, replacing a wildcard or removing unused explicit columns.
+**What to do:** run `check` to verify the [column pruning](column-pruning.md), then `fix` to apply it.
 
 ### NEEDS_COMPILED_ANALYSIS
 **Seen in:** `scan` findings. The source has duplicate imports, but whether they can be merged depends on the compiled SQL.
@@ -42,7 +46,7 @@ These refusals happen before anything touches the warehouse. None of them is a m
 **Status:** `unverifiable`; also seen in `scan` findings. An import CTE isn't a plain `select col, col as alias from {{ ref(...) }} [where ...]`. Common causes:
 - `distinct`, `group by`, joins or expressions in the import;
 - `select *` expanded downstream;
-- a select list on one line, which the rewrite can't extend;
+- unsupported projection formatting, such as CR-only newlines;
 - `WITH RECURSIVE`, or CTE column lists;
 - a name reserved for internal sentinels (`__r0__`).
 

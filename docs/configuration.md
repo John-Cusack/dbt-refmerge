@@ -49,6 +49,10 @@ warehouse_statement_timeout_ms = 300000
 
 The adapter sets the SQL dialect used to parse models and how unquoted identifiers are compared. Only `postgres` can be verified (`check`, `fix`, `cleanup`). Every other name below works with `scan` only.
 
+`scan --adapter snowflake` and `scan --adapter bigquery` analyze local text without a warehouse
+connection, installed dbt adapter or profile. See [column pruning support and limits](column-pruning.md#snowflake-and-bigquery)
+for the dialect-specific SQL forms covered by source analysis.
+
 | Adapter | Unquoted identifiers | `check` |
 |---|---|---|
 | `postgres` (also `postgresql`, `pg`) | fold to lower case | yes |

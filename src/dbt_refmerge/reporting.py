@@ -181,6 +181,8 @@ def scan_report_json(report: ScanReport, *, project_dir: Path) -> dict[str, Any]
 
 
 def finding_message(finding: Finding) -> str:
+    if ReasonCode.UNUSED_IMPORT_COLUMNS in finding.reason_codes:
+        return f"CTEs {', '.join(finding.cte_names)} can select only needed columns; run dbt-refmerge check to verify"
     if finding.cte_names:
         target = finding.upstream_unique_id or "the same relation"
         return f"CTEs {', '.join(finding.cte_names)} import {target}; run dbt-refmerge check to prove a merge"
@@ -203,9 +205,15 @@ def render_github_scan(report: ScanReport, *, base_dir: Path) -> str:
     """
     return "".join(
         f"::warning file={_escape_property(_display_path(f.source_path, base_dir))},line={f.line},"
-        f"title={_escape_property('dbt-refmerge: duplicate import CTEs')}::{_escape_data(finding_message(f))}\n"
+        f"title={_escape_property(_finding_title(f))}::{_escape_data(finding_message(f))}\n"
         for f in report.findings
     )
+
+
+def _finding_title(finding: Finding) -> str:
+    if ReasonCode.UNUSED_IMPORT_COLUMNS in finding.reason_codes:
+        return "dbt-refmerge: unused import columns"
+    return "dbt-refmerge: duplicate import CTEs"
 
 
 def _display_path(path: Path, base_dir: Path) -> str:
