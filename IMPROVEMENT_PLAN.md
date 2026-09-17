@@ -128,7 +128,9 @@ Items marked **Now** are implemented in this round, each with the tests or check
   8. one verdict run-operation that runs every model's comparison and prints each result under its own marker
   9. one drop-and-confirm
 - **Keeping failures per model:**
-  - A failed candidate compile or harness run is attributed to models through `run_results.json`. Models that succeeded carry on.
+  - A failed batch candidate compile is retried one candidate at a time, with the other models restored to their original source. dbt parses the whole project, so a parse error in one candidate would otherwise fail every compile, with no per-model results.
+  - A failed harness run is attributed to models through `run_results.json`. Models that succeeded carry on.
+  - Two models whose scratch view names would collide (the same 8-hex-digit hash) are refused, so neither is judged on the other's SQL.
   - If the batched verdict run-operation fails, each model's comparison is re-run on its own, so one bad query cannot hide the others' verdicts.
   - A preflight violation still refuses the whole batch: the harness project is not what was written.
 - **Done when:**

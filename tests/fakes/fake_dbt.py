@@ -10,6 +10,8 @@ Behaviour switches (``FAKE_DBT_MODE``, comma separated, ``key`` or ``key=value``
 
 - ``version_fail``: ``--version`` exits 1
 - ``compile_fail`` / ``candidate_compile_fail``: baseline / candidate compile exits 1
+- ``candidate_compile_fail_sql=<text>``: a candidate compile exits 1 while any model file contains ``text``
+  (dbt parses the whole project, so one broken file fails every compile)
 - ``ignore_target_path``: write the manifest to ``<project>/target`` instead
 - ``adapter_type=<name>``: manifest ``metadata.adapter_type`` (default ``postgres``)
 - ``candidate_drop_node``: candidate manifest omits the selected model
@@ -21,8 +23,11 @@ Behaviour switches (``FAKE_DBT_MODE``, comma separated, ``key`` or ``key=value``
 - ``invalid_utf8``: write bytes that are not UTF-8 to stdout
 - ``echo_env=<NAME>``: print ``NAME=<value>`` to stdout
 - ``exit=<code>``: exit with ``code`` after everything else
-- ``parse_fail`` / ``run_fail`` / ``drop_fail``: that harness step exits 1
-- ``query_fail=<label>``: the ``dbt_refmerge_query`` call with that label exits 1
+- ``parse_fail`` / ``run_fail`` / ``drop_fail``: that harness step exits 1 (``run`` writes no ``run_results.json``)
+- ``run_fail_sql=<text>``: ``run`` exits 1 and reports every harness view whose file contains ``text`` as an error
+- ``query_fail=<label>``: a query with that label exits 1 (``dbt_refmerge_query`` or ``dbt_refmerge_queries``)
+- ``verdict_fail_sql=<text>``: a verdict query on a harness view whose file contains ``text`` exits 1
+- ``catalog_omit_sql=<text>``: the ``schema`` query leaves out harness views whose file contains ``text``
 - ``harness_materialized=<m>``, ``harness_schema=<s>``, ``harness_extra_node``: preflight violations
 
 ``FAKE_DBT_VERSION_OUTPUT`` / ``FAKE_DBT_COMPILE_HELP`` replace those outputs, and
@@ -32,9 +37,11 @@ Harness query results (``run-operation dbt_refmerge_query``), keyed by the call'
 
 - ``schema``: both harness views with the columns in ``FAKE_DBT_BASELINE_COLUMNS`` /
   ``FAKE_DBT_CANDIDATE_COLUMNS`` (JSON ``[[name, type], ...]``, default ``[["id", "integer"]]``)
-- ``verdict``: ``FAKE_DBT_VERDICT`` = ``"baseline,candidate,baseline_only,candidate_only"`` (default ``1,1,0,0``)
+- ``verdict``: ``FAKE_DBT_VERDICT`` = ``"baseline,candidate,baseline_only,candidate_only"`` (default ``1,1,0,0``);
+  ``dbt_refmerge_queries`` runs a list of these, printing each under ``<nonce>_<key>``
 - ``run-views``: the names in ``FAKE_DBT_RUN_VIEWS`` (comma separated)
-- ``FAKE_DBT_QUERY_OUTPUT`` replaces the marked output entirely (for malformed-result tests)
+- ``FAKE_DBT_QUERY_OUTPUT`` replaces the marked output entirely (for malformed-result tests), for every label or
+  only for ``FAKE_DBT_QUERY_OUTPUT_LABEL`` when that is set
 
 ``run-operation dbt_refmerge_drop_views`` reports no remaining relations, or every requested name when
 ``FAKE_DBT_REMAINING=all``.
@@ -98,7 +105,12 @@ HARNESS_NAME_RE = re.compile(r"'(dbt_refmerge_(?:baseline|candidate)_[a-z0-9_]+)
 def _selected(selector: str | None, name: str, path: str = "") -> bool:
     if selector in (None, "fqn:*", "*"):
         return True
-    return selector in (name, f"fqn:{name}", f"path:{path}")
+    # dbt unions space-separated selectors within one --select value.
+    return any(part in (name, f"fqn:{name}", f"path:{path}") for part in selector.split())
+
+
+def _files_containing(project: Path, text: str) -> list[Path]:
+    return [path for path in sorted((project / "models").rglob("*.sql")) if text in path.read_text(encoding="utf-8")]
 
 
 def _compile(args: list[str], modes: dict[str, str], *, parse_only: bool = False) -> int:
@@ -106,6 +118,13 @@ def _compile(args: list[str], modes: dict[str, str], *, parse_only: bool = False
     is_candidate = project.name == "candidate_project"
     if ("compile_fail" in modes and not is_candidate) or ("candidate_compile_fail" in modes and is_candidate):
         print("fake dbt: compilation error", file=sys.stderr)
+        return 1
+    if (
+        is_candidate
+        and "candidate_compile_fail_sql" in modes
+        and _files_containing(project, modes["candidate_compile_fail_sql"])
+    ):
+        print("fake dbt: compilation error in a candidate", file=sys.stderr)
         return 1
     if parse_only and "parse_fail" in modes:
         print("fake dbt: parse error", file=sys.stderr)
@@ -222,8 +241,16 @@ def _columns(env_name: str) -> list[list[str]]:
     return columns
 
 
-def _query_rows(label: str, sql: str) -> tuple[list[str], list[list[str | None]]]:
+def _harness_views_containing(project: Path, text: str) -> list[str]:
+    # A harness file baseline_<token>.sql builds the view dbt_refmerge_baseline_<token>.
+    return [f"dbt_refmerge_{path.stem}" for path in _files_containing(project, text)]
+
+
+def _query_rows(project: Path, modes: dict[str, str], label: str, sql: str) -> tuple[list[str], list[list[str | None]]]:
     names = HARNESS_NAME_RE.findall(sql)
+    if "catalog_omit_sql" in modes:
+        omitted = _harness_views_containing(project, modes["catalog_omit_sql"])
+        names = [name for name in names if name not in omitted]
     if label == "schema":
         rows: list[list[str | None]] = []
         for relname in sorted(names):
@@ -246,29 +273,58 @@ def _print_result(nonce: str, columns: list[str], rows: list[list[str | None]]) 
     print(f"DBT_REFMERGE_RESULT_{nonce}_END")
 
 
+def _query(project: Path, modes: dict[str, str], label: str, nonce: str, sql: str) -> int:
+    failing = []
+    if label == "verdict" and "verdict_fail_sql" in modes:
+        failing = _harness_views_containing(project, modes["verdict_fail_sql"])
+    if modes.get("query_fail") == label or any(name in sql for name in failing):
+        print(f"fake dbt: database error in {label}", file=sys.stderr)
+        return 1
+    if "FAKE_DBT_QUERY_OUTPUT" in os.environ and os.environ.get("FAKE_DBT_QUERY_OUTPUT_LABEL", label) == label:
+        sys.stdout.write(os.environ["FAKE_DBT_QUERY_OUTPUT"].replace("{nonce}", nonce))
+        return 0
+    columns, rows = _query_rows(project, modes, label, sql)
+    _print_result(nonce, columns, rows)
+    return 0
+
+
 def _run_operation(args: list[str], modes: dict[str, str]) -> int:
     macro = args[1]
     macro_args = json.loads(_opt(args, "--args") or "{}")
+    project = Path(_opt(args, "--project-dir") or ".")
     if macro == "dbt_refmerge_drop_views":
         if "drop_fail" in modes:
             return 1
         remaining = macro_args["identifiers"] if os.environ.get("FAKE_DBT_REMAINING") == "all" else []
         _print_result(macro_args["nonce"], ["relname"], [[name] for name in remaining])
         return 0
-    if macro != "dbt_refmerge_query":
-        print(f"fake dbt: unknown macro {macro}", file=sys.stderr)
-        return 1
-    label = macro_args["label"]
-    if modes.get("query_fail") == label:
-        print(f"fake dbt: database error in {label}", file=sys.stderr)
-        return 1
-    nonce = macro_args["nonce"]
-    if "FAKE_DBT_QUERY_OUTPUT" in os.environ:
-        sys.stdout.write(os.environ["FAKE_DBT_QUERY_OUTPUT"].replace("{nonce}", nonce))
+    if macro == "dbt_refmerge_query":
+        return _query(project, modes, macro_args["label"], macro_args["nonce"], macro_args["sql"])
+    if macro == "dbt_refmerge_queries":
+        for query in macro_args["queries"]:
+            code = _query(project, modes, macro_args["label"], f"{macro_args['nonce']}_{query['key']}", query["sql"])
+            if code:
+                return code
         return 0
-    columns, rows = _query_rows(label, macro_args["sql"])
-    _print_result(nonce, columns, rows)
-    return 0
+    print(f"fake dbt: unknown macro {macro}", file=sys.stderr)
+    return 1
+
+
+def _run(args: list[str], modes: dict[str, str]) -> int:
+    """Build the harness views: writes run_results.json unless the whole run fails."""
+    if "run_fail" in modes:
+        return 1
+    project = Path(_opt(args, "--project-dir") or ".")
+    failing = set(_files_containing(project, modes["run_fail_sql"])) if "run_fail_sql" in modes else set()
+    package = _project_name(project)
+    results = [
+        {"unique_id": f"model.{package}.{path.stem}", "status": "error" if path in failing else "success"}
+        for path in sorted((project / "models").rglob("*.sql"))
+    ]
+    target = Path(_opt(args, "--target-path") or project / "target")
+    target.mkdir(parents=True, exist_ok=True)
+    (target / "run_results.json").write_text(json.dumps({"results": results}), encoding="utf-8")
+    return 1 if failing else 0
 
 
 def main(args: list[str]) -> int:
@@ -316,7 +372,7 @@ def main(args: list[str]) -> int:
     elif args and args[0] == "parse":
         code = _compile(args, modes, parse_only=True)
     elif args and args[0] == "run":
-        code = 1 if "run_fail" in modes else 0
+        code = _run(args, modes)
     elif args and args[0] == "run-operation":
         code = _run_operation(args, modes)
     else:

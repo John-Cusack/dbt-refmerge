@@ -9,11 +9,13 @@ from dbt_refmerge.verification.runner import (
     HarnessSession,
     QueryResult,
     _counts,
+    _failed_nodes,
     _profile_name,
     _query_result,
     _schema_payload,
     catalog_sql,
     sql_literal,
+    verify_postgres_batch,
 )
 
 COUNT_COLUMNS = ("baseline_rows", "candidate_rows", "baseline_only_occurrences", "candidate_only_occurrences")
@@ -119,3 +121,29 @@ def test_harness_uses_the_projects_profiles_yml_when_no_profiles_dir_is_given(ma
     with_file = HarnessSession(DbtCli(("dbt",)), tmp_path, AppConfig(project_dir=root), "s", tmp_path / "t")
 
     assert (without.invocation.profiles_dir, with_file.invocation.profiles_dir) == (None, root)
+
+
+def test_an_empty_batch_needs_no_warehouse():
+    assert verify_postgres_batch([]) == []
+
+
+@pytest.mark.parametrize(
+    ("content", "failed"),
+    [
+        (
+            '{"results": [{"unique_id": "a", "status": "success"}, "junk", {"unique_id": "b", "status": "error"}]}',
+            {"b"},
+        ),
+        ("{not json", set()),
+        ('{"no_results": []}', set()),
+        ('{"results": [{"status": "error"}]}', set()),
+        ('{"results": 1}', set()),
+    ],
+    ids=["mixed", "bad-json", "no-results-key", "no-unique-id", "results-not-a-list"],
+)
+def test_failed_nodes_reads_run_results_and_attributes_nothing_it_cannot_read(tmp_path, content, failed):
+    path = tmp_path / "run_results.json"
+    path.write_text(content)
+
+    assert _failed_nodes(path) == failed
+    assert _failed_nodes(tmp_path / "missing.json") == set()

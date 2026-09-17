@@ -74,6 +74,13 @@ def _run(action: str, config: AppConfig, call: Callable[[], T]) -> T:
         _fail(f"{action} failed", exc, debug=config.debug)
 
 
+def _service(config: AppConfig) -> RefmergeService:
+    """In human mode, report each stage on stderr; JSON mode leaves stderr to errors."""
+    if config.json_output:
+        return RefmergeService()
+    return RefmergeService(progress=lambda message: err_console.print(f"dbt-refmerge: {message}"))
+
+
 def _fail(prefix: str, exc: BaseException, *, debug: bool) -> NoReturn:
     if debug:
         err_console.print("".join(traceback.format_exception(exc)).rstrip())
@@ -151,7 +158,7 @@ def check(
         keep_workspace=keep_workspace,
         debug=debug,
     )
-    report = _run("check", config, lambda: RefmergeService().check(CheckRequest(config=config, select=select)))
+    report = _run("check", config, lambda: _service(config).check(CheckRequest(config=config, select=select)))
     if config.json_output:
         _write_json(
             check_report_json(
@@ -199,7 +206,7 @@ def fix(
         debug=debug,
     )
     request = FixRequest(config=config, model_path=model_path, dry_run=dry_run)
-    report = _run("fix", config, lambda: RefmergeService().fix(request))
+    report = _run("fix", config, lambda: _service(config).fix(request))
     result = report.result
     if result is None:
         err_console.print(f"fix: {report.reason}")

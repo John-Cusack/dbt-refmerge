@@ -1,16 +1,19 @@
-"""Warehouse verification for one model (PostgreSQL), and cleanup of a run's scratch relations.
+"""Warehouse verification (PostgreSQL) for a batch of models, and cleanup of a run's scratch relations.
 
-Flow per model:
+One pass for the whole batch, so the number of dbt invocations does not grow with the number of models:
 
-1. Validate the scratch schema and write a throwaway dbt project (``harness``) holding the baseline
-   and candidate compiled SQL as two views, aliased with a per-run, per-model token.
-2. ``dbt parse`` and preflight the manifest: exactly those two views, no hooks, inside the scratch
-   schema. Only then record the relations in the ledger and ``dbt run`` them.
-3. Read both views' column names and exact types from ``pg_catalog``. Unsupported types refuse;
-   a schema difference is DIFFERENT.
-4. Compare the two views as bags in ONE statement (one snapshot).
+1. Validate the scratch schema and write a throwaway dbt project (``harness``) holding, for every model,
+   its baseline and candidate compiled SQL as two views aliased with a per-run, per-model token.
+2. ``dbt parse`` and preflight the manifest: exactly those views, no hooks, inside the scratch schema.
+   Only then record the relations in the ledger and ``dbt run`` them.
+3. Read every view's column names and exact types from ``pg_catalog`` in one query. Unsupported types
+   refuse; a schema difference is DIFFERENT.
+4. Compare each model's two views as bags, each in ONE statement (one snapshot), all from one dbt call.
 5. Drop the views (views only, by exact name) and confirm they are gone, whatever happened above; both in
    one dbt invocation.
+
+Failures stay per model: a view dbt could not build fails only its model (``run_results.json``), and if
+the batched comparison fails, each comparison is retried alone so one bad query cannot hide the rest.
 
 Every query runs through the harness ``dbt_refmerge_query`` macro, so dbt-refmerge needs no database
 driver: dbt and the user's profile provide the connection.
@@ -22,7 +25,7 @@ import hashlib
 import json
 import re
 import secrets
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from importlib.metadata import version as _pkg_version
 from pathlib import Path
@@ -38,7 +41,6 @@ from dbt_refmerge.domain import (
     ReasonCode,
     RelationIdentity,
     RewritePlan,
-    ScratchBoundary,
     VerificationReceipt,
     VerificationStatus,
 )
@@ -60,13 +62,14 @@ from dbt_refmerge.verification.harness import (
     DBT_INTERMEDIATE_SUFFIXES,
     SCRATCH_SCHEMA_VAR,
     _sanitize_run_token,
-    build_harness_project,
     build_verdict_sql,
+    harness_node_id,
     preflight_harness_manifest,
     relation_token,
     scratch_identifiers,
     validate_scratch_schema,
     write_harness_macros,
+    write_harness_pair,
 )
 from dbt_refmerge.workspace import RunWorkspace, ScratchObject
 
@@ -87,7 +90,9 @@ class VerificationRequest:
     spec: AdapterSpec
 
 
-VerifyRunner = Callable[[VerificationRequest], VerificationReceipt]
+# Verifies a batch sharing one config, workspace, dbt, context, manifest and adapter; one receipt per request.
+VerifyRunner = Callable[[Sequence[VerificationRequest]], list[VerificationReceipt]]
+Outcome = tuple[VerificationStatus, tuple[ReasonCode, ...], EqualityResult]
 
 
 @dataclass(frozen=True)
@@ -169,10 +174,38 @@ class HarnessSession:
             raise DbtError(f"dbt parse failed for the verification harness: {_tail(res)}", argv=res.argv_redacted)
         return self.target_path / "manifest.json"
 
-    def run(self) -> None:
+    def run(self) -> set[str]:
+        """Build every harness view; returns the unique_ids dbt could not build (from run_results.json)."""
+        run_results = self.target_path / "run_results.json"
+        run_results.unlink(missing_ok=True)
         res = self.dbt.run(self.invocation, "fqn:*")
-        if res.returncode != 0:
+        if res.returncode == 0:
+            return set()
+        failed = _failed_nodes(run_results)
+        if not failed:
             raise DbtError(f"dbt run failed for the verification harness: {_tail(res)}", argv=res.argv_redacted)
+        return failed
+
+    def queries(self, label: str, statements: Mapping[str, str]) -> dict[str, QueryResult | RefmergeError]:
+        """Run several statements from one dbt invocation; if that fails, retry each alone to attribute it."""
+        nonce = secrets.token_hex(8)
+        args = {
+            "nonce": nonce,
+            "queries": [{"key": key, "sql": sql} for key, sql in statements.items()],
+            "statement_timeout_ms": self.config.warehouse_statement_timeout_ms,
+            "label": label,
+        }
+        res = self.dbt.run_operation(self.invocation, "dbt_refmerge_queries", args)
+        results: dict[str, QueryResult | RefmergeError] = {}
+        for key, sql in statements.items():
+            try:
+                if res.returncode != 0:
+                    results[key] = self.query(label, sql)
+                else:
+                    results[key] = _query_result(parse_marked_json(res.stdout, f"{nonce}_{key}"))
+            except RefmergeError as exc:
+                results[key] = exc
+        return results
 
     def query(self, label: str, sql: str) -> QueryResult:
         nonce = secrets.token_hex(8)
@@ -203,55 +236,122 @@ class HarnessSession:
         return {row[0] for row in _query_result(parse_marked_json(res.stdout, nonce)).rows if row[0] is not None}
 
 
+@dataclass(frozen=True)
+class _Pair:
+    """One request whose harness views were written."""
+
+    index: int
+    request: VerificationRequest
+    token: str
+    relations: tuple[RelationIdentity, RelationIdentity]
+
+    @property
+    def names(self) -> tuple[str, str]:
+        return (self.relations[0].identifier.value, self.relations[1].identifier.value)
+
+
 def verify_postgres(request: VerificationRequest) -> VerificationReceipt:
-    ws = request.workspace
-    token = relation_token(ws.run_id, request.baseline.unique_id)
+    """Verify a single model (a batch of one)."""
+    return verify_postgres_batch([request])[0]
+
+
+def verify_postgres_batch(requests: Sequence[VerificationRequest]) -> list[VerificationReceipt]:
+    """One receipt per request, in order: one harness batch per model database.
+
+    Every harness view lives in the profile's target database, and the preflight holds a batch to a single
+    database. A batch per database keeps a model from another database from refusing the rest.
+    """
+    by_database: dict[str | None, list[int]] = {}
+    for index, request in enumerate(requests):
+        by_database.setdefault(request.baseline.database, []).append(index)
+    receipts: dict[int, VerificationReceipt] = {}
+    for indexes in by_database.values():
+        receipts.update(zip(indexes, _verify_one_database([requests[i] for i in indexes]), strict=True))
+    return [receipts[index] for index in range(len(requests))]
+
+
+def _verify_one_database(requests: Sequence[VerificationRequest]) -> list[VerificationReceipt]:
+    shared = requests[0]
+    ws, config = shared.workspace, shared.config
+    outcomes: dict[int, Outcome] = {}
+    pairs: list[_Pair] = []
+    created: list[_Pair] = []
     session: HarnessSession | None = None
     scratch_schema = ""
-    relations: tuple[RelationIdentity, ...] = ()
-    created = False
+    cleaned: dict[int, bool] = {}
     try:
-        scratch_schema = validate_scratch_schema(
-            request.config.scratch_schema or "", model_schema=request.baseline.schema_
-        ).value
-        database = request.baseline.database
-        if not database:
-            raise ScratchBoundaryError(f"model {request.baseline.unique_id} has no database in the manifest")
-        if request.spec.capabilities is None:
-            raise VerificationError(ReasonCode.UNSUPPORTED_ADAPTER, f"adapter {request.spec.name!r} cannot verify")
-        harness = build_harness_project(
-            ws,
-            profile=_profile_name(request.config, request.context.project_dir),
-            baseline_sql=request.baseline.compiled_code or "",
-            candidate_sql=request.candidate.compiled_code or "",
-            token=token,
-        )
-        relations = tuple(
-            RelationIdentity(IdentifierIdentity(database), IdentifierIdentity(scratch_schema), IdentifierIdentity(a))
-            for a in (harness.baseline_alias, harness.candidate_alias)
-        )
-        session = HarnessSession(request.dbt, ws.harness_project, request.config, scratch_schema, _target(ws, token))
-        preflight_harness_manifest(
-            session.parse(),
-            ScratchBoundary(
-                database=IdentifierIdentity(database),
-                schema=IdentifierIdentity(scratch_schema),
-                allowed_relations=relations,
-            ),
-        )
-        for relation in relations:
-            ws.record_object(ScratchObject(relation=relation, kind="view"))
-        created = True
-        session.run()
-        status, codes, equality = _compare(session, relations, request.spec.capabilities.bag_strategy)
+        scratch_schema = validate_scratch_schema(config.scratch_schema or "").value
+        if shared.spec.capabilities is None:
+            raise VerificationError(ReasonCode.UNSUPPORTED_ADAPTER, f"adapter {shared.spec.name!r} cannot verify")
+        strategy = shared.spec.capabilities.bag_strategy
+        write_harness_macros(ws.harness_project, _profile_name(config, shared.context.project_dir))
+        for index, request in enumerate(requests):
+            try:
+                pairs.append(_write_pair(index, request, scratch_schema, {pair.token for pair in pairs}))
+            except RefmergeError as exc:
+                outcomes[index] = _failure(exc)
+        if pairs:
+            session = HarnessSession(shared.dbt, ws.harness_project, config, scratch_schema, _harness_target(ws))
+            expected = {
+                harness_node_id(role, pair.token): relation.identifier.value
+                for pair in pairs
+                for role, relation in zip(("baseline", "candidate"), pair.relations, strict=True)
+            }
+            preflight_harness_manifest(
+                session.parse(), database=pairs[0].relations[0].database.value, schema=scratch_schema, expected=expected
+            )
+            for pair in pairs:
+                for relation in pair.relations:
+                    ws.record_object(ScratchObject(relation=relation, kind="view"))
+            created = list(pairs)
+            failed_nodes = session.run()
+            built = []
+            for pair in pairs:
+                if {harness_node_id("baseline", pair.token), harness_node_id("candidate", pair.token)} & failed_nodes:
+                    outcomes[pair.index] = _failure(DbtError("dbt could not build this model's harness views"))
+                else:
+                    built.append(pair)
+            outcomes.update(_compare(session, built, scratch_schema, strategy))
     except RefmergeError as exc:
-        status = VerificationStatus.ERROR if isinstance(exc, DbtError) else VerificationStatus.UNVERIFIABLE
-        codes, equality = (exc.reason_code,), _NO_EQUALITY
+        for index in range(len(requests)):
+            outcomes.setdefault(index, _failure(exc))
     finally:
-        cleanup_complete = True
         if created and session is not None:
-            cleanup_complete = _drop_run_relations(session, ws, scratch_schema, relations, token)
-    return _receipt(request, status, codes, equality, relations if created else (), cleanup_complete)
+            cleaned = _drop_run_relations(session, ws, scratch_schema, created)
+    relations = {pair.index: pair.relations for pair in created}
+    return [
+        _receipt(request, *outcomes[index], relations.get(index, ()), cleaned.get(index, index not in relations))
+        for index, request in enumerate(requests)
+    ]
+
+
+def _write_pair(index: int, request: VerificationRequest, scratch_schema: str, taken: set[str]) -> _Pair:
+    validate_scratch_schema(request.config.scratch_schema or "", model_schema=request.baseline.schema_)
+    database = request.baseline.database
+    if not database:
+        raise ScratchBoundaryError(f"model {request.baseline.unique_id} has no database in the manifest")
+    token = relation_token(request.workspace.run_id, request.baseline.unique_id)
+    if token in taken:
+        # Two models whose ids share a hash prefix would share views, and one would be judged on the other's SQL.
+        raise ScratchBoundaryError(
+            f"scratch relation names for {request.baseline.unique_id} collide with another model"
+        )
+    harness = write_harness_pair(
+        request.workspace.harness_project,
+        token,
+        request.baseline.compiled_code or "",
+        request.candidate.compiled_code or "",
+    )
+    baseline, candidate = (
+        RelationIdentity(IdentifierIdentity(database), IdentifierIdentity(scratch_schema), IdentifierIdentity(alias))
+        for alias in (harness.baseline_alias, harness.candidate_alias)
+    )
+    return _Pair(index=index, request=request, token=token, relations=(baseline, candidate))
+
+
+def _failure(exc: RefmergeError) -> Outcome:
+    status = VerificationStatus.ERROR if isinstance(exc, DbtError) else VerificationStatus.UNVERIFIABLE
+    return status, (exc.reason_code,), _NO_EQUALITY
 
 
 def cleanup_run(config: AppConfig, dbt: DbtCli, run_id: str, ws: RunWorkspace) -> dict[str, Any]:
@@ -274,53 +374,81 @@ def cleanup_run(config: AppConfig, dbt: DbtCli, run_id: str, ws: RunWorkspace) -
     }
 
 
-def _compare(
-    session: HarnessSession,
-    relations: tuple[RelationIdentity, ...],
-    strategy: str,
-) -> tuple[VerificationStatus, tuple[ReasonCode, ...], EqualityResult]:
-    baseline, candidate = relations
-    schema = baseline.schema.value
-    catalog = session.query("schema", catalog_sql(schema, [baseline.identifier.value, candidate.identifier.value]))
-    payload = _schema_payload(catalog, baseline.identifier.value, candidate.identifier.value)
-    baseline_schema = normalize_schema(payload)
-    candidate_schema = normalize_schema(RawSchemaPayload(baseline=payload.candidate, candidate=[]))
-    for relation_schema in (baseline_schema, candidate_schema):
-        if validate_types(relation_schema, POSTGRES_EXACT_TYPES) != (ReasonCode.OK,):
-            return VerificationStatus.UNVERIFIABLE, (ReasonCode.UNSUPPORTED_COMPARISON_TYPE,), _NO_EQUALITY
-    if not schemas_equal(baseline_schema, payload):
-        return VerificationStatus.DIFFERENT, (ReasonCode.SCHEMA_MISMATCH,), _NO_EQUALITY
-    verdict = session.query(
-        "verdict",
-        build_verdict_sql(
-            _quoted(baseline),
-            _quoted(candidate),
-            [column.name for column in baseline_schema.columns],
-            strategy,
-        ),
-    )
-    equality = parse_equality_result({"schema_equal": True, **_counts(verdict)})
-    status = VerificationStatus(derive_status(equality))
-    codes = (ReasonCode.OK,) if status is VerificationStatus.SNAPSHOT_EQUIVALENT else (ReasonCode.BAG_DIFFERENCE,)
-    return status, codes, equality
+def _compare(session: HarnessSession, pairs: list[_Pair], schema: str, strategy: str) -> dict[int, Outcome]:
+    if not pairs:
+        return {}
+    catalog = session.query("schema", catalog_sql(schema, [name for pair in pairs for name in pair.names]))
+    outcomes: dict[int, Outcome] = {}
+    verdicts: dict[str, str] = {}
+    for pair in pairs:
+        try:
+            baseline_name, candidate_name = pair.names
+            rows = tuple(row for row in catalog.rows if row[0] in pair.names)
+            payload = _schema_payload(QueryResult(catalog.columns, rows), baseline_name, candidate_name)
+            baseline_schema = normalize_schema(payload)
+            candidate_schema = normalize_schema(RawSchemaPayload(baseline=payload.candidate, candidate=[]))
+            if any(
+                validate_types(relation_schema, POSTGRES_EXACT_TYPES) != (ReasonCode.OK,)
+                for relation_schema in (baseline_schema, candidate_schema)
+            ):
+                outcomes[pair.index] = (
+                    VerificationStatus.UNVERIFIABLE,
+                    (ReasonCode.UNSUPPORTED_COMPARISON_TYPE,),
+                    _NO_EQUALITY,
+                )
+            elif not schemas_equal(baseline_schema, payload):
+                outcomes[pair.index] = (VerificationStatus.DIFFERENT, (ReasonCode.SCHEMA_MISMATCH,), _NO_EQUALITY)
+            else:
+                columns = [column.name for column in baseline_schema.columns]
+                baseline, candidate = pair.relations
+                verdicts[pair.token] = build_verdict_sql(_quoted(baseline), _quoted(candidate), columns, strategy)
+        except RefmergeError as exc:
+            outcomes[pair.index] = _failure(exc)
+    results = session.queries("verdict", verdicts) if verdicts else {}
+    for pair in pairs:
+        result = results.get(pair.token)
+        if result is None:
+            continue
+        try:
+            if isinstance(result, RefmergeError):
+                raise result
+            equality = parse_equality_result({"schema_equal": True, **_counts(result)})
+        except RefmergeError as exc:
+            outcomes[pair.index] = _failure(exc)
+            continue
+        status = VerificationStatus(derive_status(equality))
+        codes = (ReasonCode.OK,) if status is VerificationStatus.SNAPSHOT_EQUIVALENT else (ReasonCode.BAG_DIFFERENCE,)
+        outcomes[pair.index] = (status, codes, equality)
+    return outcomes
 
 
-def _drop_run_relations(
-    session: HarnessSession,
-    ws: RunWorkspace,
-    schema: str,
-    relations: tuple[RelationIdentity, ...],
-    token: str,
-) -> bool:
-    names = scratch_identifiers(token)
+def _drop_run_relations(session: HarnessSession, ws: RunWorkspace, schema: str, pairs: list[_Pair]) -> dict[int, bool]:
+    """Drop every view the batch may have created; per request, whether all of its names are gone."""
+    names = [name for pair in pairs for name in scratch_identifiers(pair.token)]
     try:
         remaining = session.drop_views(schema, names)
     except RefmergeError:
         remaining = set(names)
-    for relation in relations:
-        state = "cleanup_failed" if relation.identifier.value in remaining else "dropped"
-        ws.record_object(ScratchObject(relation=relation, kind="view", state=state))
-    return not remaining
+    cleaned: dict[int, bool] = {}
+    for pair in pairs:
+        cleaned[pair.index] = not remaining.intersection(scratch_identifiers(pair.token))
+        for relation in pair.relations:
+            state = "cleanup_failed" if relation.identifier.value in remaining else "dropped"
+            ws.record_object(ScratchObject(relation=relation, kind="view", state=state))
+    return cleaned
+
+
+def _failed_nodes(run_results: Path) -> set[str]:
+    """unique_ids whose status in dbt's run_results.json is not success; empty when unreadable."""
+    try:
+        results = json.loads(run_results.read_text(encoding="utf-8"))["results"]
+        return {
+            str(result["unique_id"])
+            for result in results
+            if isinstance(result, dict) and result.get("status") != "success"
+        }
+    except (OSError, ValueError, KeyError, TypeError):
+        return set()
 
 
 def _schema_payload(result: QueryResult, baseline: str, candidate: str) -> RawSchemaPayload:
@@ -421,8 +549,8 @@ def _project_profiles_dir(project_dir: Path) -> Path | None:
     return project_dir if (project_dir / "profiles.yml").is_file() else None
 
 
-def _target(ws: RunWorkspace, token: str) -> Path:
-    return ws.artifacts_root / f"harness-target-{token}"
+def _harness_target(ws: RunWorkspace) -> Path:
+    return ws.artifacts_root / "harness-target"
 
 
 def _quoted(relation: RelationIdentity) -> str:
