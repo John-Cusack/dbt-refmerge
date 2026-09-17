@@ -15,24 +15,29 @@ Items marked **Now** are implemented in this round, each with the tests or check
 
 | ID | Item | Tier | Status |
 |---|---|---|---|
-| A1 | Branch protection on `main` | Now | |
-| A2 | Pin every GitHub Action to a commit SHA, on current majors | Now | |
-| A3 | Dependabot for Actions and Python dependencies | Now | |
-| A4 | CodeQL static analysis (Python and Actions) | Now | |
-| A5 | zizmor audit of the workflows | Now | |
-| A6 | OpenSSF Scorecard workflow and badge | Now | |
-| A7 | SECURITY.md, CONTRIBUTING.md, issue and PR templates, CODEOWNERS | Now | |
-| A8 | Refresh `.pre-commit-config.yaml` | Now | |
-| A9 | Private vulnerability reporting | Now | |
-| B1 | Release workflow publishes the GitHub release, with dists and an SBOM | Now | |
-| C1 | pre-commit hook for dbt projects | Now | |
-| C2 | `scan --format github` PR annotations | Now | |
-| C3 | Reusable GitHub Action | Now | |
-| C4 | `python -m dbt_refmerge` | Now | |
-| D1 | User documentation in `docs/`, checked by tests | Now | |
-| E1 | Batched verification: constant dbt invocations per `check` | Now | |
-| E2 | Progress messages for `check` and `fix` | Now | |
-| F1 | Property-based rewrite test | Now | |
+| A1 | Branch protection on `main` | Now | Done: repository setting (required checks, admins included) |
+| A2 | Pin every GitHub Action to a commit SHA, on current majors | Now | Done (#12) |
+| A3 | Dependabot for Actions and Python dependencies | Now | Done (#12) |
+| A4 | CodeQL static analysis (Python and Actions) | Now | Done (#12) |
+| A5 | zizmor audit of the workflows | Now | Done (#12) |
+| A6 | OpenSSF Scorecard workflow and badge | Now | Done (#12) |
+| A7 | SECURITY.md, CONTRIBUTING.md, issue and PR templates, CODEOWNERS | Now | Done (#12) |
+| A8 | Refresh `.pre-commit-config.yaml` | Now | Done (#12) |
+| A9 | Private vulnerability reporting | Now | Done: repository setting |
+| B1 | Release workflow publishes the GitHub release, with dists and an SBOM | Now | Done (#12) |
+| C1 | pre-commit hook for dbt projects | Now | Done (#14) |
+| C2 | `scan --format github` PR annotations | Now | Done (#14) |
+| C3 | Reusable GitHub Action | Now | Done (#14) |
+| C4 | `python -m dbt_refmerge` | Now | Done (#14) |
+| D1 | User documentation in `docs/`, checked by tests | Now | Done (#15) |
+| E1 | Batched verification: constant dbt invocations per `check` | Now | Done (#13) |
+| E2 | Progress messages for `check` and `fix` | Now | Done (#13) |
+| F1 | Property-based rewrite test | Now | Done (#16) |
+
+Found and fixed along the way:
+- **Mixed-database batches.** `check` refused every model when one lived in another database (#13).
+- **Noisy refusals.** `check` refused incremental and unparseable models that have no duplicate imports (#15).
+- **Unreadable models in `scan`.** `scan` reported models it couldn't parse even when nothing was imported twice (#14).
 
 ## Now
 
