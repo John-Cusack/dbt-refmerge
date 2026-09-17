@@ -57,8 +57,7 @@ trino, spark, sqlite, tsql, oracle, exasol, clickhouse, and more).
 ## Keep new duplicates out
 
 `scan` needs no dbt run and no warehouse, so it works as a commit hook or a
-pull request check. The hook and the action ship with 0.2.0; until that
-release, pin `rev:` and `uses:` to a commit on `main`.
+pull request check (both need 0.2.0 or later):
 
 ```yaml
 # .pre-commit-config.yaml

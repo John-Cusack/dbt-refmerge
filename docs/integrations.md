@@ -2,7 +2,7 @@
 
 `scan` needs no dbt run and no warehouse, so it fits in commit hooks and pull request checks. Keep `check` and `fix` for a machine that can reach a development database.
 
-> The pre-commit hook, the GitHub Action and `scan --format github` are new in 0.2.0. Until 0.2.0 is released, pin `rev:` and `uses:` to a commit SHA on `main` instead of a tag, and install from GitHub (`package: git+https://github.com/John-Cusack/dbt-refmerge@<sha>`).
+The pre-commit hook, the GitHub Action and `scan --format github` need dbt-refmerge 0.2.0 or later.
 
 `scan` must know the SQL dialect. On CI machines without a `profiles.yml`, set it once in the project:
 

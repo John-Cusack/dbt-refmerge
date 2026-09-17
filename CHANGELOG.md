@@ -1,4 +1,4 @@
-# Unreleased
+# 0.2.0 (2026-09-17)
 - `check` verifies every model in one batch: a fixed number of dbt invocations (one candidate compile,
   one harness parse and run, one catalog query, one comparison call, one drop) however many models are
   checked. Failures stay per model: a broken candidate compile is retried alone, a view dbt cannot build
@@ -14,6 +14,8 @@
   relation twice; such models are `not_run` with `NO_DUPLICATE_IMPORT`, so they don't fail `--fail-on`.
 - User documentation in `docs/`: CLI reference and exit codes, configuration, verification, every reason code,
   JSON output and integrations, kept in sync with the code by tests.
+- Releases publish a GitHub release with the wheel, the sdist and a CycloneDX SBOM; PyPI uploads carry
+  attestations.
 
 # 0.1.0 (2026-09-16)
 - `scan` lists duplicate import CTEs from source; `check` proves each merge on PostgreSQL (two scratch views,
