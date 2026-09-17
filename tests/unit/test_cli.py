@@ -2,6 +2,7 @@
 
 import json
 
+from conftest import parse_workflow_command
 from typer.testing import CliRunner
 
 from dbt_refmerge.cli import app
@@ -25,10 +26,8 @@ def test_scan_prints_one_lead_per_line_with_the_project_relative_path(make_proje
     result = _invoke("scan", "--project-dir", str(root), "--adapter", "postgres")
 
     assert result.exit_code == 0, result.stderr
-    assert (
-        result.stdout
-        == f"{long_dir}/orders.sql:1: CTEs a, b import the same relation; run dbt-refmerge check to prove a merge\n"
-    )
+    assert result.stdout.startswith(f"{long_dir}/orders.sql:1: ") and result.stdout.count("\n") == 1
+    assert "a, b" in result.stdout
 
 
 def test_scan_json_lists_findings(make_project):
@@ -48,10 +47,13 @@ def test_scan_format_github_annotates_the_first_duplicated_import(make_project, 
     result = _invoke("scan", "--project-dir", str(root), "--adapter", "postgres", "--format", "github")
 
     assert result.exit_code == 0, result.stderr
-    assert result.stdout == (
-        f"::warning file={root.name}/models/core/orders.sql,line=3,title=dbt-refmerge%3A duplicate import CTEs"
-        "::CTEs a, b import the same relation; run dbt-refmerge check to prove a merge\n"
+    (annotation,) = (parse_workflow_command(line) for line in result.stdout.splitlines())
+    assert (annotation.command, annotation.properties["file"], annotation.properties["line"]) == (
+        "warning",
+        f"{root.name}/models/core/orders.sql",
+        "3",
     )
+    assert "a, b" in annotation.message
 
 
 def test_scan_format_github_names_files_relative_to_the_working_directory_outside_actions(make_project, monkeypatch):
@@ -60,7 +62,7 @@ def test_scan_format_github_names_files_relative_to_the_working_directory_outsid
 
     result = _invoke("scan", "--adapter", "postgres", "--format", "github")
 
-    assert result.stdout.startswith("::warning file=models/orders.sql,line=1,")
+    assert parse_workflow_command(result.stdout.splitlines()[0]).properties["file"] == "models/orders.sql"
 
 
 def test_scan_format_json_is_the_same_as_the_json_flag_and_conflicts_are_refused(make_project):

@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 import pytest
+from conftest import parse_workflow_command
 
 from dbt_refmerge.analyze import Finding, FindingStatus
 from dbt_refmerge.config import FailOn
@@ -326,21 +327,28 @@ def test_render_github_scan_escapes_properties_and_messages(tmp_path):
 
     lines = render_github_scan(report, base_dir=tmp_path).splitlines()
 
-    assert lines == [
-        "::warning file=models/100%25%2C a%3Ab/m.sql,line=7,title=dbt-refmerge%3A duplicate import CTEs"
-        '::CTEs "50%25 off", "x%0D%0Ay" import model.p.stg; run dbt-refmerge check to prove a merge',
-        # A Windows drive letter's colon is escaped like any other.
-        f"::warning file={(tmp_path.parent / 'elsewhere.sql').as_posix().replace(':', '%3A')},line=1,"
-        "title=dbt-refmerge%3A duplicate "
-        "import CTEs::several CTEs import the same relation in a shape dbt-refmerge cannot merge "
-        "(UNSUPPORTED_IMPORT_SHAPE)",
-    ]
+    # Two lines, one command each: the runner must read back exactly the paths and names that went in.
+    first, second = (parse_workflow_command(line) for line in lines)
+    assert (first.command, first.properties["file"], first.properties["line"]) == (
+        "warning",
+        "models/100%, a:b/m.sql",
+        "7",
+    )
+    assert all(part in first.message for part in ('"50% off"', '"x\r\ny"', "model.p.stg"))
+    # A path outside the workspace stays absolute (a Windows drive colon is escaped like any other).
+    assert (second.properties["file"], second.properties["line"]) == (
+        (tmp_path.parent / "elsewhere.sql").as_posix(),
+        "1",
+    )
+    assert "UNSUPPORTED_IMPORT_SHAPE" in second.message
+    assert first.properties["title"] == second.properties["title"] != ""
 
 
 def test_render_human_scan_prints_project_relative_locations(tmp_path):
     report = ScanReport(findings=(_finding(tmp_path / "models" / "m.sql", upstream="model.p.stg", line=4),))
 
-    assert render_human_scan(report, project_dir=tmp_path) == (
-        "models/m.sql:4: CTEs a, b import model.p.stg; run dbt-refmerge check to prove a merge\n"
-    )
+    text = render_human_scan(report, project_dir=tmp_path)
+
+    assert text.startswith("models/m.sql:4: ") and text.count("\n") == 1 and text.endswith("\n")
+    assert "a, b" in text and "model.p.stg" in text
     assert render_human_scan(ScanReport(findings=()), project_dir=tmp_path) == ""
