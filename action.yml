@@ -1,0 +1,62 @@
+name: dbt-refmerge scan
+description: Annotate pull requests where a dbt model imports the same ref() or source() in more than one CTE.
+author: John Cusack
+branding:
+  icon: git-merge
+  color: orange
+
+inputs:
+  project-dir:
+    description: The dbt project directory, relative to the repository root.
+    default: "."
+  adapter:
+    description: >-
+      The dbt adapter whose SQL dialect the models use, for example snowflake. Not needed when the project's
+      .dbt-refmerge.toml or profiles.yml names it.
+    default: ""
+  fail-on:
+    description: "`finding` fails the step when there are leads; `never` (the default) only annotates."
+    default: never
+  package:
+    description: The pip requirement to install, for example dbt-refmerge==0.2.0. Requires 0.2.0 or later.
+    default: dbt-refmerge
+  python-version:
+    description: The Python version to run dbt-refmerge with. The job's own Python setup is left unchanged.
+    default: "3.12"
+
+outputs:
+  findings:
+    description: The number of leads (annotations) the scan reported.
+    value: ${{ steps.scan.outputs.findings }}
+
+runs:
+  using: composite
+  steps:
+    - id: python
+      uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      with:
+        python-version: ${{ inputs.python-version }}
+        update-environment: false
+    - id: scan
+      shell: bash
+      env:
+        PYTHON: ${{ steps.python.outputs.python-path }}
+        PACKAGE: ${{ inputs.package }}
+        PROJECT_DIR: ${{ inputs.project-dir }}
+        ADAPTER: ${{ inputs.adapter }}
+        FAIL_ON: ${{ inputs.fail-on }}
+      run: |
+        set -euo pipefail
+        venv="$RUNNER_TEMP/dbt-refmerge-venv"
+        "$PYTHON" -m venv "$venv"
+        if [ -d "$venv/bin" ]; then bin="$venv/bin"; else bin="$venv/Scripts"; fi
+        "$bin/python" -m pip install --quiet --disable-pip-version-check "$PACKAGE"
+        args=(scan --format github --project-dir "$PROJECT_DIR" --fail-on "$FAIL_ON")
+        if [ -n "$ADAPTER" ]; then args+=(--adapter "$ADAPTER"); fi
+        out="$RUNNER_TEMP/dbt-refmerge-scan.txt"
+        status=0
+        "$bin/dbt-refmerge" "${args[@]}" > "$out" || status=$?
+        # The runner turns these workflow commands into annotations when they reach the log.
+        cat "$out"
+        echo "findings=$(grep -c '^::warning ' "$out" || true)" >> "$GITHUB_OUTPUT"
+        exit "$status"

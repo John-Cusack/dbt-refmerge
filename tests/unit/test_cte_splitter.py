@@ -314,3 +314,36 @@ def test_import_body_shapes(body, expected):
     else:
         assert cte.ref_call is not None
         assert actual == expected
+
+
+def test_scan_findings_point_at_the_first_duplicated_import():
+    raw = b"-- header\nwith other as (select 1 as x),\n\na as (select id from {{ ref('m') }}),\nb as (select id from {{ ref('m') }})\nselect 1"
+    unsupported = raw.replace(b"select id from {{ ref('m') }}),\nb", b"select distinct id from {{ ref('m') }}),\nb")
+
+    assert detect_source_duplicates(raw, None, "model.p.m", Path("m.sql")).line == 4
+    assert detect_source_duplicates(unsupported, None, "model.p.m", Path("m.sql")).line == 4
+
+
+@pytest.mark.parametrize(
+    ("raw", "line"),
+    [
+        (b"with recursive a as (select id from {{ ref('m') }}),\nb as (select id from {{ ref('m') }}) select 1", 1),
+        (b"with a (id) as (\nselect id from {{ source('s', 't') }}), b as (select id from {{ source('s', 't') }})", 2),
+        (b"with recursive a as (select id from {{ ref('m') }}), b as (select id from {{ ref('n') }}) select 1", None),
+        (b"with recursive a as (select id from {{ ref('m') }}), b as (select id from {{ ref('m') ", None),
+        (b"with recursive a as (select id from {{ ref('m') }}), b as (select id from {{ ref('m') }}) \xff", None),
+    ],
+    ids=["recursive-duplicate", "column-list-duplicate", "recursive-distinct", "unterminated-jinja", "invalid-utf8"],
+)
+def test_scan_reports_models_the_cte_parser_refuses_only_when_a_relation_is_named_twice(raw, line):
+    finding = detect_source_duplicates(raw, None, "model.p.m", Path("m.sql"))
+
+    if line is None:
+        assert finding is None
+    else:
+        assert (finding.status, finding.reason_codes, finding.cte_names, finding.line) == (
+            FindingStatus.NEEDS_COMPILED_ANALYSIS,
+            (ReasonCode.UNSUPPORTED_IMPORT_SHAPE,),
+            (),
+            line,
+        )

@@ -1,0 +1,11 @@
+# Hooks this repository provides to other projects' .pre-commit-config.yaml (see docs/integrations.md).
+- id: dbt-refmerge-scan
+  name: dbt-refmerge scan
+  description: Fail when a dbt model imports the same ref() or source() in more than one CTE.
+  entry: dbt-refmerge scan --fail-on finding
+  language: python
+  # scan reads the whole project (dbt_project.yml, model paths), not single files; SQL changes trigger it.
+  pass_filenames: false
+  files: \.sql$
+  require_serial: true
+  minimum_pre_commit_version: "3.0.0"

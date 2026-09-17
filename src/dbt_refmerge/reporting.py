@@ -2,13 +2,20 @@
 
 from __future__ import annotations
 
-from enum import IntEnum
+from enum import Enum, IntEnum
 from pathlib import Path
 from typing import Any
 
+from dbt_refmerge.analyze import Finding
 from dbt_refmerge.config import FailOn
 from dbt_refmerge.domain import ReasonCode, VerificationReceipt, VerificationStatus, is_fixable
 from dbt_refmerge.orchestrator import CheckReport, ScanReport
+
+
+class OutputFormat(str, Enum):
+    TEXT = "text"
+    JSON = "json"
+    GITHUB = "github"
 
 
 class ExitCode(IntEnum):
@@ -166,10 +173,55 @@ def scan_report_json(report: ScanReport, *, project_dir: Path) -> dict[str, Any]
                 "cte_names": list(f.cte_names),
                 "status": f.status.value,
                 "reason_codes": [c.value for c in f.reason_codes],
+                "line": f.line,
             }
             for f in report.findings
         ],
     }
+
+
+def finding_message(finding: Finding) -> str:
+    if finding.cte_names:
+        target = finding.upstream_unique_id or "the same relation"
+        return f"CTEs {', '.join(finding.cte_names)} import {target}; run dbt-refmerge check to prove a merge"
+    codes = ", ".join(code.value for code in finding.reason_codes)
+    return f"several CTEs import the same relation in a shape dbt-refmerge cannot merge ({codes})"
+
+
+def render_human_scan(report: ScanReport, *, project_dir: Path) -> str:
+    """One ``path:line: message`` lead per line, paths relative to the project."""
+    return "".join(
+        f"{_display_path(f.source_path, project_dir)}:{f.line}: {finding_message(f)}\n" for f in report.findings
+    )
+
+
+def render_github_scan(report: ScanReport, *, base_dir: Path) -> str:
+    """GitHub Actions workflow commands: one warning annotation per lead, on the first duplicated import.
+
+    GitHub resolves ``file`` against the repository root, so paths are relative to ``base_dir`` (the
+    workspace) when the model is inside it.
+    """
+    return "".join(
+        f"::warning file={_escape_property(_display_path(f.source_path, base_dir))},line={f.line},"
+        f"title={_escape_property('dbt-refmerge: duplicate import CTEs')}::{_escape_data(finding_message(f))}\n"
+        for f in report.findings
+    )
+
+
+def _display_path(path: Path, base_dir: Path) -> str:
+    try:
+        return path.resolve().relative_to(base_dir.resolve()).as_posix()
+    except ValueError:
+        return path.as_posix()
+
+
+def _escape_data(text: str) -> str:
+    # The escaping of GitHub's @actions/core toolkit: messages keep ':' and ',' but not '%' or line breaks.
+    return text.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+
+
+def _escape_property(text: str) -> str:
+    return _escape_data(text).replace(":", "%3A").replace(",", "%2C")
 
 
 def render_human_check(report: CheckReport) -> str:

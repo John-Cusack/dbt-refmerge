@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 import pytest
+from conftest import parse_workflow_command
 
 from dbt_refmerge.analyze import Finding, FindingStatus
 from dbt_refmerge.config import FailOn
@@ -20,7 +21,9 @@ from dbt_refmerge.reporting import (
     ExitCode,
     check_report_json,
     evaluate_exit_code_for_check,
+    render_github_scan,
     render_human_check,
+    render_human_scan,
     scan_report_json,
 )
 
@@ -254,6 +257,7 @@ def test_scan_report_json_shape():
                 "cte_names": ["orders", "order_financials"],
                 "status": "merge_eligible",
                 "reason_codes": ["OK"],
+                "line": 1,
             },
             {
                 "model_unique_id": "model.p.items",
@@ -262,6 +266,7 @@ def test_scan_report_json_shape():
                 "cte_names": ["a", "b"],
                 "status": "not_eligible",
                 "reason_codes": ["DIFFERENT_PREDICATE", "PROJECTION_COLLISION"],
+                "line": 1,
             },
         ],
     }
@@ -297,3 +302,53 @@ def test_render_human_check_includes_diff_only_when_present():
 
 def test_render_human_check_empty_report():
     assert render_human_check(_report()) == ""
+
+
+def _finding(source_path, *, cte_names=("a", "b"), upstream="", line=1, codes=(ReasonCode.NEEDS_COMPILED_ANALYSIS,)):
+    return Finding(
+        model_unique_id="model.p.m",
+        source_path=source_path,
+        upstream_unique_id=upstream,
+        cte_names=cte_names,
+        status=FindingStatus.NEEDS_COMPILED_ANALYSIS,
+        reason_codes=codes,
+        line=line,
+    )
+
+
+def test_render_github_scan_escapes_properties_and_messages(tmp_path):
+    odd = tmp_path / "models" / "100%, a:b" / "m.sql"
+    report = ScanReport(
+        findings=(
+            _finding(odd, cte_names=('"50% off"', '"x\r\ny"'), upstream="model.p.stg", line=7),
+            _finding(tmp_path.parent / "elsewhere.sql", cte_names=(), codes=(ReasonCode.UNSUPPORTED_IMPORT_SHAPE,)),
+        )
+    )
+
+    lines = render_github_scan(report, base_dir=tmp_path).splitlines()
+
+    # Two lines, one command each: the runner must read back exactly the paths and names that went in.
+    first, second = (parse_workflow_command(line) for line in lines)
+    assert (first.command, first.properties["file"], first.properties["line"]) == (
+        "warning",
+        "models/100%, a:b/m.sql",
+        "7",
+    )
+    assert all(part in first.message for part in ('"50% off"', '"x\r\ny"', "model.p.stg"))
+    # A path outside the workspace stays absolute (a Windows drive colon is escaped like any other).
+    assert (second.properties["file"], second.properties["line"]) == (
+        (tmp_path.parent / "elsewhere.sql").as_posix(),
+        "1",
+    )
+    assert "UNSUPPORTED_IMPORT_SHAPE" in second.message
+    assert first.properties["title"] == second.properties["title"] != ""
+
+
+def test_render_human_scan_prints_project_relative_locations(tmp_path):
+    report = ScanReport(findings=(_finding(tmp_path / "models" / "m.sql", upstream="model.p.stg", line=4),))
+
+    text = render_human_scan(report, project_dir=tmp_path)
+
+    assert text.startswith("models/m.sql:4: ") and text.count("\n") == 1 and text.endswith("\n")
+    assert "a, b" in text and "model.p.stg" in text
+    assert render_human_scan(ScanReport(findings=()), project_dir=tmp_path) == ""

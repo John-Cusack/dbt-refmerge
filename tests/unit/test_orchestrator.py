@@ -101,14 +101,23 @@ def test_scan_ignores_an_unreadable_manifest(make_project):
     assert [f.model_unique_id for f in _scan(root)] == ["model.m"]
 
 
-def test_scan_reports_unparseable_models_and_skips_distinct_refs(make_project):
+def test_scan_reports_unparseable_models_only_when_they_name_a_relation_twice(make_project):
+    # A pre-commit hook with --fail-on finding must not fail on models it merely cannot read.
     distinct = DUPLICATE.replace("ref('stg') }}\n)\nselect", "ref('other') }}\n)\nselect")
-    root = make_project({"models/broken.sql": "with a as (select 1 from {{ ref('x'\n", "models/distinct.sql": distinct})
+    recursive = "with recursive a as (select 1 from {{ ref('x') }})\nselect * from a join {{ ref('x') }} using (id)\n"
+    root = make_project(
+        {
+            "models/broken.sql": "with a as (select 1 from {{ ref('x'\n",
+            "models/distinct.sql": distinct,
+            "models/recursive.sql": recursive,
+            "models/recursive_single.sql": "with recursive a as (select 1 from {{ ref('x') }}) select 1\n",
+        }
+    )
 
     findings = _scan(root)
 
-    assert [(f.model_unique_id, f.reason_codes) for f in findings] == [
-        ("model.broken", (ReasonCode.UNSUPPORTED_IMPORT_SHAPE,))
+    assert [(f.model_unique_id, f.reason_codes, f.line) for f in findings] == [
+        ("model.recursive", (ReasonCode.UNSUPPORTED_IMPORT_SHAPE,), 1)
     ]
 
 

@@ -4,6 +4,12 @@
   checked. Failures stay per model: a broken candidate compile is retried alone, a view dbt cannot build
   fails only its model, and a failing comparison is re-run alone.
 - `check` and `fix` print progress lines on stderr in human mode (not with `--json`).
+- `scan --format github` prints GitHub Actions annotations; `--format text|json|github` (`--json` is
+  `--format json`). Text output is now `path:line: message`, and JSON findings carry `line`.
+- `scan` no longer reports a model its CTE parser cannot read unless the model names the same relation in two
+  literal `ref()`/`source()` calls, so `--fail-on finding` doesn't fail on unrelated models.
+- A pre-commit hook (`dbt-refmerge-scan`) and a composite GitHub Action (`uses: John-Cusack/dbt-refmerge@…`).
+- `python -m dbt_refmerge` runs the CLI.
 
 # 0.1.0 (2026-09-16)
 - `scan` lists duplicate import CTEs from source; `check` proves each merge on PostgreSQL (two scratch views,

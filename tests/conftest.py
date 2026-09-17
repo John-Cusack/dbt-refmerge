@@ -30,7 +30,12 @@ _REQUIRE_WAREHOUSE = os.environ.get("REQUIRE_WAREHOUSE") == "1"
 def isolated_env(tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch) -> None:
     """Keep tests off the developer's real config, profiles and temp directory."""
     for name in list(os.environ):
-        if name.startswith("DBT_REFMERGE_") or name in ("DBT_PROFILES_DIR", "FAKE_DBT_MODE", "FAKE_DBT_ARGV_LOG"):
+        if name.startswith("DBT_REFMERGE_") or name in (
+            "DBT_PROFILES_DIR",
+            "FAKE_DBT_MODE",
+            "FAKE_DBT_ARGV_LOG",
+            "GITHUB_WORKSPACE",  # set in CI; scan --format github would name files relative to it
+        ):
             monkeypatch.delenv(name)
     home = tmp_path_factory.mktemp("home")
     monkeypatch.setenv("HOME", str(home))
@@ -252,3 +257,28 @@ def scratch_schema(pg_dsn: str) -> Iterator[str]:
         with conn.cursor() as cur:
             cur.execute(f'drop schema if exists "{name}" cascade')
         conn.close()
+
+
+# -- GitHub workflow commands ------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class WorkflowCommand:
+    command: str
+    properties: dict[str, str]
+    message: str
+
+
+def parse_workflow_command(line: str) -> WorkflowCommand:
+    """Parse ``::command key=value,...::message`` the way the runner does, undoing the toolkit's escaping."""
+
+    def unescape(text: str) -> str:
+        for escaped, char in (("%0D", "\r"), ("%0A", "\n"), ("%3A", ":"), ("%2C", ","), ("%25", "%")):
+            text = text.replace(escaped, char)
+        return text
+
+    assert line.startswith("::"), line
+    head, message = line[2:].split("::", 1)
+    command, _, raw_properties = head.partition(" ")
+    properties = dict(item.split("=", 1) for item in raw_properties.split(",")) if raw_properties else {}
+    return WorkflowCommand(command, {key: unescape(value) for key, value in properties.items()}, unescape(message))

@@ -29,6 +29,7 @@ class Finding:
     cte_names: tuple[str, ...]
     status: FindingStatus
     reason_codes: tuple[ReasonCode, ...]
+    line: int = 1  # 1-based line of the first duplicated import
 
 
 @dataclass(frozen=True)

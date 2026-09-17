@@ -8,7 +8,7 @@ import difflib
 import hashlib
 import os
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -27,6 +27,7 @@ from dbt_refmerge.dbt_cli import DbtCli, DbtInvocation
 from dbt_refmerge.domain import (
     EqualityResult,
     ReasonCode,
+    RefCall,
     RewritePlan,
     VerificationReceipt,
     VerificationStatus,
@@ -48,7 +49,7 @@ from dbt_refmerge.semantics import (
     parse_model,
     semantic_fingerprint,
 )
-from dbt_refmerge.source import parse_source_model, source_sha256
+from dbt_refmerge.source import decode_source, mask_jinja, parse_source_model, source_sha256
 from dbt_refmerge.verification.runner import VerificationRequest, VerifyRunner, cleanup_run, verify_postgres_batch
 from dbt_refmerge.workspace import RunWorkspace
 
@@ -154,6 +155,19 @@ def project_relative_path(model_path: Path, project_dir: Path) -> Path | None:
     return None
 
 
+def _line_of(source: bytes, byte_offset: int) -> int:
+    return source.count(b"\n", 0, byte_offset) + 1
+
+
+def _first_duplicate_calls(calls: Iterable[RefCall]) -> list[RefCall] | None:
+    """The literal ref()/source() calls naming the relation that is imported first and more than once."""
+    grouped: dict[tuple[Any, ...], list[RefCall]] = {}
+    for call in calls:
+        grouped.setdefault((call.kind, call.package, call.name, call.source_name, call.version), []).append(call)
+    duplicates = [group for group in grouped.values() if len(group) >= 2]
+    return min(duplicates, key=lambda group: group[0].span.start_byte) if duplicates else None
+
+
 def detect_source_duplicates(
     source: bytes,
     manifest: ManifestView | None,
@@ -161,28 +175,33 @@ def detect_source_duplicates(
     source_path: Path,
     fold_unquoted: FoldRule = "lower",
 ) -> Finding | None:
+    def unsupported(calls: list[RefCall]) -> Finding:
+        return Finding(
+            model_unique_id=model_uid,
+            source_path=source_path,
+            upstream_unique_id="",
+            cte_names=(),
+            status=FindingStatus.NEEDS_COMPILED_ANALYSIS,
+            reason_codes=(ReasonCode.UNSUPPORTED_IMPORT_SHAPE,),
+            line=_line_of(source, calls[0].span.start_byte),
+        )
+
     try:
         model = parse_source_model(source, fold_unquoted=fold_unquoted)
     except RefmergeError:
-        return Finding(
-            model_unique_id=model_uid,
-            source_path=source_path,
-            upstream_unique_id="",
-            cte_names=(),
-            status=FindingStatus.NEEDS_COMPILED_ANALYSIS,
-            reason_codes=(ReasonCode.UNSUPPORTED_IMPORT_SHAPE,),
-        )
+        # A model the CTE parser cannot read is a lead only if it names one relation in two literal calls.
+        try:
+            calls = mask_jinja(decode_source(source)).ref_calls.values()
+        except RefmergeError:
+            return None  # not UTF-8 or unterminated Jinja: dbt cannot compile it either
+        duplicate_calls = _first_duplicate_calls(calls)
+        return unsupported(duplicate_calls) if duplicate_calls else None
     from dbt_refmerge.source import has_unsupported_duplicate_candidates
 
     if has_unsupported_duplicate_candidates(model):
-        return Finding(
-            model_unique_id=model_uid,
-            source_path=source_path,
-            upstream_unique_id="",
-            cte_names=(),
-            status=FindingStatus.NEEDS_COMPILED_ANALYSIS,
-            reason_codes=(ReasonCode.UNSUPPORTED_IMPORT_SHAPE,),
-        )
+        duplicate_calls = _first_duplicate_calls(model.masked.ref_calls.values())
+        assert duplicate_calls is not None  # two CTEs import one relation, so two literal calls name it
+        return unsupported(duplicate_calls)
     import_ctes = [c for c in model.ctes if c.ref_call is not None]
     if len(import_ctes) < 2:
         return None
@@ -218,6 +237,7 @@ def detect_source_duplicates(
         cte_names=tuple(c.identifier.source_text for c in sorted(first, key=lambda c: c.ordinal)),
         status=FindingStatus.NEEDS_COMPILED_ANALYSIS,
         reason_codes=(ReasonCode.NEEDS_COMPILED_ANALYSIS,),
+        line=_line_of(source, min(c.cte_span.start_byte for c in first)),
     )
 
 
