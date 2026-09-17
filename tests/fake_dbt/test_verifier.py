@@ -350,6 +350,27 @@ def test_a_view_missing_from_the_catalog_refuses_only_its_model(make_project, fa
     assert receipts["model.p.m2"].cleanup_complete
 
 
+def test_a_model_in_another_database_is_refused_without_refusing_the_rest(make_project, fake_dbt, tmp_path):
+    # Harness views live in the target database ("db" in the fake), so the model in "other" fails preflight alone.
+    def runner(requests):
+        moved = [
+            dataclasses.replace(r, baseline=r.baseline.model_copy(update={"database": "other"}))
+            if r.baseline.unique_id == "model.p.m2"
+            else r
+            for r in requests
+        ]
+        return verify_postgres_batch(moved)
+
+    receipts = _check_all(make_project, fake_dbt, tmp_path, service=RefmergeService(verify_runner=runner))
+
+    assert _outcome(receipts["model.p.m"]) == (VerificationStatus.SNAPSHOT_EQUIVALENT, (ReasonCode.OK,))
+    assert _outcome(receipts["model.p.m2"]) == (
+        VerificationStatus.UNVERIFIABLE,
+        (ReasonCode.SCRATCH_BOUNDARY_VIOLATION,),
+    )
+    assert [call[0] for call in fake_dbt.calls()].count("parse") == 2
+
+
 def test_models_whose_scratch_names_would_collide_are_refused(make_project, fake_dbt, tmp_path):
     # sha256(uid)[:8] of these two ids is 5e82aa39: their views would share names.
     colliding = iter(["model.p.m18129", "model.p.m144525"])

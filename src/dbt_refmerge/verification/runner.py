@@ -256,8 +256,21 @@ def verify_postgres(request: VerificationRequest) -> VerificationReceipt:
 
 
 def verify_postgres_batch(requests: Sequence[VerificationRequest]) -> list[VerificationReceipt]:
-    if not requests:
-        return []
+    """One receipt per request, in order: one harness batch per model database.
+
+    Every harness view lives in the profile's target database, and the preflight holds a batch to a single
+    database. A batch per database keeps a model from another database from refusing the rest.
+    """
+    by_database: dict[str | None, list[int]] = {}
+    for index, request in enumerate(requests):
+        by_database.setdefault(request.baseline.database, []).append(index)
+    receipts: dict[int, VerificationReceipt] = {}
+    for indexes in by_database.values():
+        receipts.update(zip(indexes, _verify_one_database([requests[i] for i in indexes]), strict=True))
+    return [receipts[index] for index in range(len(requests))]
+
+
+def _verify_one_database(requests: Sequence[VerificationRequest]) -> list[VerificationReceipt]:
     shared = requests[0]
     ws, config = shared.workspace, shared.config
     outcomes: dict[int, Outcome] = {}
